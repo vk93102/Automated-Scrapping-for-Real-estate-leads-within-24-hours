@@ -1,0 +1,18 @@
+# Core scraper
+requests
+psycopg[binary]
+pdf2image
+pytesseract
+pillow
+
+# API server
+fastapi
+uvicorn[standard]
+gunicorn
+
+# Utilities
+beautifulsoup4
+
+# Optional: only needed if using --search-backend playwright (not used in production)
+# playwright
+

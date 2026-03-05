@@ -1,244 +1,225 @@
-# Automation — End-to-end OCR → JSON extraction
+# Maricopa County Recorder — Automated Real Estate Leads Scraper
 
-This folder contains a runnable pipeline to extract structured fields from OCR text of Notice of Trustee Sale documents.
+Discovers every property-transfer document recorded at Maricopa County each day,
+fetches per-document metadata via the public API, OCRs each PDF in-memory (nothing
+saved to disk), and stores everything in Supabase in real time.
 
-It also contains a production-grade Maricopa County Recorder scraper that can run daily on a VPS:
+---
 
-- Scrape search results (Playwright; handles Cloudflare challenge via stored session)
-- Extract recording numbers
-- Call public metadata API
-- Download PDF
-- OCR (Tesseract)
-- Rule-based field extraction (baseline)
-- Store into PostgreSQL (Supabase) + write local JSON
+## Project Structure
 
-## 0) Security first
+```
+automation/
+├── maricopa_scraper/       Core package
+│   ├── server.py           FastAPI production API server
+│   ├── scraper.py          Main scraper pipeline
+│   ├── maricopa_api.py     Public API client (discovery + metadata)
+│   ├── db_postgres.py      Supabase/Postgres operations
+│   ├── pdf_downloader.py   In-memory PDF fetch (no disk write)
+│   ├── ocr_pipeline.py     Tesseract OCR
+│   └── extract_rules.py    Field extraction (names, address, sale date, principal)
+├── scripts/
+│   └── db_smoke_check.py   DB health check
+├── run_server.sh           Start the API server
+├── run_cron.sh             Cron wrapper (runs every 10 min automatically)
+├── gunicorn.conf.py        Production server config
+├── Procfile                For Railway / Heroku deployment
+└── .env                    Secrets (never committed)
+```
 
-If you committed or shared your API key, rotate it immediately.
+---
 
-Also: the file `proxy_server/Webshare 10 proxies.txt` contains proxy credentials. Treat it as a secret and rotate/replace those credentials if they were ever committed/shared.
+## One-time Setup
 
-## 1) Install dependencies
+```bash
+# 1. Create virtual environment
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 
-From the repo root:
+# 2. Install system dependencies (macOS)
+brew install tesseract poppler
 
-- Install Python deps:
-  - `./.venv/bin/python -m pip install -U pip`
-  - `./.venv/bin/python -m pip install -r requirements.txt`
+# 3. Configure secrets
+cp .env.example .env
+# Edit .env and set DATABASE_URL to your Supabase connection string
+```
 
-Additional system deps for OCR on macOS:
+---
 
-- `brew install tesseract poppler`
+## Start the Server
 
-Playwright browser install (required for the search page):
+```bash
+# Development (foreground, auto-reload)
+./run_server.sh
 
-- `./.venv/bin/python -m playwright install chromium`
+# Production (gunicorn, background daemon)
+DAEMON=1 PRODUCTION=1 ./run_server.sh
 
-This automation uses the official `openai` Python package.
+# Restart production server
+DAEMON=1 RESTART=1 PRODUCTION=1 ./run_server.sh
 
-## 2) Configure environment
+# Stop server
+kill $(cat logs/server.pid)
 
-Create `automation/.env` (or export env vars) with:
+# View server logs
+tail -f logs/server.log
+```
 
-- `OPENAI_API_KEY=...` (recommended)
-- `OPENAI_MODEL=gpt-4.1` (optional)
+Server:          http://localhost:8080
+Interactive docs: http://localhost:8080/docs
 
-For the Maricopa scraper (Postgres):
+---
 
-- `DATABASE_URL=postgresql://...` (Supabase connection string)
-- Optional: `PROXY_LIST_PATH=proxy_list.txt`
-- Optional: `LOG_LEVEL=INFO`
+## API Endpoints
 
-For backward compatibility, `OPEN_API_KEY` is also accepted.
+### GET /api/v1/health
+Returns DB connectivity status and active job count.
 
-## 3) Run single-file extraction
+---
+
+### POST /api/v1/scrape
+Trigger a scrape for any date range. Returns a jobId immediately.
+
+Request body (JSON):
+
+  begin_date    "2026-03-05"   Start date YYYY-MM-DD
+  end_date      "2026-03-05"   End date YYYY-MM-DD (defaults to today)
+  days          1              Days back from end_date (ignored when begin_date is set)
+  document_code "ALL"          ALL = every type; or specific codes: NS, DT, REL D/T
+  limit         0              Max docs; 0 = no cap (process everything found)
+  pdf_mode      "memory"       memory = OCR without writing PDF to disk
+  only_new      false          Skip docs already stored in the DB
 
 Example:
+```json
+{
+  "begin_date":    "2026-03-05",
+  "end_date":      "2026-03-05",
+  "document_code": "ALL",
+  "limit":         0,
+  "pdf_mode":      "memory"
+}
+```
 
-- `./.venv/bin/python -m automation.backend.extract_notice_json \
-  --in downloads/NS_2025-10-01_to_2026-01-01/20250569128.txt \
-  --out output/notice_20250569128.json \
-  --recording-number 20250569128`
+Response (202):
+```json
+{
+  "jobId":         "abc123",
+  "status":        "queued",
+  "statusUrl":     "/api/v1/jobs/abc123",
+  "logUrl":        "/api/v1/jobs/abc123/log",
+  "resultsUrl":    "/api/v1/jobs/abc123/results",
+  "supabaseTable": "documents"
+}
+```
 
-## 4) Run batch extraction
+---
 
-Process a directory of OCR `.txt` files:
+### GET /api/v1/jobs/{jobId}
+Job status: queued | running | done | error
 
-- `./.venv/bin/python -m automation.backend.run_batch_extract \
-  --txt-dir downloads/NS_2025-10-01_to_2026-01-01 \
-  --out-jsonl output/notice_extract.jsonl \
-  --out-csv output/notice_extract.csv`
+### GET /api/v1/jobs/{jobId}/log
+Live log output as plain text. Call repeatedly while status == running.
 
-Useful flags:
-- `--continue-on-error` keeps going on failures
-- `--resume` appends to `--out-jsonl` and skips already-processed `recording_number`s
-- `--sleep 0.2` adds a delay between requests
+### GET /api/v1/jobs/{jobId}/results
+Download completed results as CSV. Optional ?cities=Scottsdale,Phoenix filter.
 
-## 5) Optional: upsert to Supabase (PostgreSQL)
+---
 
-If you want the final validated JSON rows written to Postgres via Supabase REST:
+## Usage — curl examples
 
-- Set env vars (recommended) or pass flags:
-  - `SUPABASE_URL=...`
-  - `SUPABASE_SERVICE_ROLE_KEY=...`
-  - `SUPABASE_TABLE=notice_extracts`
+### Full day scrape for a specific date
 
-Then run:
+```bash
+JOB=$(curl -s -X POST http://localhost:8080/api/v1/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"begin_date":"2026-03-05","end_date":"2026-03-05","document_code":"ALL","limit":0,"pdf_mode":"memory"}')
+echo $JOB
 
-- `./.venv/bin/python -m automation.backend.run_batch_extract \
-  --txt-dir downloads/NS_2025-10-01_to_2026-01-01 \
-  --out-jsonl output/notice_extract.jsonl \
-  --out-csv output/notice_extract.csv \
-  --supabase-url "$SUPABASE_URL" \
-  --supabase-key "$SUPABASE_SERVICE_ROLE_KEY" \
-  --supabase-table "$SUPABASE_TABLE"`
+JOB_ID=$(echo $JOB | python3 -c "import sys,json; print(json.load(sys.stdin)['jobId'])")
+```
 
-Outputs:
-- JSONL: one JSON object per line
-- CSV: flattened table for spreadsheets
+### Watch live progress
 
-## Notes
+```bash
+curl http://localhost:8080/api/v1/jobs/$JOB_ID/log
+```
 
-- The validator normalizes:
-  - `sale_date` to ISO `YYYY-MM-DD` when parseable
-  - `original_principal_balance` to digits/decimal only
-- It can also fill `address_unit`, `city`, `state`, `zip` from `property_address` deterministically (no guessing). Disable with `--no-fill-from-address` for the single-file script.
+### Check status
 
-## Maricopa daily scraper (end-to-end)
+```bash
+curl http://localhost:8080/api/v1/jobs/$JOB_ID
+```
 
-Entry point:
+### Download CSV when done
 
-- `./.venv/bin/python -m automation.maricopa_scraper.scraper --no-db --headful`
+```bash
+curl -o results.csv http://localhost:8080/api/v1/jobs/$JOB_ID/results
+```
 
-### Why you may see fewer records than the website
+### Last 3 days
 
-The website page you shared is Cloudflare-protected. We **do not** scrape that HTML page.
-Instead, we discover recording numbers via the public API:
+```bash
+curl -X POST http://localhost:8080/api/v1/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"days":3,"document_code":"ALL","limit":0,"pdf_mode":"memory"}'
+```
 
-- `GET https://publicapi.recorder.maricopa.gov/documents/search`
+### Today only — skip already-stored records
 
-This API can return **more** than “100+” (e.g. 501 for 2026-03-05).
+```bash
+curl -X POST http://localhost:8080/api/v1/scrape \
+  -H "Content-Type: application/json" \
+  -d '{"document_code":"ALL","limit":0,"pdf_mode":"memory","only_new":true}'
+```
 
-If you still see fewer rows, it’s usually one of these:
+---
 
-- You ran with `DOCUMENT_CODE=NS` (default), which filters to a subset.
-- You ran with a positive `LIMIT` (default 100).
-- `ONLY_NEW=1` (default) skips previously-seen/DB-existing recording numbers.
+## Run scraper directly (no server needed)
 
-Also note: some recording numbers return `404` on the legacy PDF endpoint. In that case OCR/leads cannot be extracted, but we still output/store the recording number + metadata and record a failure for later retry.
+```bash
+source .env && ./.venv/bin/python -m automation.maricopa_scraper.scraper \
+  --begin-date 2026-03-05 \
+  --end-date   2026-03-05 \
+  --document-code ALL \
+  --limit 0 \
+  --pdf-mode memory \
+  --db-url "$DATABASE_URL" \
+  --log-level INFO
+```
 
-### Get ALL recording numbers for a day (recommended first step)
+---
 
-This fetches *all* document types and does not cap the run:
+## Cron (automatic every 10 minutes)
 
-- `DOCUMENT_CODE=ALL LIMIT=0 ONLY_NEW=0 METADATA_ONLY=1 ./run_scraper.sh`
+Fetches 50 new documents per run — covers all 600+ daily documents automatically.
 
-Then (heavier) OCR + extraction:
+```bash
+# View current cron jobs
+crontab -l
 
-- `DOCUMENT_CODE=ALL LIMIT=0 ONLY_NEW=0 PDF_MODE=memory ./run_scraper.sh`
+# Install cron (if not already added)
+(crontab -l 2>/dev/null; echo "*/10 * * * * /Users/vishaljha/Desktop/web\ scrapping/automation/run_cron.sh") | crontab -
 
-### Start server and monitor progress
+# Remove cron job
+crontab -l | grep -v run_cron.sh | crontab -
 
-Start the API server detached:
+# Watch today's cron log live
+tail -f logs/cron_$(date +%Y-%m-%d).log
+```
 
-- `DAEMON=1 RESTART=1 ./run_server.sh`
+---
 
-Watch server logs:
+## DB health check
 
-- `tail -n 200 -f logs/server.log`
+```bash
+source .env && ./.venv/bin/python scripts/db_smoke_check.py
+```
 
-Trigger a job (returns a `jobId`):
+---
 
-- `curl -sS -X POST "http://127.0.0.1:8080/run?wait=false" -H "content-type: application/json" -d '{"document_code":"ALL","days":1,"limit":0,"only_new":false,"pdf_mode":"memory"}'`
+## Supabase Tables
 
-Check job status:
-
-- `curl -sS "http://127.0.0.1:8080/jobs/<jobId>"`
-- `curl -sS "http://127.0.0.1:8080/jobs/<jobId>/csv" > output/job.csv`
-
-### Supabase DB storage
-
-To store records in Supabase Postgres, create `automation/.env` and set:
-
-- `DATABASE_URL=postgresql://...`
-
-Then restart the server (`RESTART=1`) and run the scraper normally; it will upsert documents early, store OCR txt path, and mark processing timestamps.
-
-Important: the Maricopa search page returns `403` to plain HTTP due to a Cloudflare challenge. The scraper uses Playwright.
-
-Recommended first run (interactive, to pass the challenge and save cookies):
-
-- `./.venv/bin/python -m automation.maricopa_scraper.scraper --headful --no-db --days 1 --limit 10`
-
-This writes:
-
-- `storage_state.json` (Playwright cookies/session)
-- `downloads/documents/<recording>.pdf`
-- `downloads/ocr_text/<recording>.txt`
-- `output/output.json`
-
-Then a headless run is typically enough for cron:
-
-- `./.venv/bin/python -m automation.maricopa_scraper.scraper --days 1 --limit 100 --db-url "$DATABASE_URL"`
-
-### Proxies (optional)
-
-- Put proxies in `proxy_list.txt` and run with `--use-proxy`.
-- For Playwright itself, pass `--playwright-proxy http://host:port`.
-
-## Cron on a VPS
-
-Make the runner executable:
-
-- `chmod +x run_scraper.sh`
-
-If you also want an HTTP endpoint to download the latest CSV:
-
-- `chmod +x run_server.sh`
-
-Crontab example (runs daily at 2am):
-
-- `0 2 * * * /path/to/automation/run_scraper.sh`
-
-If you want to keep a dated CSV archive each run, set `OUT_CSV_DATED=1` in cron:
-
-- `0 2 * * * OUT_CSV_DATED=1 /path/to/automation/run_scraper.sh`
-
-### CSV download endpoint
-
-Run the API server:
-
-- `./run_server.sh`
-
-Run it detached (writes `logs/server.log` + `logs/server.pid`):
-
-- `DAEMON=1 ./run_server.sh`
-
-Stop the detached server:
-
-- `kill "$(cat logs/server.pid)"`
-
-Endpoints:
-
-- `GET /health`
-- `GET /cities`
-- `GET /csv/latest` (latest CSV)
-- `GET /csv/latest?city=Phoenix` (filters by city when `output/new_records_latest.json` exists)
-- `GET /csv/latest?cities=Phoenix,Tempe` (multi-city filter)
-
-On-demand trigger:
-
-- `POST /run` (starts a scrape job; recommended to protect with `API_TOKEN`)
-- Tip: pass `recording_numbers` to bypass Playwright search (useful if Cloudflare blocks headless search)
-- `GET /jobs/<jobId>`
-- `GET /jobs/<jobId>/csv` (optional filter: `?cities=Phoenix,Tempe`)
-
-Security:
-
-- Set `API_TOKEN=...` and send header `x-api-token: ...` to `POST /run`.
-
-Logs:
-
-- `logs/scraper.log`
-
-# Automated-Scrapping-for-Real-estate-leads-within-24-hours
+  documents       One row per recording number — metadata + full OCR text
+  properties      Extracted fields: trustor names, address, sale date, principal balance
+  scrape_failures Failed records (404 PDFs auto-resolved, never retried)

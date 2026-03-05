@@ -1,0 +1,28 @@
+# System
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+proxy_list.txt
+
+# Runtime artifacts
+downloads/
+output/
+logs/
+storage_state.json
+
+# Editor
+.vscode/
+.idea/
