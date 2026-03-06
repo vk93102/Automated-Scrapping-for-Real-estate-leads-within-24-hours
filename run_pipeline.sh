@@ -4,6 +4,9 @@
 #
 # Schedule: Every 2 hours, 12 times per day (0 */2 * * *)
 #
+# For testing: run every 10 minutes (uncomment in your crontab while testing):
+#   */10 * * * * /absolute/path/to/run_pipeline.sh >> /absolute/path/to/logs/cron_test.log 2>&1
+#
 # Pipeline per run:
 #   1. Fetch today's recording numbers from Maricopa public API
 #   2. Check DB → skip already-processed records
@@ -86,9 +89,9 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 
 EXIT_CODE=0
 "$PY_BIN" -m maricopa_scraper.scraper \
-  --document-code ALL \
+  --document-code "N/TR SALE" \
   --days 1 \
-  --limit 500 \
+  --limit  \
   --pdf-mode memory \
   --sleep 0.3 \
   --only-new \

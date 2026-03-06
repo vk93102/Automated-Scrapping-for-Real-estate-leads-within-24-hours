@@ -16,12 +16,23 @@ venv/
 # Secrets — never commit
 .env
 proxy_list.txt
+proxyserver.txt
+storage_state.json
+storage_state.json.bak
+
+# Debug / shell trace output (contain env vars with secrets)
+run_debug.out
+run_debug_ns.out
+*.out
+
+# Log files (may contain secrets via set -x)
+*.log
+maricopa_scraper/*.log
 
 # Runtime artifacts
 downloads/
 output/
 logs/
-storage_state.json
 
 # Editor
 .vscode/

@@ -47,15 +47,24 @@ def search_recording_numbers(
     total_results: Optional[int] = None
 
     while True:
+        # Match the real API URL format used by the Maricopa Recorder site:
+        # ?businessNames=&firstNames=&lastNames=&middleNameIs=
+        #   &documentCode=NS&beginDate=...&endDate=...&pageSize=5000&pageNumber=1&maxResults=500
         params: dict[str, Any] = {
+            "businessNames": "",
+            "firstNames": "",
+            "lastNames": "",
+            "middleNameIs": "",
             "beginDate": begin_date.isoformat(),
             "endDate": end_date.isoformat(),
             "pageNumber": page_number,
             "pageSize": int(page_size),
+            "maxResults": max_results if max_results is not None else 5000,
         }
         if codes:
-            # Requests will encode list values as repeated query params.
-            params["documentCode"] = codes
+            # Pass as a single comma-joined string — the API expects one
+            # documentCode value (e.g. documentCode=NS), not repeated params.
+            params["documentCode"] = ",".join(codes)
 
         def _do() -> requests.Response:
             return session.get(url, params=params, timeout=timeout_s, proxies=proxies)
@@ -77,7 +86,8 @@ def search_recording_numbers(
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            rn = row.get("recordingNumber")
+            # The search API may return recording numbers in different keys
+            rn = row.get("recordingNumber") or row.get("RecordingNumber") or row.get("recording_number")
             if rn is None:
                 continue
             rn_s = str(rn).strip()

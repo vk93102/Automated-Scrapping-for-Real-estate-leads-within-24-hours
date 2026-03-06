@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Optional
+from typing import Optional, Any, Dict
 
 import psycopg
 
 from .extract_rules import ExtractedFields
 from .maricopa_api import DocumentMetadata
+import json
 
 
 def ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
-        # Core documents table — every recording number lands here immediately after metadata fetch.
+        # Minimal schema: `documents` and `cron_jobs`.
         cur.execute(
             """
             create table if not exists documents (
@@ -22,106 +23,74 @@ def ensure_schema(conn: psycopg.Connection) -> None:
               page_amount      integer,
               names            text,
               restricted       boolean,
+              metadata         jsonb,
+              properties       jsonb,
               ocr_text         text,
-              ocr_text_path    text,
+              last_failure     jsonb,
+              failed           boolean default false,
               last_processed_at timestamptz,
-              created_at       timestamptz not null default now()
-            );
-            """
-        )
-
-        # Backward-compatible column additions so existing tables upgrade in place.
-        for col_sql in [
-            "alter table documents add column if not exists names text;",
-            "alter table documents add column if not exists restricted boolean;",
-            "alter table documents add column if not exists ocr_text text;",
-            "alter table documents add column if not exists ocr_text_path text;",
-            "alter table documents add column if not exists last_processed_at timestamptz;",
-        ]:
-            cur.execute(col_sql)
-
-        # Extracted lead fields from OCR.
-        cur.execute(
-            """
-            create table if not exists properties (
-              id               bigserial primary key,
-              document_id      bigint unique references documents(id) on delete cascade,
-              trustor_1_full_name  text,
-              trustor_1_first_name text,
-              trustor_1_last_name  text,
-              trustor_2_full_name  text,
-              trustor_2_first_name text,
-              trustor_2_last_name  text,
-              property_address text,
-              address_city     text,
-              address_state    text,
-              address_zip      text,
-              address_unit     text,
-              sale_date        text,
-              original_principal_balance text,
-              llm_model        text,
               created_at       timestamptz not null default now(),
               updated_at       timestamptz not null default now()
             );
             """
         )
 
-        # Ensure unique constraint on document_id — deduplicate first to avoid constraint errors.
+        # Lightweight table to store cron/pipeline progress and logs. One row per run.
         cur.execute(
             """
-            do $$ begin
-              if not exists (
-                select 1 from pg_constraint where conname = 'properties_document_id_unique'
-              ) then
-                -- Remove duplicates (keep newest row per document)
-                delete from properties a using properties b
-                  where a.id < b.id and a.document_id = b.document_id;
-                alter table properties add constraint properties_document_id_unique unique (document_id);
-              end if;
-            end $$;
-            """
-        )
-
-        # Backward-compatible column additions for properties.
-        for col_sql in [
-            "alter table properties add column if not exists llm_model text;",
-            "alter table properties add column if not exists updated_at timestamptz not null default now();",
-        ]:
-            cur.execute(col_sql)
-
-        # Per-recording failure tracking for retries.
-        cur.execute(
-            """
-            create table if not exists scrape_failures (
-              id               bigserial primary key,
-              recording_number text unique not null,
-              stage            text not null,
-              error            text,
-              attempts         integer not null default 1,
-              resolved         boolean not null default false,
-              last_attempt_at  timestamptz not null default now()
-            );
-            """
-        )
-
-        # Pipeline run audit table — one row per cron execution.
-        cur.execute(
-            """
-            create table if not exists pipeline_runs (
+            create table if not exists cron_jobs (
               id               bigserial primary key,
               run_id           text unique not null,
-              begin_date       text,
-              end_date         text,
+              job_name         text,
               status           text not null default 'running',
               total_found      integer,
               total_skipped    integer default 0,
               total_processed  integer default 0,
               total_failed     integer default 0,
-              total_ocr        integer default 0,
-              total_llm        integer default 0,
               started_at       timestamptz not null default now(),
               finished_at      timestamptz,
-              error_message    text
+              last_updated_at  timestamptz not null default now(),
+              error_message    text,
+              raw_log          text
+            );
+            """
+        )
+
+        # Explicit properties table with columns requested by user.
+        cur.execute(
+            """
+            create table if not exists properties (
+              id                         bigserial primary key,
+              document_id                bigint references documents(id) on delete cascade,
+              trustor_1_full_name        text,
+              trustor_1_first_name       text,
+              trustor_1_last_name        text,
+              trustor_2_full_name        text,
+              trustor_2_first_name       text,
+              trustor_2_last_name        text,
+              address_city               text,
+              address_state              text,
+              address_zip                text,
+              property_address           text,
+              sale_date                  text,
+              original_principal_balance text,
+              address_unit               text,
+              llm_model                  text,
+              created_at                 timestamptz not null default now(),
+              updated_at                 timestamptz not null default now(),
+              unique (document_id)
+            );
+            """
+        )
+
+        # Store discovered recording numbers (raw discovery) for auditing/backfill
+        cur.execute(
+            """
+            create table if not exists discovered_recordings (
+              id               bigserial primary key,
+              recording_number text unique not null,
+              metadata         jsonb,
+              discovered_at    timestamptz not null default now()
             );
             """
         )
@@ -136,18 +105,29 @@ def upsert_document(conn: psycopg.Connection, meta: DocumentMetadata) -> int:
     """Insert or update a document row from API metadata. Returns the row id."""
     doc_type = meta.document_codes[0] if meta.document_codes else None
     names_str = ", ".join(meta.names) if meta.names else None
+    # Compact metadata JSON
+    meta_json: Dict[str, Any] = {
+        "recording_number": meta.recording_number,
+        "recording_date": meta.recording_date,
+        "document_codes": list(meta.document_codes) if getattr(meta, "document_codes", None) else None,
+        "page_amount": meta.page_amount,
+        "names": list(meta.names) if getattr(meta, "names", None) else None,
+        "restricted": meta.restricted,
+    }
     with conn.cursor() as cur:
         cur.execute(
             """
             insert into documents
-              (recording_number, recording_date, document_type, page_amount, names, restricted)
-            values (%s, %s, %s, %s, %s, %s)
+              (recording_number, recording_date, document_type, page_amount, names, restricted, metadata)
+            values (%s, %s, %s, %s, %s, %s, %s::jsonb)
             on conflict (recording_number) do update set
               recording_date = excluded.recording_date,
               document_type  = excluded.document_type,
               page_amount    = excluded.page_amount,
               names          = excluded.names,
-              restricted     = excluded.restricted
+              restricted     = excluded.restricted,
+              metadata       = excluded.metadata,
+              updated_at     = now()
             returning id;
             """,
             (
@@ -157,11 +137,32 @@ def upsert_document(conn: psycopg.Connection, meta: DocumentMetadata) -> int:
                 meta.page_amount,
                 names_str,
                 meta.restricted,
+                json.dumps(meta_json),
             ),
         )
         doc_id = int(cur.fetchone()[0])
     conn.commit()
     return doc_id
+
+
+def insert_discovered_recording(conn: psycopg.Connection, recording_number: str, metadata: Optional[Dict[str, Any]] = None) -> int:
+    """Insert or update a discovered recording number for auditing. Returns the row id."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            insert into discovered_recordings (recording_number, metadata)
+            values (%s, %s::jsonb)
+            on conflict (recording_number) do update set
+              metadata = coalesce(discovered_recordings.metadata, excluded.metadata),
+              discovered_at = coalesce(discovered_recordings.discovered_at, now())
+            returning id;
+            """,
+            (recording_number, json.dumps(metadata) if metadata is not None else None),
+        )
+        row = cur.fetchone()
+        rid = int(row[0]) if row else None
+    conn.commit()
+    return rid
 
 
 def update_document_ocr_text(
@@ -174,7 +175,7 @@ def update_document_ocr_text(
         cur.execute(
             """
             update documents
-            set ocr_text = %s, last_processed_at = now()
+            set ocr_text = %s, last_processed_at = now(), updated_at = now()
             where recording_number = %s;
             """,
             (ocr_text or "", recording_number),
@@ -186,7 +187,7 @@ def update_document_ocr_text(
 def mark_processed(conn: psycopg.Connection, recording_number: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "update documents set last_processed_at = now() where recording_number = %s;",
+            "update documents set last_processed_at = now(), updated_at = now() where recording_number = %s;",
             (recording_number,),
         )
     conn.commit()
@@ -203,19 +204,23 @@ def record_failure(
     stage: str,
     error: str,
 ) -> None:
+    # Store last failure as JSON on the documents row (no separate failures table).
+    failure_json = {
+        "stage": stage,
+        "error": (error or "")[:5000],
+        "attempts": 1,
+    }
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into scrape_failures (recording_number, stage, error, attempts, resolved)
-            values (%s, %s, %s, 1, false)
+            insert into documents (recording_number, failed, last_failure)
+            values (%s, true, %s::jsonb)
             on conflict (recording_number) do update set
-              stage           = excluded.stage,
-              error           = excluded.error,
-              attempts        = scrape_failures.attempts + 1,
-              resolved        = false,
-              last_attempt_at = now();
+              failed = true,
+              last_failure = %s::jsonb,
+              updated_at = now();
             """,
-            (recording_number, stage, (error or "")[:5000]),
+            (recording_number, json.dumps(failure_json), json.dumps(failure_json)),
         )
     conn.commit()
 
@@ -223,7 +228,7 @@ def record_failure(
 def mark_resolved(conn: psycopg.Connection, recording_number: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
-            "update scrape_failures set resolved = true, last_attempt_at = now() where recording_number = %s;",
+            "update documents set failed = false, last_failure = null, updated_at = now() where recording_number = %s;",
             (recording_number,),
         )
     conn.commit()
@@ -243,11 +248,11 @@ def get_document_id(conn: psycopg.Connection, recording_number: str) -> Optional
 def has_unresolved_failure(conn: psycopg.Connection, recording_number: str) -> bool:
     with conn.cursor() as cur:
         cur.execute(
-            "select resolved from scrape_failures where recording_number = %s;",
+            "select failed from documents where recording_number = %s;",
             (recording_number,),
         )
         row = cur.fetchone()
-        return False if not row else (bool(row[0]) is False)
+        return False if not row else bool(row[0])
 
 
 def has_any_failure(conn: psycopg.Connection, recording_number: str) -> bool:
@@ -255,7 +260,7 @@ def has_any_failure(conn: psycopg.Connection, recording_number: str) -> bool:
     resolved or not. Used to skip permanently broken / 404 records."""
     with conn.cursor() as cur:
         cur.execute(
-            "select 1 from scrape_failures where recording_number = %s limit 1;",
+            "select 1 from documents where recording_number = %s limit 1;",
             (recording_number,),
         )
         return cur.fetchone() is not None
@@ -273,40 +278,55 @@ def upsert_properties(
 ) -> int:
     """Insert or update extracted properties row (idempotent — safe to call on retries)."""
     d = asdict(fields)
-    cols = [
-        "document_id",
-        "trustor_1_full_name",
-        "trustor_1_first_name",
-        "trustor_1_last_name",
-        "trustor_2_full_name",
-        "trustor_2_first_name",
-        "trustor_2_last_name",
-        "property_address",
-        "address_city",
-        "address_state",
-        "address_zip",
-        "address_unit",
-        "sale_date",
-        "original_principal_balance",
-        "llm_model",
-    ]
-    vals = [document_id] + [d.get(c) for c in cols[1:-1]] + [llm_model]
-    update_set = ", ".join(
-        f"{c} = excluded.{c}"
-        for c in cols
-        if c != "document_id"
-    ) + ", updated_at = now()"
+    # Map fields to the explicit properties table columns.
+    vals = (
+        document_id,
+        d.get("trustor_1_full_name"),
+        d.get("trustor_1_first_name"),
+        d.get("trustor_1_last_name"),
+        d.get("trustor_2_full_name"),
+        d.get("trustor_2_first_name"),
+        d.get("trustor_2_last_name"),
+        d.get("address_city"),
+        d.get("address_state"),
+        d.get("address_zip"),
+        d.get("property_address"),
+        d.get("sale_date"),
+        d.get("original_principal_balance"),
+        d.get("address_unit"),
+        llm_model,
+    )
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            insert into properties ({', '.join(cols)})
-            values ({', '.join(['%s'] * len(cols))})
-            on conflict (document_id) do update set {update_set}
+            """
+            insert into properties (
+              document_id, trustor_1_full_name, trustor_1_first_name, trustor_1_last_name,
+              trustor_2_full_name, trustor_2_first_name, trustor_2_last_name,
+              address_city, address_state, address_zip, property_address,
+              sale_date, original_principal_balance, address_unit, llm_model
+            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict (document_id) do update set
+              trustor_1_full_name = excluded.trustor_1_full_name,
+              trustor_1_first_name = excluded.trustor_1_first_name,
+              trustor_1_last_name = excluded.trustor_1_last_name,
+              trustor_2_full_name = excluded.trustor_2_full_name,
+              trustor_2_first_name = excluded.trustor_2_first_name,
+              trustor_2_last_name = excluded.trustor_2_last_name,
+              address_city = excluded.address_city,
+              address_state = excluded.address_state,
+              address_zip = excluded.address_zip,
+              property_address = excluded.property_address,
+              sale_date = excluded.sale_date,
+              original_principal_balance = excluded.original_principal_balance,
+              address_unit = excluded.address_unit,
+              llm_model = excluded.llm_model,
+              updated_at = now()
             returning id;
             """,
             vals,
         )
-        prop_id = int(cur.fetchone()[0])
+        row = cur.fetchone()
+        prop_id = int(row[0]) if row else document_id
     conn.commit()
     return prop_id
 
@@ -332,18 +352,20 @@ def start_pipeline_run(
     total_found: int,
 ) -> int:
     """Record a new pipeline run, return the run row id."""
+    # Record into cron_jobs table for unified, lightweight tracking.
     with conn.cursor() as cur:
         cur.execute(
             """
-            insert into pipeline_runs (run_id, begin_date, end_date, status, total_found)
-            values (%s, %s, %s, 'running', %s)
+            insert into cron_jobs (run_id, job_name, status, total_found, started_at)
+            values (%s, %s, 'running', %s, now())
             on conflict (run_id) do update set
               total_found = excluded.total_found,
-              started_at  = now(),
-              status      = 'running'
+              status = 'running',
+              last_updated_at = now(),
+              started_at = coalesce(cron_jobs.started_at, now())
             returning id;
             """,
-            (run_id, begin_date, end_date, total_found),
+            (run_id, 'maricopa_pipeline', total_found),
         )
         run_db_id = int(cur.fetchone()[0])
     conn.commit()
@@ -366,19 +388,17 @@ def finish_pipeline_run(
     with conn.cursor() as cur:
         cur.execute(
             """
-            update pipeline_runs set
-              status          = %s,
-              total_skipped   = %s,
+            update cron_jobs set
+              status = %s,
+              total_skipped = %s,
               total_processed = %s,
-              total_failed    = %s,
-              total_ocr       = %s,
-              total_llm       = %s,
-              finished_at     = now(),
-              error_message   = %s
+              total_failed = %s,
+              finished_at = now(),
+              last_updated_at = now(),
+              error_message = %s
             where run_id = %s;
             """,
-            (status, total_skipped, total_processed, total_failed,
-             total_ocr, total_llm, error_message, run_id),
+            (status, total_skipped, total_processed, total_failed, error_message, run_id),
         )
     conn.commit()
 
