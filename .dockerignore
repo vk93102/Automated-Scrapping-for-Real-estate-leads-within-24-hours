@@ -1,0 +1,30 @@
+.git
+.venv
+.venv_old
+__pycache__
+*.pyc
+*.pyo
+*.pth
+
+# Local secrets — injected via Coolify env vars
+.env
+
+# Dev artifacts
+*.out
+*.log
+logs/
+output/
+tmp/
+storage_state.json
+storage_state.json.bak
+proxy_list.txt
+proxyserver.txt
+
+# Editor
+.vscode/
+.idea/
+.DS_Store
+
+# Test files
+live_test_*.py
+run_debug*.out

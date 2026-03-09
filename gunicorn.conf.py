@@ -8,7 +8,7 @@ IMPORTANT — workers must stay at 1
 
 Usage:
   # foreground (dev)
-  gunicorn -c gunicorn.conf.py automation.maricopa_scraper.server:app
+  gunicorn -c gunicorn.conf.py maricopa_scraper.server:app
 
   # daemon (production)
   DAEMON=1 PRODUCTION=1 ./run_server.sh
