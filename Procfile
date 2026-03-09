@@ -1,1 +1,1 @@
-web: gunicorn -c gunicorn.conf.py automation.maricopa_scraper.server:app
+web: gunicorn -c gunicorn.conf.py maricopa_scraper.server:app
