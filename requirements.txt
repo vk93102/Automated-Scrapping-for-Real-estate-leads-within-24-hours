@@ -10,8 +10,9 @@ fastapi
 uvicorn[standard]
 gunicorn
 
-# Utilities
-beautifulsoup4
+# LLM extraction (Groq — llama-3.1-8b-instant)
+# Falls back to rule-based extraction automatically when GROQ_API_KEY is not set.
+groq
 
 # Optional: only needed if using --search-backend playwright (not used in production)
 # playwright
