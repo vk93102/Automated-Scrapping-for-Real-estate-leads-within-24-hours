@@ -8,9 +8,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     curl \
     cron \
+    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+ENV TZ=America/Phoenix
 
 # ── Stage 2: deps ──────────────────────────────────────────────────────────
 FROM base AS deps
@@ -23,6 +26,8 @@ RUN pip install --no-cache-dir --upgrade pip \
 FROM deps AS final
 
 WORKDIR /app
+
+ENV TZ=America/Phoenix
 
 # Copy project files
 COPY . .

@@ -2,10 +2,7 @@
 # =============================================================================
 # run_pipeline.sh — Production cron wrapper for Maricopa County Recorder scraper
 #
-# Schedule: Every 2 hours, 12 times per day (0 */2 * * *)
-#
-# For testing: run every 10 minutes (uncomment in your crontab while testing):
-#   */10 * * * * /absolute/path/to/run_pipeline.sh >> /absolute/path/to/logs/cron_test.log 2>&1
+# Schedule: Every 10 minutes (*/10 * * * *)
 #
 # Pipeline per run:
 #   1. Fetch today's recording numbers from Maricopa public API
@@ -47,6 +44,10 @@ if [[ -f "$DIR/.env" ]]; then
   set +a
 fi
 
+# ── Arizona time by default ──────────────────────────────────────────────────
+# Maricopa County runs on Phoenix time year-round (no DST switch).
+export TZ="${TZ:-America/Phoenix}"
+
 # ── Validate required env vars ────────────────────────────────────────────────
 if [[ ! -x "$PY_BIN" ]]; then
   echo "[pipeline] FATAL: Python venv not found at $PY_BIN" | tee -a "$LOG_FILE"
@@ -68,12 +69,21 @@ if [[ -z "${GROQ_API_KEY:-}" ]]; then
   echo "[pipeline] WARNING: GROQ_API_KEY not set — LLM extraction will use fallback" | tee -a "$LOG_FILE"
 fi
 
+# ── Optional US proxy rotation ────────────────────────────────────────────────
+USE_PROXY_FLAG=()
+if [[ "${USE_PROXY:-false}" == "true" ]]; then
+  USE_PROXY_FLAG=(--use-proxy)
+  if [[ -z "${PROXY_LIST_PATH:-}" ]]; then
+    echo "[pipeline] WARNING: USE_PROXY=true but PROXY_LIST_PATH is not set" | tee -a "$LOG_FILE"
+  fi
+fi
+
 # ── Log run header ────────────────────────────────────────────────────────────
 TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 {
   echo ""
   echo "============================================================"
-  echo "[$TIMESTAMP] run_pipeline.sh starting (date=$TODAY)"
+  echo "[$TIMESTAMP] run_pipeline.sh starting (date=$TODAY, tz=$TZ, use_proxy=${USE_PROXY:-false})"
   echo "============================================================"
 } >> "$LOG_FILE"
 
@@ -91,10 +101,11 @@ EXIT_CODE=0
 "$PY_BIN" -m maricopa_scraper.scraper \
   --document-code "N/TR SALE" \
   --days 1 \
-  --limit  \
+  --limit 0 \
   --pdf-mode memory \
   --sleep 0.3 \
   --only-new \
+  "${USE_PROXY_FLAG[@]}" \
   --db-url "$DATABASE_URL" \
   --log-level INFO \
   --out-json  "$OUTPUT_DIR/pipeline_latest.json" \

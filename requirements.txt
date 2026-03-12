@@ -14,6 +14,9 @@ gunicorn
 # Falls back to rule-based extraction automatically when GROQ_API_KEY is not set.
 groq
 
+# HTML parsing for authenticated county assessor pages
+beautifulsoup4
+
 # Optional: only needed if using --search-backend playwright (not used in production)
 # playwright
 
