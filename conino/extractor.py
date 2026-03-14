@@ -54,6 +54,7 @@ class ExtractedRecord:
     grantees: list[str]
     legal_descriptions: list[str]
     property_address: str
+    principal_amount: str
     detail_url: str
     source_file: str
     raw_html: str
@@ -68,6 +69,7 @@ class ExtractedRecord:
             "grantees": self.grantees,
             "legalDescriptions": self.legal_descriptions,
             "propertyAddress": self.property_address,
+            "principalAmount": self.principal_amount,
             "detailUrl": self.detail_url,
             "sourceFile": self.source_file,
         }
@@ -288,12 +290,33 @@ def run_live_search(
     opener = build_opener(HTTPCookieProcessor())
     opener.open(Request(SEARCH_URL, headers=_search_headers(effective_cookie)), timeout=30).read()
     normalized_types = _normalize_document_types(document_types)
+    # Payload exactly mirrors the browser network request.
+    # Each document type is posted as a separate "field_selfservice_documentTypes-searchInput"
+    # entry (the JS autocomplete widget appends hidden inputs with that suffix).
+    # All other scaffold fields are sent empty, as the server validates their presence.
     payload: list[tuple[str, str]] = [
+        ("field_DocNum", ""),
         ("field_rdate_DOT_StartDate", _normalize_date(start_date)),
         ("field_rdate_DOT_EndDate", _normalize_date(end_date)),
+        ("field_BothID-containsInput", "Contains Any"),
+        ("field_BothID", ""),
+        ("field_BookPageID_DOT_Book", ""),
+        ("field_BookPageID_DOT_Page", ""),
+        ("field_PlattedID_DOT_Subdivision-containsInput", "Contains Any"),
+        ("field_PlattedID_DOT_Subdivision", ""),
+        ("field_PlattedID_DOT_Lot", ""),
+        ("field_PlattedID_DOT_Block", ""),
+        ("field_PlattedID_DOT_Tract", ""),
+        ("field_LegalCompID_DOT_QuarterSection-containsInput", "Contains Any"),
+        ("field_LegalCompID_DOT_QuarterSection", ""),
+        ("field_LegalCompID_DOT_Section", ""),
+        ("field_LegalCompID_DOT_Township", ""),
+        ("field_LegalCompID_DOT_Range", ""),
     ]
     for doc_type in normalized_types:
-        payload.append(("field_selfservice_documentTypes", doc_type))
+        payload.append(("field_selfservice_documentTypes-searchInput", doc_type))
+    payload.append(("field_selfservice_documentTypes-containsInput", "Contains Any"))
+    payload.append(("field_selfservice_documentTypes", ""))  # autocomplete text box — always empty
     post_request = Request(
         SEARCH_POST_URL,
         data=urlencode(payload).encode("utf-8"),
@@ -346,6 +369,7 @@ def _safe_slug(value: str) -> str:
 
 
 def build_document_pdf_url(document_id: str, recording_number: str, index: int = 1) -> str:
+    """Legacy fallback URL (DEGRADED format). Use fetch_document_real_pdf_url() instead."""
     clean_document_id = document_id.strip()
     clean_recording_number = recording_number.strip()
     if not clean_document_id or not clean_recording_number:
@@ -353,6 +377,111 @@ def build_document_pdf_url(document_id: str, recording_number: str, index: int =
     return (
         f"{BASE_URL}/web/document/servepdf/"
         f"DEGRADED-{clean_document_id}.{index}.pdf/{clean_recording_number}.pdf?index={index}"
+    )
+
+
+# UUID v4 regex used in Coconino's document-image URLs
+_UUID_RE = r"[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"
+
+
+def _extract_pdf_guid_from_html(html_body: str) -> tuple[str, str] | None:
+    """Scan a detail-page HTML for a pdfjs viewer link and return (guid, base_filename).
+
+    The link looks like:
+      /web/document-image-pdfjs/{doc_id}/{guid}/{filename}.pdf?allowDownload=true&index=N
+    """
+    pattern = re.compile(
+        rf"/web/document-image-pdfjs/[^/]+/({_UUID_RE})/([^\"'/?]+?)(?:\.pdf|\.PDF)",
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(html_body)
+    if match:
+        return match.group(1), match.group(2)
+    return None
+
+
+def _extract_iframe_pdf_path(html_body: str) -> str | None:
+    """Scan a pdfjs-viewer HTML page for the embedded direct-PDF path.
+
+    Looks for: src="/web/document-image-pdf/{doc_id}/{guid}/{filename}.pdf?index=N"
+    """
+    pattern = re.compile(
+        r'(?:src|data)=["\'](/web/document-image-pdf/[^"\'?]+\.pdf[^"\']*)["\']',
+        flags=re.IGNORECASE,
+    )
+    match = pattern.search(html_body)
+    return match.group(1) if match else None
+
+
+def fetch_document_real_pdf_url(
+    document_id: str,
+    cookie: str,
+    index: int = 1,
+    timeout_s: int = 60,
+) -> str:
+    """Discover the authenticated PDF download URL for a Coconino county document.
+
+    Steps:
+      1. Fetch the document detail page.
+      2. Look for a pdfjs viewer link → extract GUID + base filename.
+         Transform to: /web/document-image-pdf/{id}/{guid}/{file}-{idx}.pdf?index={idx}
+      3. Fallback A: look for a direct /web/document-image-pdf/ link in the detail page.
+      4. Fallback B: fetch the pdfjs viewer HTML and parse its iframe src.
+
+    Returns the absolute PDF download URL ready for GET with the session cookie.
+    """
+    effective_cookie = cookie.strip()
+    detail_url = f"{BASE_URL}/web/document/{document_id}?search=DOCSEARCH1213S1"
+    req = Request(detail_url, headers=_document_headers(document_id, effective_cookie), method="GET")
+    with urlopen(req, timeout=timeout_s) as resp:
+        detail_html = resp.read().decode("utf-8", errors="ignore")
+
+    # --- Primary: pdfjs link in detail page → direct URL via URL transformation ---
+    guid_result = _extract_pdf_guid_from_html(detail_html)
+    if guid_result:
+        guid, base_filename = guid_result
+        # pdfjs:  /web/document-image-pdfjs/{id}/{guid}/{file}.pdf?...&index=N
+        # direct: /web/document-image-pdf/{id}/{guid}/{file}-N.pdf?index=N
+        return (
+            f"{BASE_URL}/web/document-image-pdf/{document_id}/{guid}"
+            f"/{base_filename}-{index}.pdf?index={index}"
+        )
+
+    # --- Fallback A: direct image-pdf link already present in detail page ---
+    direct_pat = re.compile(
+        rf"/web/document-image-pdf/[^/]+/{_UUID_RE}/[^\"'?]+\.pdf",
+        flags=re.IGNORECASE,
+    )
+    direct_match = direct_pat.search(detail_html)
+    if direct_match:
+        path = direct_match.group(0)
+        sep = "&" if "?" in path else "?"
+        if "index=" not in path:
+            path = f"{path}{sep}index={index}"
+        return f"{BASE_URL}{path}"
+
+    # --- Fallback B: fetch the pdfjs viewer page and parse its iframe src ---
+    pdfjs_link_match = re.search(
+        r'href=["\'](?P<path>/web/document-image-pdfjs/[^"\']+)["\']',
+        detail_html,
+        flags=re.IGNORECASE,
+    )
+    if pdfjs_link_match:
+        pdfjs_url = f"{BASE_URL}{pdfjs_link_match.group('path')}"
+        pdfjs_req = Request(pdfjs_url, headers=_document_headers(document_id, effective_cookie), method="GET")
+        with urlopen(pdfjs_req, timeout=timeout_s) as pdfjs_resp:
+            pdfjs_html = pdfjs_resp.read().decode("utf-8", errors="ignore")
+        iframe_path = _extract_iframe_pdf_path(pdfjs_html)
+        if iframe_path:
+            sep = "&" if "?" in iframe_path else "?"
+            if "index=" not in iframe_path:
+                iframe_path = f"{iframe_path}{sep}index={index}"
+            return f"{BASE_URL}{iframe_path}"
+
+    raise RuntimeError(
+        f"Could not discover PDF URL for document {document_id}. "
+        f"Detail page returned {len(detail_html)} chars. "
+        f"The document may not have an associated image PDF."
     )
 
 
@@ -385,6 +514,28 @@ def _extract_address_candidates(text: str) -> list[str]:
     return candidates
 
 
+def _extract_currency_values(text: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(r"\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?", text or "", flags=re.IGNORECASE):
+        value = re.sub(r"\s+", "", match.group(0)).strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _extract_principal_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    pattern = re.compile(
+        r"(?:principal(?:\s+amount)?|loan\s+amount|original\s+amount|indebtedness|note\s+amount)[^$]{0,80}(\$\s*\d{1,3}(?:,\d{3})*(?:\.\d{2})?)",
+        flags=re.IGNORECASE,
+    )
+    for match in pattern.finditer(text or ""):
+        amount = re.sub(r"\s+", "", match.group(1)).strip()
+        if amount and amount not in candidates:
+            candidates.append(amount)
+    return candidates
+
+
 def fetch_document_detail_fields(document_id: str, cookie: str | None = None, timeout_s: int = 60) -> dict[str, Any]:
     load_env()
     effective_cookie = (cookie or os.environ.get("COCONINO_COOKIE", "")).strip()
@@ -414,15 +565,48 @@ def fetch_document_detail_fields(document_id: str, cookie: str | None = None, ti
         if values.get(key):
             property_address = values[key][0]
             break
+    if not property_address:
+        address_candidates = _extract_address_candidates(_clean_text(body))
+        if address_candidates:
+            property_address = address_candidates[0]
+
+    principal_amount = ""
+    amount_keys = (
+        "principal amount",
+        "principal",
+        "loan amount",
+        "original amount",
+        "original principal",
+        "amount",
+        "deed of trust amount",
+        "unpaid principal",
+    )
+    for key in amount_keys:
+        if values.get(key):
+            joined = " ".join(values.get(key, []))
+            money = _extract_currency_values(joined)
+            if money:
+                principal_amount = money[0]
+                break
+    if not principal_amount:
+        principal_candidates = _extract_principal_candidates(_clean_text(body))
+        if principal_candidates:
+            principal_amount = principal_candidates[0]
+
     subdivision = ""
     lot = ""
     platted_match = re.search(r"Subdivision:\s*</strong>\s*([^<]+).*?Unit/Lot:\s*</strong>\s*([^<]+)", body, flags=re.IGNORECASE | re.DOTALL)
     if platted_match:
         subdivision = _clean_text(platted_match.group(1))
         lot = _clean_text(platted_match.group(2))
+    if not property_address and subdivision:
+        property_address = f"Subdivision {subdivision}"
+        if lot:
+            property_address = f"{property_address} Lot {lot}"
     return {
         "detailUrl": url,
         "propertyAddress": property_address,
+        "principalAmount": principal_amount,
         "grantors": values.get("grantor", []),
         "grantees": values.get("grantee", []),
         "subdivision": subdivision,
@@ -438,19 +622,40 @@ def fetch_document_pdf(
     cookie: str | None = None,
     timeout_s: int = 60,
 ) -> dict[str, Any]:
+    """Download a Coconino county document PDF.
+
+    Discovers the real PDF URL by inspecting the document detail page for the
+    GUID-based /web/document-image-pdf/ link, rather than the old broken
+    DEGRADED-* servepdf format which returned empty files.
+    """
     load_env()
     effective_cookie = (cookie or os.environ.get("COCONINO_COOKIE", "")).strip()
     if not effective_cookie:
-        raise RuntimeError("Coconino session cookie is required via X-Coconino-Cookie header or COCONINO_COOKIE env var")
+        raise RuntimeError(
+            "Coconino session cookie is required via X-Coconino-Cookie header or COCONINO_COOKIE env var"
+        )
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
-    pdf_url = build_document_pdf_url(document_id=document_id, recording_number=recording_number, index=index)
+
+    # Discover the real PDF URL via the document detail page (GUID-based URL).
+    pdf_url = fetch_document_real_pdf_url(
+        document_id=document_id,
+        cookie=effective_cookie,
+        index=index,
+        timeout_s=timeout_s,
+    )
+
     request = Request(pdf_url, headers=_document_headers(document_id, effective_cookie), method="GET")
     with urlopen(request, timeout=timeout_s) as response:
         body = response.read()
         content_type = response.headers.get("content-type", "")
+
     if b"<html" in body[:200].lower() or "text/html" in content_type.lower():
         preview = body.decode("utf-8", errors="ignore")[:500]
         raise RuntimeError(f"Expected PDF but received HTML response: {preview}")
+
+    if len(body) == 0:
+        raise RuntimeError(f"Server returned an empty PDF from {pdf_url}")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{_safe_slug(document_id)}_{_safe_slug(recording_number)}_{index}_{timestamp}.pdf"
     pdf_path = DOCUMENTS_DIR / filename
@@ -620,6 +825,7 @@ def fetch_document_ocr_and_analysis(
         "groqError": groq_error,
         "groqAnalysis": groq_analysis,
         "addressCandidates": _extract_address_candidates(ocr_result["ocrText"]),
+        "principalCandidates": _extract_principal_candidates(ocr_result["ocrText"]),
     }
 
 
@@ -666,10 +872,17 @@ def _parse_summary(html_text: str) -> dict[str, Any]:
 
 def _row_blocks(html_text: str) -> list[str]:
     pattern = re.compile(
-        r"(<li class=\"ss-search-row\"[\s\S]*?<p class=\"selfServiceSearchFullResult selfServiceSearchResultNavigation\">[\s\S]*?</div>\s*</li>)",
+        r"(<li[^>]*class=\"[^\"]*ss-search-row[^\"]*\"[\s\S]*?<p class=\"selfServiceSearchFullResult selfServiceSearchResultNavigation\">[\s\S]*?</div>\s*</li>)",
         flags=re.IGNORECASE,
     )
-    return [match.group(1) for match in pattern.finditer(html_text)]
+    rows = [match.group(1) for match in pattern.finditer(html_text)]
+    if rows:
+        return rows
+    fallback_pattern = re.compile(
+        r"(<li[^>]*class=\"[^\"]*ss-search-row[^\"]*\"[\s\S]*?</li>)",
+        flags=re.IGNORECASE,
+    )
+    return [match.group(1) for match in fallback_pattern.finditer(html_text)]
 
 
 def _extract_column_values(block: str) -> dict[str, list[str]]:
@@ -718,7 +931,8 @@ def parse_search_results_html(html_text: str, source_file: str) -> dict[str, Any
                 grantors=columns.get("grantor", []),
                 grantees=columns.get("grantee", []),
                 legal_descriptions=columns.get("legal", []),
-                property_address="",
+                property_address=(columns.get("legal", [""])[0] if columns.get("legal") else ""),
+                principal_amount="",
                 detail_url=f"{BASE_URL}{detail_path}" if detail_path.startswith("/") else detail_path,
                 source_file=source_file,
                 raw_html=block,
@@ -844,6 +1058,7 @@ def export_csv(records: list[dict[str, Any]], csv_name: str | None = None) -> Pa
         "grantees",
         "legalDescriptions",
         "propertyAddress",
+        "principalAmount",
         "detailUrl",
         "sourceFile",
         "documentUrl",
@@ -855,7 +1070,7 @@ def export_csv(records: list[dict[str, Any]], csv_name: str | None = None) -> Pa
         "documentAnalysisError",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for record in records:
             document_analysis = record.get("documentAnalysis") or {}
@@ -866,6 +1081,7 @@ def export_csv(records: list[dict[str, Any]], csv_name: str | None = None) -> Pa
                     "grantees": " | ".join(record.get("grantees", [])),
                     "legalDescriptions": " | ".join(record.get("legalDescriptions", [])),
                     "propertyAddress": record.get("propertyAddress", ""),
+                    "principalAmount": record.get("principalAmount", ""),
                     "documentUrl": document_analysis.get("documentUrl", ""),
                     "ocrMethod": document_analysis.get("ocrMethod", ""),
                     "ocrTextPreview": (document_analysis.get("ocrTextPreview", "") or "")[:500],
@@ -908,12 +1124,10 @@ def fetch_session_results_pages(cookie: str, page_limit: int | None = None, save
 
 def enrich_records_with_detail_fields(records: list[dict[str, Any]], cookie: str | None = None, max_records: int | None = None) -> list[dict[str, Any]]:
     effective_cookie = (cookie or os.environ.get("COCONINO_COOKIE", "")).strip()
-    if not effective_cookie:
-        return records
     enriched: list[dict[str, Any]] = []
     for index, record in enumerate(records):
         updated = dict(record)
-        if max_records is None or index < max_records:
+        if effective_cookie and (max_records is None or index < max_records):
             try:
                 detail = fetch_document_detail_fields(str(record.get("documentId", "")), cookie=effective_cookie)
                 if detail.get("grantors"):
@@ -922,15 +1136,19 @@ def enrich_records_with_detail_fields(records: list[dict[str, Any]], cookie: str
                     updated["grantees"] = detail["grantees"]
                 if detail.get("propertyAddress"):
                     updated["propertyAddress"] = detail["propertyAddress"]
+                if detail.get("principalAmount"):
+                    updated["principalAmount"] = detail["principalAmount"]
                 if not updated.get("legalDescriptions") and detail.get("subdivision"):
                     legal = detail["subdivision"]
                     if detail.get("lot"):
                         legal = f"Subdivision {legal} Lot {detail['lot']}"
                     updated["legalDescriptions"] = [legal]
-                if not updated.get("propertyAddress") and updated.get("legalDescriptions"):
-                    updated["propertyAddress"] = updated["legalDescriptions"][0]
             except Exception as exc:
                 updated["detailError"] = str(exc)
+        if not updated.get("propertyAddress") and updated.get("legalDescriptions"):
+            updated["propertyAddress"] = updated["legalDescriptions"][0]
+        if not updated.get("principalAmount"):
+            updated["principalAmount"] = ""
         enriched.append(updated)
     return enriched
 
@@ -1053,6 +1271,10 @@ def search_to_csv(
                     candidates = record["documentAnalysis"].get("addressCandidates") or []
                     if candidates:
                         record["propertyAddress"] = candidates[0]
+                if not record.get("principalAmount"):
+                    amount_candidates = record["documentAnalysis"].get("principalCandidates") or []
+                    if amount_candidates:
+                        record["principalAmount"] = amount_candidates[0]
             except Exception as exc:
                 record["documentAnalysisError"] = str(exc)
     records = enrich_records_with_detail_fields(records, cookie=cookie, max_records=None)
@@ -1083,6 +1305,8 @@ def extract_to_csv(
     use_groq: bool = True,
     csv_name: str | None = None,
     document_types: list[str] | None = None,
+    cookie: str | None = None,
+    enrich_details: bool = True,
 ) -> dict[str, Any]:
     load_env()
     path = resolve_html_file(html_file)
@@ -1105,6 +1329,8 @@ def extract_to_csv(
             groq_used = True
         except Exception as exc:
             groq_error = str(exc)
+    if enrich_details:
+        records = enrich_records_with_detail_fields(records, cookie=cookie, max_records=None)
     csv_path = export_csv(records, csv_name=csv_name)
     return {
         "ok": True,
@@ -1116,5 +1342,6 @@ def extract_to_csv(
         "requestedGroq": use_groq,
         "usedGroq": groq_used,
         "groqError": groq_error,
+        "enrichedDetails": enrich_details,
         "records": records,
     }
