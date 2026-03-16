@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--doc-types", nargs="+", default=DEFAULT_DOCUMENT_TYPES, help="Document types")
     parser.add_argument("--pages", type=int, default=0, help="Max result pages per doc type (0=all)")
     parser.add_argument("--ocr-limit", type=int, default=10, help="OCR limit: -1 skip, 0 all, N first N")
+    parser.add_argument("--workers", type=int, default=3, help="Parallel enrichment workers")
     parser.add_argument("--no-groq", action="store_true", help="Disable Groq extraction")
     parser.add_argument("--headful", action="store_true", help="Run visible browser")
     parser.add_argument("--verbose", action="store_true", help="Verbose logs")
@@ -49,6 +50,7 @@ def main() -> None:
         doc_types=args.doc_types,
         max_pages=args.pages,
         ocr_limit=args.ocr_limit,
+        workers=args.workers,
         use_groq=not args.no_groq,
         headless=not args.headful,
         verbose=args.verbose,

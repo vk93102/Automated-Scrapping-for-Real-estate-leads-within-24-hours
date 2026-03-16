@@ -10,6 +10,7 @@ import os
 import re
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -54,14 +55,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
 
 DEFAULT_DOCUMENT_TYPES = [
+    "NOTICE OF DEFAULT",
     "NOTICE OF TRUSTEE SALE",
     "LIS PENDENS",
-    "TRUSTEES DEED",
-    "SHERIFFS DEED",
+    "DEED IN LIEU",
     "TREASURERS DEED",
-    "STATE LIEN",
-    "STATE TAX LIEN",
-    "RELEASE STATE TAX LIEN",
+    "NOTICE OF REINSTATEMENT",
 ]
 
 CSV_FIELDS = [
@@ -178,13 +177,37 @@ def _value_by_id_contains(soup: BeautifulSoup, key: str) -> str:
 
 def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5000) -> bool:
     """Select first option in <select> whose text contains target (case-insensitive)."""
+    def _norm(s: str) -> str:
+        return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
+
     try:
         locator = page.locator(sel).first
         opts = locator.evaluate(
             "el => Array.from(el.options).map(o => ({text: o.text.trim(), value: o.value}))"
         )
+        tgt_upper = (target or "").upper()
+        tgt_norm = _norm(target)
+        tgt_tokens = [t for t in re.split(r"\W+", tgt_upper) if t]
+
+        # Pass 1: direct contains
         for opt in opts:
-            if target.upper() in (opt.get("text") or "").upper():
+            txt = (opt.get("text") or "")
+            if tgt_upper and tgt_upper in txt.upper():
+                locator.select_option(value=opt["value"], timeout=timeout)
+                return True
+
+        # Pass 2: normalized contains (handles apostrophes, extra spaces, punctuation)
+        for opt in opts:
+            txt_norm = _norm(opt.get("text") or "")
+            if tgt_norm and (tgt_norm in txt_norm or txt_norm in tgt_norm):
+                locator.select_option(value=opt["value"], timeout=timeout)
+                return True
+
+        # Pass 3: token-based fuzzy match
+        for opt in opts:
+            txt_up = (opt.get("text") or "").upper()
+            score = sum(1 for t in tgt_tokens if t and t in txt_up)
+            if score >= max(2, len(tgt_tokens) - 1):
                 locator.select_option(value=opt["value"], timeout=timeout)
                 return True
     except Exception:
@@ -336,48 +359,78 @@ def _execute_search_for_doc_type(
     group_sel = "select[id*='cboDocumentGroup']"
     type_sel = "select[id*='cboDocumentType']"
     load_types_btn = "input[id*='btnLoadDocumentTypes']"
+
+    # Fast path: on repeated searches, the document type list is often already loaded.
+    if page.locator(type_sel).count() > 0:
+        try:
+            type_ok = _select_option_containing(page, type_sel, doc_type)
+        except Exception:
+            type_ok = False
+
     if page.locator(group_sel).count() > 0:
         group_map = {
-            "Notice": ["NOTICE OF TRUSTEE SALE", "LIS PENDENS"],
-            "Deed": ["TRUSTEES DEED", "SHERIFFS DEED"],
+            "Notice": [
+                "NOTICE OF DEFAULT",
+                "NOTICE OF TRUSTEE SALE",
+                "NOTICE OF REINSTATEMENT",
+            ],
+            "Court": ["LIS PENDENS"],
+            "Deed": ["DEED IN LIEU", "TREASURERS DEED", "TRUSTEES DEED", "SHERIFFS DEED"],
             "Lien": ["STATE LIEN", "STATE TAX LIEN"],
         }
+        group_order = ["Notice", "Court", "Deed", "Lien", "Release", "Other"]
+        selected_group = ""
         for group, types in group_map.items():
-            if any(t.lower() in doc_type.lower() for t in types):
-                if _select_option_containing(page, group_sel, group):
-                    page.wait_for_timeout(500)
-                    # Some sessions require explicit "Load" click to populate Document Type options.
-                    if page.locator(load_types_btn).count() > 0:
-                        try:
-                            page.locator(load_types_btn).first.click(timeout=8000)
-                            page.wait_for_load_state("domcontentloaded", timeout=30_000)
-                        except Exception:
-                            pass
-                    # Also trigger onfocus loader used by the site JS, then wait for options.
+            if any(t.lower() in doc_type.lower() or doc_type.lower() in t.lower() for t in types):
+                selected_group = group
+                break
+
+        # If not mapped, still try common groups.
+        groups_to_try = [selected_group] if selected_group else []
+        groups_to_try.extend([g for g in group_order if g and g != selected_group])
+
+        for group in groups_to_try:
+            if type_ok:
+                break
+            if not group:
+                continue
+            if _select_option_containing(page, group_sel, group):
+                page.wait_for_timeout(500)
+                # Some sessions require explicit "Load" click to populate Document Type options.
+                if page.locator(load_types_btn).count() > 0:
                     try:
-                        if page.locator(type_sel).count() > 0:
-                            page.locator(type_sel).first.focus()
+                        page.locator(load_types_btn).first.click(timeout=8000)
+                        page.wait_for_load_state("domcontentloaded", timeout=30_000)
                     except Exception:
                         pass
-                    page.wait_for_timeout(1200)
+                # Also trigger onfocus loader used by the site JS, then wait for options.
+                try:
                     if page.locator(type_sel).count() > 0:
-                        # Wait until placeholder "Loading..." is replaced (max ~5s)
-                        for _ in range(10):
-                            try:
-                                opts = page.locator(type_sel).first.evaluate(
-                                    "el => Array.from(el.options).map(o => (o.text || '').trim())"
-                                )
-                                has_real = any(o and o.upper() != "LOADING..." for o in opts)
-                                if has_real:
-                                    break
-                            except Exception:
-                                pass
-                            page.wait_for_timeout(500)
-                        type_ok = _select_option_containing(page, type_sel, doc_type)
+                        page.locator(type_sel).first.focus()
+                except Exception:
+                    pass
+                page.wait_for_timeout(1200)
+                if page.locator(type_sel).count() > 0:
+                    # Wait until placeholder "Loading..." is replaced (max ~5s)
+                    for _ in range(10):
+                        try:
+                            opts = page.locator(type_sel).first.evaluate(
+                                "el => Array.from(el.options).map(o => (o.text || '').trim())"
+                            )
+                            has_real = any(o and o.upper() != "LOADING..." for o in opts)
+                            if has_real:
+                                break
+                        except Exception:
+                            pass
+                        page.wait_for_timeout(500)
+                    type_ok = _select_option_containing(page, type_sel, doc_type)
+                if type_ok:
                     break
         page.wait_for_timeout(400)
     if verbose:
         print(f"  Search setup: dates={'ok' if date_ok else 'fail'} type={'ok' if type_ok else 'fail'}")
+    if not type_ok:
+        return False
     for sel in ["input[id*='btnSearchDocuments']", "input[type='submit'][value*='Execute Search']"]:
         if page.locator(sel).count() > 0:
             try:
@@ -701,6 +754,7 @@ def run_lapaz_pipeline(
     doc_types: list[str] | None = None,
     max_pages: int = 0,
     ocr_limit: int = 10,
+    workers: int = 3,
     use_groq: bool = True,
     headless: bool = True,
     verbose: bool = False,
@@ -723,19 +777,36 @@ def run_lapaz_pipeline(
         enrich_count = len(records)
     else:
         enrich_count = min(ocr_limit, len(records))
+
+    # Run OCR/enrichment in parallel workers (default: 3).
+    if enrich_count > 0:
+        max_workers = max(1, int(workers or 1))
+
+        def _enrich_one(idx: int) -> tuple[int, dict]:
+            rec = records[idx]
+            if verbose:
+                print(f"[ENRICH] {idx + 1}/{len(records)} DK={rec.get('documentId','')}")
+            # Use one requests session per worker task to avoid cross-thread session mutation.
+            local_session = _make_session(cookie_header)
+            out = enrich_record(rec, local_session, use_groq=use_groq, groq_api_key=groq_key)
+            return idx, out
+
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_enrich_one, i) for i in range(enrich_count)]
+            for fut in as_completed(futures):
+                idx, out = fut.result()
+                records[idx] = out
+
     for i, rec in enumerate(records, 1):
-        if verbose:
-            print(f"[ENRICH] {i}/{len(records)} DK={rec.get('documentId','')}")
         if i <= enrich_count:
-            enrich_record(rec, session, use_groq=use_groq, groq_api_key=groq_key)
-        else:
-            try:
-                detail = fetch_detail(rec.get("documentId", ""), session)
-                for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
-                    if detail.get(key):
-                        rec[key] = detail[key]
-            except Exception as e:
-                rec["analysisError"] = f"detail fetch failed: {e}"
+            continue
+        try:
+            detail = fetch_detail(rec.get("documentId", ""), session)
+            for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
+                if detail.get(key):
+                    rec[key] = detail[key]
+        except Exception as e:
+            rec["analysisError"] = f"detail fetch failed: {e}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"lapaz_leads_{ts}.csv"
     json_path = OUTPUT_DIR / f"lapaz_leads_{ts}.json"
@@ -748,6 +819,7 @@ def run_lapaz_pipeline(
         "documentTypes": doc_types,
         "recordsFound": len(records),
         "recordsOCR": enrich_count,
+        "workers": max(1, int(workers or 1)),
         "usedGroq": use_groq,
         "timestamp": datetime.now().isoformat(),
     }
