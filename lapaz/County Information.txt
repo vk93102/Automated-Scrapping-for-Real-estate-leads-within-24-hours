@@ -1,0 +1,359 @@
+Coconino County approach
+Base URL: https://eagleassessor.coconino.az.gov:8444/web/search/DOCSEARCH1213S1
+Endpoint:
+Header:
+GET /web/searchResults/DOCSEARCH1213S1?page=1&_=1773403647766 HTTP/1.1
+Accept: */*
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-GB,en;q=0.9
+Connection: keep-alive
+Cookie: disclaimerAccepted=true; JSESSIONID=3950E6F34D6B1D03087C5A38BB9D2AF3;
+cf_clearance=hlEqP1Imw5a1oUKvt1ikmwSXr.wMiJTOli0PdzJ4xyU-1773241622-1.2.1.1-OuZczQAbiH4z98d_LE
+KsIckYfCQ57mO.aTRDExfCTbKzEQUKNKGd53knpH2hHiTUbAgZX2np_H_xEZ0x_QLNPmYvSO1eIYiNqD_dWTkI3lnXOOxV
+Af4RlJtwQlRotqXS0KeZvukcZMqQ5_XEBey43bHaaw0_D5r2Ed1piF8LevLsM.eEL32ULacMbWwoxy0ACAUoovci4879Wf
+ljhRkrTWf0mjTkvFvyCrYwAaoLw7k
+Host: eagleassessor.coconino.az.gov:8444
+Referer: https://eagleassessor.coconino.az.gov:8444/web/search/DOCSEARCH1213S1
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-origin
+Sec-GPC: 1
+User-Agent: Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36
+(KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36
+X-Requested-With: XMLHttpRequest
+ajaxRequest: true
+sec-ch-ua: "Not:A-Brand";v="99", "Brave";v="145", "Chromium";v="145"
+sec-ch-ua-mobile: ?1
+
+No need to enter it within the endpoint that has been defined there just defined the structure
+there :Where is the document search type defined?
+●​ LIS PENDENS
+●​ TRUSTEES DEED
+●​ SHERIFFS DEED
+●​ NOTICE OF TRUSTEES SALE
+●​ TREASURERS DEED
+●​ AMENDED STATE LIEN
+●​ STATE LIEN
+●​ STATE TAX LIEN
+●​ RELEASE STATE TAX LIEN
+
+For making a hit to a particular endpoint, there to extract:●​ https://eagleassessor.coconino.az.gov:8444/web/searchResults/DOCSEARCH1213S1?
+page=1&_=1773411644309
+We can get the following values from there:●​ Document meta
+○​ Fee Number
+○​ Recording Date
+○​ Document Id
+●​ Names
+○​ Grantor
+○​ Grantee
+
+For finding the document PDF, there:Endpoint to be used:
+https://eagleassessor.coconino.az.gov:8444/web/document-image-pdfjs/DOC1870S924/536801
+f5-cb31-4c0e-b671-550225b67795/4035050.pdf?allowDownload=true&index=1
+
+In the response will be getting the html response there we need to find the format for document
+there like :We will find this type of something in iframe element there :/web/document-image-pdf/DOC2352S262/1b3bbb90-f82c-4b57-9f36-1eaa6e8cfd39/2026-0024
+08-1.pdf?index=1
+So once we get this need to add with one of the base url there :https://selfservice.gilacountyaz.gov/
+So the final downloading document will be :https://eagleassessor.coconino.az.gov:8444/web/document-image-pdf/DOC1870S924/536801f5
+-cb31-4c0e-b671-550225b67795/4035050-1.pdf?index=1
+
+Then extract the PDF to OCR, where OCR will be generated, and after ocr passes to grow lama
+model there to need to extract the property address and the principal amount of the property
+there.
+So the final endpoint should consist of
+
+●​ Document meta
+○​ Fee Number
+○​ Recording Date
+○​ Document Id
+●​ Names
+○​ Grantor
+○​ Grantee
+●​ Principal Amount
+●​ Address
+____________________________________________________________________________
+
+Gila County approach
+Base URL: https://selfservice.gilacountyaz.gov/web/search/DOCSEARCH2242S1
+Endpoint:
+https://selfservice.gilacountyaz.gov/web/searchResults/DOCSEARCH2242S1?page=1&_=1773
+391799942
+Header:
+GET /web/searchResults/DOCSEARCH2242S1?page=1&_=1773392241570 HTTP/1.1
+Accept: */*
+Accept-Encoding: gzip, deflate, br, zstd
+Accept-Language: en-GB,en;q=0.7
+Connection: keep-alive
+Cookie: disclaimerAccepted=true; JSESSIONID=4EE41B05F0BD4B87D17D2F075712493C
+Host: selfservice.gilacountyaz.gov
+Referer: https://selfservice.gilacountyaz.gov/web/search/DOCSEARCH2242S1
+Sec-Fetch-Dest: empty
+Sec-Fetch-Mode: cors
+Sec-Fetch-Site: same-origin
+Sec-GPC: 1
+User-Agent: Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) AppleWebKit/537.36
+(KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36
+X-Requested-With: XMLHttpRequest
+ajaxRequest: true
+sec-ch-ua: "Not:A-Brand";v="99", "Brave";v="145", "Chromium";v="145"
+sec-ch-ua-mobile: ?1
+sec-ch-ua-platform: "Android"
+
+No need to enter it within the endpoint that has been defined there just defined the structure
+there :Where is the document search type defined?
+●​ LIS PENDENS
+
+●​ TRUSTEES DEED
+●​ SHERIFFS DEED
+●​ NOTICE OF TRUSTEES SALE
+●​ TREASURERS DEED
+●​ AMENDED STATE LIEN
+●​ STATE LIEN
+●​ STATE TAX LIEN
+●​ RELEASE STATE TAX LIEN
+
+AGR​ Agreement For Sale
+ANCL​ Amend Notice And Claim Of Lien
+CNTS​ Corrected Notice Of Sale
+DOR​ Deed Of Release
+DOT​ Deed Of Trust
+LP​
+
+Lis Pendens
+
+NTS​ Notice Of Trustee Sale
+NOTSS​
+NR​
+
+Notice of Sheriff
+
+Notice Of Rescission
+
+NOC​ Notice Of Completion
+COS​ Certificate Of Sale
+CP​
+
+Certificate Of Purchase
+
+SCOS​ Sheriffs Certificate Of Sale
+NTRST​
+
+Notice Of Trust
+
+For making a hit to a particular endpoint, there to extract:●​ https://selfservice.gilacountyaz.gov/web/document/DOC2352S262?search=DOCSEARC
+H2242S1
+We can get the following values from there:-
+
+●​ Document meta
+○​ Fee Number
+○​ Recording Date
+○​ Document Id
+●​ Names
+○​ Grantor
+○​ Grantee
+
+For finding the document PDF there:Endpoint to be used:
+https://selfservice.gilacountyaz.gov/web/document-image-pdfjs/DOC2352S262/1b3bbb90-f82c4b57-9f36-1eaa6e8cfd39/2026-002408.pdf?allowDownload=true&index=1
+
+In the response will be getting the html response there we need to find the format for document
+there like :We will find this type of something in iframe element there :/web/document-image-pdf/DOC2352S262/1b3bbb90-f82c-4b57-9f36-1eaa6e8cfd39/2026-0024
+08-1.pdf?index=1
+So once we get this need to add with one of the base url there :https://selfservice.gilacountyaz.gov/
+So the final downloading document will be :https://selfservice.gilacountyaz.gov//web/document-image-pdf/DOC2352S262/1b3bbb90-f82c-4
+b57-9f36-1eaa6e8cfd39/2026-002408-1.pdf?index=1
+
+Then extract the PDF to OCR, where OCR will be generated, and after ocr passes to grow lama
+model there to need to extract the property address and the principal amount of the property
+there.
+So the final endpoint should consist of
+●​ Document meta
+○​ Fee Number
+○​ Recording Date
+○​ Document Id
+
+●​ Names
+○​ Grantor
+○​ Grantee
+●​ Principal Amount
+●​ Address
+
+The downloading of the document is not accessible or workable there
+____________________________________________________________________________
+
+LAPAZ COUNTY
+Base Url: https://www.thecountyrecorder.com/Search.aspx
+Whenever we visits the url it shows the option for default for selcting the county there
+Where it shows the county has not been selected there so you have to move continue
+there with playwright and selenium there and press continue there and move to the
+next screens there.
+This is the html element there : <input type="submit"
+name="ctl00$MainContent$Button1" value="Continue" id="MainContent_Button1">
+
+Then it shows the options there to select the county there so we can select the county
+there as with the option of state there and also the option of county there so we have to
+selct the state and county the approach there. Where move to the continue button there
+and make sure that we move to next button continue there
+This is the html element for form there fir state and county there where we need to
+select this ARIZONA and LA PAZ.
+<label for="MainContent_searchMainContent_ctl01_ctl00_cboStates"
+id="MainContent_searchMainContent_ctl01_ctl00_lblSelectState">Select State</label>
+<label for="MainContent_searchMainContent_ctl01_ctl00_cboCounties"
+id="MainContent_searchMainContent_ctl01_ctl00_lblSelecCounty">Select
+County</label>
+
+This is the button for Yes, I Accept there
+<input type="submit" name="ctl00$ctl00$MainContent$searchMainContent$ctl01$btnAccept"
+value="Yes, I Accept" id="MainContent_searchMainContent_ctl01_btnAccept"
+style="width:120px;">
+Then it redirects there to https://www.thecountyrecorder.com/Introduction.aspx
+
+We have to move forward with this :- https://www.thecountyrecorder.com/Search.aspx
+There we will get the
+get
+
+Then this will shows then this is the html element for yes, I accept there
+HTML ELEMENT :- ​ <input type="submit"
+name="ctl00$ctl00$MainContent$searchMainContent$ctl01$btnAccept" value="Yes, I Accept"
+id="MainContent_searchMainContent_ctl01_btnAccept" style="width:120px;">
+
+This is the overall flow, but ensure the overflow may be exchanged or reordered.
+
+Pleasae ensure that this is the screen there will be redirected there and then we define the
+endpoint there :Endpoint :
+Url: https://www.thecountyrecorder.com/Introduction.aspx
+Then ensure that it redirects to that page where we needs to go search Document → Document
+itself there
+
+Where this is the HTML element for the document from the search document there
+<a class="TreeView1_0 TreeView1_4" href="Search.aspx" id="TreeView1t6">Document</a>
+
+Endpoint : https://www.thecountyrecorder.com/Search.aspx
+
+Payload :
+VIEWSTATE:
+​
+
+ctl00$ctl00$ContentPlaceHolder_SelectCounty$ctl00$cboStates​
+
+-1|AZ
+
+​
+
+ctl00$ctl00$ContentPlaceHolder_SelectCounty$ctl00$cboCounties​
+
+3|LA PAZ
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDateStart​
+
+01/02/2026
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDateEnd​
+
+3/16/2026
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$cboDocumentType​
+
+182|NOTICE OF TRUSTEE SALE
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$radioDocName​
+
+radioDocName1
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDocNameLast
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDocNameFirst
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDocNameMiddle
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbLot
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbBlock
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$cboSubdivision​
+
+-1
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbSection
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbTownship
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbRange
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbParcelID
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$tbDescription
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$chkWildcardSearch​
+
+on
+
+​
+
+ctl00$ctl00$MainContent$searchMainContent$ctl00$btnSearchDocuments​
+
+Execute Search
+Endpoint: https://www.thecountyrecorder.com/Results.aspx
+
+Where we need to follow browser automation usign playwright to obtain the session id of js carefully there
+Endpoint for response for search payload there
+https://www.thecountyrecorder.com/Results.aspx
+
+There we will extract the following stuffs
+
+●​
+●​
+●​
+●​
+●​
+
+Document Id
+Recording Date
+Document Type
+
+For a particular document :
+https://www.thecountyrecorder.com/Document.aspx?DK=273530
+
+There we will obtain the document image :
+<input type="submit" name="ctl00$ctl00$MainContent$searchMainContent$ctl00$btnViewImage" value=" View
+Image " id="MainContent_searchMainContent_ctl00_btnViewImage" style="color:Black;"> on clicking there we can
+get the document download form there
+
+Where this is the endpoint for image : https://www.thecountyrecorder.com/ImageHandler.ashx?DK=273530&PN=1
+
+From image we have to extract using llm there what is trustor and trustee and address and principal balance
+beneficiary also there
+
+

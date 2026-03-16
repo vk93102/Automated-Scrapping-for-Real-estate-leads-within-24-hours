@@ -72,6 +72,7 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 DOCS_DIR   = OUTPUT_DIR / "documents"
 
 # Target distressed-property document types for Gila County
+# These are sent as field_selfservice_documentTypes-searchInput (text search)
 DEFAULT_DOCUMENT_TYPES: list[str] = [
     "LIS PENDENS",
     "TRUSTEES DEED",
@@ -82,16 +83,58 @@ DEFAULT_DOCUMENT_TYPES: list[str] = [
     "STATE LIEN",
     "STATE TAX LIEN",
     "RELEASE STATE TAX LIEN",
+    "COMPLETION OF FORECLOSURE",
+    "CERTIFICATE OF SALE",
 ]
 
-# Client-side alias normalisation (server sometimes returns apostrophe variants)
+# Confirmed document-type code→name pairs captured from Gila County browser payload.
+# Sent as field_selfservice_documentTypes-holderInput / holderValue pairs (separate
+# mechanism from searchInput — targets specific confirmed Tyler EagleWeb type codes).
+GILA_DOC_TYPE_HOLDERS: list[tuple[str, str]] = [
+    ("AGR",   "Agreement For Sale"),
+    ("ANCL",  "Amend Notice And Claim Of Lien"),
+    ("CNTS",  "Corrected Notice Of Sale"),
+    ("DOR",   "Deed Of Release"),
+    ("DOT",   "Deed Of Trust"),
+    ("LP",    "Lis Pendens"),
+    ("NTS",   "Notice Of Trustee Sale"),
+    ("NOTSS", "Notice of Sheriff"),
+    ("NR",    "Notice Of Rescission"),
+    ("NOC",   "Notice Of Completion"),
+    ("COS",   "Certificate Of Sale"),
+    ("CP",    "Certificate Of Purchase"),
+    ("SCOS",  "Sheriffs Certificate Of Sale"),
+    ("NTRST", "Notice Of Trust"),
+]
+
+# Client-side alias normalisation
+# Maps server-returned doc type variants → canonical names (handles apostrophes,
+# holder-code value names, and other server-side spelling differences).
 _SERVER_ALIASES: dict[str, str] = {
-    "TRUSTEE'S DEED":             "TRUSTEES DEED",
-    "TRUSTEE'S DEED UPON SALE":   "TRUSTEES DEED",
-    "TRUSTEES DEED UPON SALE":    "TRUSTEES DEED",
-    "NOTICE OF TRUSTEE'S SALE":   "NOTICE OF TRUSTEES SALE",
-    "SHERIFF'S DEED":             "SHERIFFS DEED",
-    "TREASURER'S DEED":           "TREASURERS DEED",
+    # Apostrophe / possessive variants
+    "TRUSTEE'S DEED":                 "TRUSTEES DEED",
+    "TRUSTEE'S DEED UPON SALE":       "TRUSTEES DEED",
+    "TRUSTEES DEED UPON SALE":        "TRUSTEES DEED",
+    "NOTICE OF TRUSTEE'S SALE":       "NOTICE OF TRUSTEES SALE",
+    "NOTICE OF TRUSTEE SALE":         "NOTICE OF TRUSTEES SALE",
+    "SHERIFF'S DEED":                 "SHERIFFS DEED",
+    "TREASURER'S DEED":               "TREASURERS DEED",
+    # Holder-value names returned when portal matches by code
+    "LIS PENDENS":                    "LIS PENDENS",
+    "AGREEMENT FOR SALE":             "AGREEMENT FOR SALE",
+    "AMEND NOTICE AND CLAIM OF LIEN": "AMEND NOTICE AND CLAIM OF LIEN",
+    "CORRECTED NOTICE OF SALE":       "CORRECTED NOTICE OF SALE",
+    "DEED OF RELEASE":                "DEED OF RELEASE",
+    "DEED OF TRUST":                  "DEED OF TRUST",
+    "NOTICE OF SHERIFF":              "NOTICE OF SHERIFF",
+    "NOTICE OF RESCISSION":           "NOTICE OF RESCISSION",
+    "NOTICE OF COMPLETION":           "NOTICE OF COMPLETION",
+    "CERTIFICATE OF SALE":            "CERTIFICATE OF SALE",
+    "CERTIFICATE OF PURCHASE":        "CERTIFICATE OF PURCHASE",
+    "SHERIFFS CERTIFICATE OF SALE":   "SHERIFFS CERTIFICATE OF SALE",
+    "SHERIFF'S CERTIFICATE OF SALE":  "SHERIFFS CERTIFICATE OF SALE",
+    "NOTICE OF TRUST":                "NOTICE OF TRUST",
+    "COMPLETION OF FORECLOSURE":      "COMPLETION OF FORECLOSURE",
 }
 
 USER_AGENT = (
@@ -202,7 +245,7 @@ def playwright_search(
             print(f"  {'Reusing' if storage_state else 'Fresh'} session state")
 
         # ── Navigate ──────────────────────────────────────────────────────────
-        page.goto(SEARCH_URL, timeout=30_000, wait_until="domcontentloaded")
+        page.goto(SEARCH_URL, timeout=120_000, wait_until="domcontentloaded")
 
         # ── Accept disclaimer ─────────────────────────────────────────────────
         for sel in [
@@ -259,14 +302,16 @@ def playwright_search(
             print("  ⚠ Could not fill date fields — form selectors not found")
 
         # ── Inject document type hidden inputs ────────────────────────────────
+        holders = [[code, name] for code, name in GILA_DOC_TYPE_HOLDERS]
         injected = page.evaluate("""
-            (docTypes) => {
+            ([docTypes, holders]) => {
                 const form = document.querySelector('form');
                 if (!form) return 0;
 
                 // Remove any previously injected inputs
                 form.querySelectorAll('[data-gila-doctype]').forEach(el => el.remove());
 
+                // searchInput fields (one per text search term)
                 docTypes.forEach(dt => {
                     const inp = document.createElement('input');
                     inp.type  = 'hidden';
@@ -274,6 +319,23 @@ def playwright_search(
                     inp.value = dt;
                     inp.setAttribute('data-gila-doctype', '1');
                     form.appendChild(inp);
+                });
+
+                // holderInput / holderValue pairs (confirmed code→name entries)
+                holders.forEach(([code, name]) => {
+                    const hi = document.createElement('input');
+                    hi.type  = 'hidden';
+                    hi.name  = 'field_selfservice_documentTypes-holderInput';
+                    hi.value = code;
+                    hi.setAttribute('data-gila-doctype', '1');
+                    form.appendChild(hi);
+
+                    const hv = document.createElement('input');
+                    hv.type  = 'hidden';
+                    hv.name  = 'field_selfservice_documentTypes-holderValue';
+                    hv.value = name;
+                    hv.setAttribute('data-gila-doctype', '1');
+                    form.appendChild(hv);
                 });
 
                 // Ensure operator field present
@@ -289,11 +351,12 @@ def playwright_search(
                 }
                 op.value = 'Contains Any';
 
-                return docTypes.length;
+                return docTypes.length + holders.length;
             }
-        """, doc_types)
+        """, [doc_types, holders])
         if verbose:
-            print(f"  Injected {injected} document-type hidden inputs")
+            print(f"  Injected {injected} document-type inputs "
+                  f"({len(doc_types)} search + {len(holders)} holder pairs)")
 
         # ── Maximize results per page ────────────────────────────────────────
         # Tyler EagleWeb portals often have a results-per-page select; try to
@@ -447,6 +510,12 @@ def build_search_payload(
     # One entry per document type (the JS autocomplete widget POSTs like this)
     for dt in doc_types:
         params.append(("field_selfservice_documentTypes-searchInput", dt))
+
+    # Holder pairs — confirmed document-type codes with their canonical names.
+    # Sent exactly as captured from browser network trace (holderInput then holderValue).
+    for code, name in GILA_DOC_TYPE_HOLDERS:
+        params.append(("field_selfservice_documentTypes-holderInput", code))
+        params.append(("field_selfservice_documentTypes-holderValue", name))
 
     params.extend([
         ("field_selfservice_documentTypes-containsInput",    "Contains Any"),

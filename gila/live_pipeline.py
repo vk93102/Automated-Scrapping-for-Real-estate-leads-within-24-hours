@@ -43,6 +43,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from gila.extractor import (
     OUTPUT_DIR,
     DEFAULT_DOCUMENT_TYPES,
+    GILA_DOC_TYPE_HOLDERS,
     _SERVER_ALIASES,
     playwright_search,
     _make_requests_session,
@@ -230,13 +231,22 @@ def run_pipeline(
 
     # ── STAGE 5: CLIENT-SIDE FILTER ──────────────────────────────────────────
     print(_c("\n[STAGE 5/8] Client-side Filter", _BOLD))  # noqa: STAGE5
-    target_set = set(doc_types) | set(_SERVER_ALIASES.keys())
-    filtered   = []
+    # The server pre-filtered by our requested types, so most records should pass.
+    # Records with no documentType in the list HTML are allowed through — their type
+    # will be set by detail enrichment (Stage 6). Only positively-identified
+    # non-target types are removed.
+    _doc_types_upper = {t.upper() for t in doc_types}
+    _holder_names    = {name.upper() for _, name in GILA_DOC_TYPE_HOLDERS}
+    filtered = []
     for rec in all_records:
         raw = rec.get("documentType", "").upper()
         normalised = _SERVER_ALIASES.get(raw, raw)
         rec["documentType"] = normalised
-        if normalised in doc_types or raw in doc_types:
+        if (not normalised                             # no type yet → let detail enrichment decide
+                or normalised in _doc_types_upper
+                or raw in _doc_types_upper
+                or normalised in _holder_names
+                or raw in _holder_names):
             filtered.append(rec)
     removed = len(all_records) - len(filtered)
     print(f"  Kept {len(filtered)} target docs  (removed {removed} non-target)")

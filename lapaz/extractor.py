@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""La Paz County, AZ — Real Estate Lead Scraper & Enrichment Pipeline."""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import os
+import re
+import time
+import urllib.parse
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image, ImageFile, ImageFilter, ImageEnhance
+
+# Allow PIL to open truncated/incomplete JPEG files from the server
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+try:
+    import pytesseract
+    # Explicitly set tesseract binary path (Homebrew on macOS)
+    for _tess_bin in [
+        "/opt/homebrew/bin/tesseract",
+        "/usr/local/bin/tesseract",
+        "/usr/bin/tesseract",
+    ]:
+        if Path(_tess_bin).exists():
+            pytesseract.pytesseract.tesseract_cmd = _tess_bin
+            break
+except Exception:  # pragma: no cover
+    pytesseract = None
+
+try:
+    from playwright.sync_api import sync_playwright
+    _PLAYWRIGHT_OK = True
+except Exception:  # pragma: no cover
+    _PLAYWRIGHT_OK = False
+
+
+BASE_URL = "https://www.thecountyrecorder.com"
+SEARCH_URL = f"{BASE_URL}/Search.aspx"
+RESULTS_URL = f"{BASE_URL}/Results.aspx"
+DOCUMENT_URL = f"{BASE_URL}/Document.aspx"
+IMAGE_HANDLER_URL = f"{BASE_URL}/ImageHandler.ashx"
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
+
+DEFAULT_DOCUMENT_TYPES = [
+    "NOTICE OF TRUSTEE SALE",
+    "LIS PENDENS",
+    "TRUSTEES DEED",
+    "SHERIFFS DEED",
+    "TREASURERS DEED",
+    "STATE LIEN",
+    "STATE TAX LIEN",
+    "RELEASE STATE TAX LIEN",
+]
+
+CSV_FIELDS = [
+    "documentId",
+    "recordingNumber",
+    "recordingDate",
+    "documentType",
+    "grantors",
+    "grantees",
+    "trustor",
+    "trustee",
+    "beneficiary",
+    "principalAmount",
+    "propertyAddress",
+    "detailUrl",
+    "imageUrls",
+    "ocrMethod",
+    "ocrChars",
+    "sourceCounty",
+    "analysisError",
+]
+
+
+def _normalise_date(date_str: str) -> str:
+    s = (date_str or "").strip()
+    for fmt in ("%m/%d/%Y", "%-m/%-d/%Y", "%Y-%m-%d", "%m-%d-%Y"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%-m/%-d/%Y")
+        except Exception:
+            pass
+    return s
+
+
+def _cookie_header_from_cookies(cookies: list[dict]) -> str:
+    vals = []
+    for c in cookies:
+        name = c.get("name", "")
+        value = c.get("value", "")
+        if name:
+            vals.append(f"{name}={value}")
+    return "; ".join(vals)
+
+
+def _make_session(cookie_header: str) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.9",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    )
+    for pair in cookie_header.split(";"):
+        pair = pair.strip()
+        if "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        s.cookies.set(k.strip(), v.strip(), domain="www.thecountyrecorder.com")
+    return s
+
+
+def _safe_text(node: Any) -> str:
+    if not node:
+        return ""
+    if hasattr(node, "get_text"):
+        return re.sub(r"\s+", " ", node.get_text(" ", strip=True)).strip()
+    return re.sub(r"\s+", " ", str(node)).strip()
+
+
+def _extract_date(text: str) -> str:
+    m = re.search(r"\b\d{1,2}/\d{1,2}/\d{4}\b", text)
+    return m.group(0) if m else ""
+
+
+def _extract_recording_number(text: str) -> str:
+    for pat in [r"\b\d{4}-\d{5,}\b", r"\b\d{7,}\b"]:
+        m = re.search(pat, text)
+        if m:
+            return m.group(0)
+    return ""
+
+
+def _extract_value_by_label(soup: BeautifulSoup, labels: list[str]) -> str:
+    for label in labels:
+        tag = soup.find(string=re.compile(rf"\b{re.escape(label)}\b", re.I))
+        if not tag:
+            continue
+        parent = tag.parent
+        if parent:
+            next_td = parent.find_next("td")
+            if next_td and next_td is not parent:
+                v = _safe_text(next_td)
+                if v and label.lower() not in v.lower():
+                    return v
+        nxt = tag.find_next(string=True)
+        if nxt:
+            v = _safe_text(nxt)
+            if v and label.lower() not in v.lower():
+                return v
+    return ""
+
+
+def _value_by_id_contains(soup: BeautifulSoup, key: str) -> str:
+    node = soup.select_one(f"input[id*='{key}'], textarea[id*='{key}']")
+    if not node:
+        return ""
+    if node.name == "textarea":
+        return _safe_text(node)
+    return (node.get("value") or "").strip()
+
+
+def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5000) -> bool:
+    """Select first option in <select> whose text contains target (case-insensitive)."""
+    try:
+        locator = page.locator(sel).first
+        opts = locator.evaluate(
+            "el => Array.from(el.options).map(o => ({text: o.text.trim(), value: o.value}))"
+        )
+        for opt in opts:
+            if target.upper() in (opt.get("text") or "").upper():
+                locator.select_option(value=opt["value"], timeout=timeout)
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def parse_results_html(html: str, source_doc_type: str = "") -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
+    records: list[dict] = []
+    seen = set()
+    for a in soup.select("a[href*='Document.aspx?DK=']"):
+        href = a.get("href", "")
+        m = re.search(r"DK=(\d+)", href)
+        if not m:
+            continue
+        dk = m.group(1)
+        if dk in seen:
+            continue
+        seen.add(dk)
+        row = a.find_parent("tr") or a.find_parent("div") or a.parent
+        row_text = _safe_text(row)
+        rec = {
+            "documentId": dk,
+            "recordingNumber": _extract_recording_number(row_text),
+            "recordingDate": _extract_date(row_text),
+            "documentType": source_doc_type or "",
+            "grantors": "",
+            "grantees": "",
+            "trustor": "",
+            "trustee": "",
+            "beneficiary": "",
+            "principalAmount": "",
+            "propertyAddress": "",
+            "detailUrl": f"{DOCUMENT_URL}?DK={dk}",
+            "imageUrls": "",
+            "ocrMethod": "",
+            "ocrChars": 0,
+            "sourceCounty": "La Paz",
+            "analysisError": "",
+        }
+        if not rec["recordingDate"]:
+            tds = row.find_all("td") if row else []
+            for td in tds:
+                d = _extract_date(_safe_text(td))
+                if d:
+                    rec["recordingDate"] = d
+                    break
+        if row:
+            tds = row.find_all("td")
+            for td in tds:
+                tx = _safe_text(td).upper()
+                if any(x in tx for x in ("DEED", "LIEN", "TRUSTEE", "PENDENS", "SALE")):
+                    rec["documentType"] = tx
+                    break
+        records.append(rec)
+    return records
+
+
+def _goto_document_search(page: Any, verbose: bool = False) -> None:
+    page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=120_000)
+    
+    # Step 1: Click Continue on Search.aspx
+    for sel in ["#MainContent_Button1", "input[id*='Button1'][value*='Continue']"]:
+        if page.locator(sel).count() > 0:
+            try:
+                page.locator(sel).first.click(timeout=8000)
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(1200)
+                break
+            except Exception:
+                pass
+    
+    # Step 2: On Default.aspx, select State
+    state_sel = "select[id*='cboStates'], select[name*='cboStates']"
+    if page.locator(state_sel).count() > 0:
+        try:
+            page.locator(state_sel).first.select_option(label="ARIZONA")
+            if verbose:
+                print(f"  Select 'ARIZONA': ok")
+        except Exception:
+            if verbose:
+                print(f"  Select 'ARIZONA': failed")
+        page.wait_for_timeout(800)
+    
+    # Step 3: Select County (auto-navigates to Disclaimer.aspx)
+    county_sel = "select[id*='cboCounties'], select[name*='cboCounties']"
+    if page.locator(county_sel).count() > 0:
+        try:
+            page.locator(county_sel).first.select_option(label="LA PAZ")
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+            except Exception:
+                pass
+            if verbose:
+                print(f"  Select 'LA PAZ': ok")
+        except Exception:
+            if verbose:
+                print(f"  Select 'LA PAZ': failed")
+        page.wait_for_timeout(2000)
+    
+    # Step 4: Accept Disclaimer (on Disclaimer.aspx)
+    for sel in ["input[id*='btnAccept']", "#MainContent_searchMainContent_ctl01_btnAccept"]:
+        if page.locator(sel).count() > 0:
+            try:
+                page.locator(sel).first.click(timeout=8000)
+                page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                page.wait_for_timeout(1500)
+                break
+            except Exception:
+                pass
+    
+    # Step 5: Navigate to search form (from Introduction.aspx)
+    if "Search.aspx" not in (page.url or ""):
+        for sel in ["a:has-text('Search Document')", "a#TreeView1t6", "a[href*='Search.aspx']"]:
+            if page.locator(sel).count() > 0:
+                try:
+                    page.locator(sel).first.click(timeout=8000)
+                    page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                    page.wait_for_timeout(1200)
+                    break
+                except Exception:
+                    pass
+    
+    # Step 6: Final fallback to ensure we're on Search.aspx
+    if "Search.aspx" not in (page.url or ""):
+        page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=120_000)
+
+
+def _execute_search_for_doc_type(
+    page: Any,
+    start_date: str,
+    end_date: str,
+    doc_type: str,
+    verbose: bool = False,
+) -> bool:
+    sd = _normalise_date(start_date)
+    ed = _normalise_date(end_date)
+    date_ok = False
+    for ssel, esel in [
+        ("input[id*='tbDateStart']", "input[id*='tbDateEnd']"),
+    ]:
+        if page.locator(ssel).count() > 0 and page.locator(esel).count() > 0:
+            page.locator(ssel).first.fill(sd)
+            page.locator(esel).first.fill(ed)
+            date_ok = True
+            break
+    type_ok = False
+    group_sel = "select[id*='cboDocumentGroup']"
+    type_sel = "select[id*='cboDocumentType']"
+    load_types_btn = "input[id*='btnLoadDocumentTypes']"
+    if page.locator(group_sel).count() > 0:
+        group_map = {
+            "Notice": ["NOTICE OF TRUSTEE SALE", "LIS PENDENS"],
+            "Deed": ["TRUSTEES DEED", "SHERIFFS DEED"],
+            "Lien": ["STATE LIEN", "STATE TAX LIEN"],
+        }
+        for group, types in group_map.items():
+            if any(t.lower() in doc_type.lower() for t in types):
+                if _select_option_containing(page, group_sel, group):
+                    page.wait_for_timeout(500)
+                    # Some sessions require explicit "Load" click to populate Document Type options.
+                    if page.locator(load_types_btn).count() > 0:
+                        try:
+                            page.locator(load_types_btn).first.click(timeout=8000)
+                            page.wait_for_load_state("domcontentloaded", timeout=30_000)
+                        except Exception:
+                            pass
+                    # Also trigger onfocus loader used by the site JS, then wait for options.
+                    try:
+                        if page.locator(type_sel).count() > 0:
+                            page.locator(type_sel).first.focus()
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(1200)
+                    if page.locator(type_sel).count() > 0:
+                        # Wait until placeholder "Loading..." is replaced (max ~5s)
+                        for _ in range(10):
+                            try:
+                                opts = page.locator(type_sel).first.evaluate(
+                                    "el => Array.from(el.options).map(o => (o.text || '').trim())"
+                                )
+                                has_real = any(o and o.upper() != "LOADING..." for o in opts)
+                                if has_real:
+                                    break
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(500)
+                        type_ok = _select_option_containing(page, type_sel, doc_type)
+                    break
+        page.wait_for_timeout(400)
+    if verbose:
+        print(f"  Search setup: dates={'ok' if date_ok else 'fail'} type={'ok' if type_ok else 'fail'}")
+    for sel in ["input[id*='btnSearchDocuments']", "input[type='submit'][value*='Execute Search']"]:
+        if page.locator(sel).count() > 0:
+            try:
+                page.locator(sel).first.click(timeout=10_000)
+                page.wait_for_load_state("domcontentloaded", timeout=45_000)
+                page.wait_for_timeout(1200)
+                return True
+            except Exception:
+                pass
+    try:
+        page.evaluate("() => { const form = document.querySelector('form'); if (form) form.submit(); }")
+        page.wait_for_load_state("domcontentloaded", timeout=45_000)
+        page.wait_for_timeout(1200)
+        return True
+    except Exception:
+        return False
+
+
+def _collect_result_pages(page: Any, max_pages: int = 0, verbose: bool = False) -> list[str]:
+    pages: list[str] = []
+    page_no = 1
+    visited_fingerprints: set[str] = set()
+    while True:
+        html = page.content()
+        fingerprint = re.sub(r"\s+", "", page.url + (html[:1000] if html else ""))[:1200]
+        if fingerprint in visited_fingerprints:
+            break
+        visited_fingerprints.add(fingerprint)
+        pages.append(html)
+        if verbose:
+            print(f"    Collected results page {page_no}")
+        if max_pages and page_no >= max_pages:
+            break
+        moved = False
+        for sel in ["a:has-text('Next')", "a[title*='Next']"]:
+            if page.locator(sel).count() > 0:
+                try:
+                    page.locator(sel).first.click(timeout=8000)
+                    page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                    page.wait_for_timeout(1000)
+                    moved = True
+                    break
+                except Exception:
+                    pass
+        if not moved:
+            break
+        page_no += 1
+    return pages
+
+
+def playwright_collect_results(
+    start_date: str,
+    end_date: str,
+    doc_types: list[str],
+    max_pages: int = 0,
+    headless: bool = True,
+    verbose: bool = False,
+) -> tuple[str, list[dict]]:
+    if not _PLAYWRIGHT_OK:
+        raise RuntimeError("playwright not installed")
+    all_records: list[dict] = []
+    seen = set()
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=headless)
+        # Start fresh each run. Reusing stale storage state often causes
+        # "County Selection Missing" and breaks document type loading.
+        context = browser.new_context(viewport={"width": 1366, "height": 900})
+        page = context.new_page()
+        _goto_document_search(page, verbose=verbose)
+        for dt in doc_types:
+            if verbose:
+                print(f"[LAPAZ] Searching doc type: {dt}")
+            ok = _execute_search_for_doc_type(page, start_date, end_date, dt, verbose=verbose)
+            if not ok:
+                _goto_document_search(page, verbose=False)
+                continue
+            html_pages = _collect_result_pages(page, max_pages=max_pages, verbose=verbose)
+            for html in html_pages:
+                recs = parse_results_html(html, source_doc_type=dt)
+                for r in recs:
+                    dk = r.get("documentId", "")
+                    if dk and dk not in seen:
+                        seen.add(dk)
+                        all_records.append(r)
+            _goto_document_search(page, verbose=False)
+        context.storage_state(path=str(STORAGE_STATE_PATH))
+        cookie_header = _cookie_header_from_cookies(context.cookies())
+        browser.close()
+    return cookie_header, all_records
+
+
+def fetch_detail(dk: str, session: requests.Session, timeout: int = 30) -> dict:
+    url = f"{DOCUMENT_URL}?DK={dk}"
+    r = session.get(url, timeout=timeout)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = _safe_text(soup)
+    detail = {
+        "detailUrl": url,
+        "recordingNumber": _value_by_id_contains(soup, "tbReceptionNo") or "",
+        "recordingDate": _value_by_id_contains(soup, "tbReceptionDate") or "",
+        "documentType": _value_by_id_contains(soup, "tbDocumentType") or "",
+        "grantors": "",
+        "grantees": "",
+        "trustor": "",
+        "trustee": "",
+        "beneficiary": "",
+        "principalAmount": "",
+        "propertyAddress": "",
+        "rawText": text,
+        "imageUrls": [],
+    }
+    name_rows = soup.select("table[id*='tableNameIndexingDetails'] tr")
+    parsed_names: list[str] = []
+    for tr in name_rows[1:]:
+        tds = tr.find_all("td")
+        if not tds:
+            continue
+        parts = [_safe_text(td) for td in tds[:4]]
+        full = " ".join([p for p in parts if p]).strip()
+        if full:
+            parsed_names.append(full)
+    if parsed_names and not detail.get("grantors"):
+        detail["grantors"] = " | ".join(parsed_names[:1])
+    if len(parsed_names) > 1 and not detail.get("grantees"):
+        detail["grantees"] = " | ".join(parsed_names[1:2])
+    desc = _value_by_id_contains(soup, "tbDescription")
+    if desc:
+        detail["rawText"] = (detail["rawText"] + "\n" + desc).strip()
+    if not detail["recordingDate"]:
+        detail["recordingDate"] = _extract_date(text)
+    if not detail["recordingNumber"]:
+        detail["recordingNumber"] = _extract_recording_number(text)
+    found = set()
+    for tag in soup.select("a[href*='ImageHandler.ashx']"):
+        u = tag.get("href") or ""
+        if u:
+            full = urllib.parse.urljoin(BASE_URL + "/", u)
+            if full not in found:
+                found.add(full)
+                detail["imageUrls"].append(full)
+    return detail
+
+
+def discover_image_urls(
+    dk: str,
+    session: requests.Session,
+    detail_image_urls: list[str] | None = None,
+    max_probe_pages: int = 6,
+) -> list[str]:
+    urls: list[str] = []
+    seen = set()
+    for u in (detail_image_urls or []):
+        if u not in seen:
+            seen.add(u)
+            urls.append(u)
+    for pn in range(1, max_probe_pages + 1):
+        u = f"{IMAGE_HANDLER_URL}?DK={dk}&PN={pn}"
+        try:
+            head = session.head(u, timeout=10)
+            ctype = (head.headers.get("Content-Type") or "").lower()
+            cl = int(head.headers.get("Content-Length") or 0)
+            if head.status_code == 200 and "image" in ctype and cl > 500:
+                if u not in seen:
+                    seen.add(u)
+                    urls.append(u)
+            elif head.status_code == 200 and cl == 0:
+                break
+        except Exception:
+            if pn > 1:
+                break
+    return urls
+
+
+def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
+    """Upscale 2x + sharpen + increase contrast for OCR."""
+    im = im.convert("RGB")
+    w, h = im.size
+    if w < 1200:
+        im = im.resize((w * 2, h * 2), Image.LANCZOS)
+    im = im.filter(ImageFilter.SHARPEN)
+    im = ImageEnhance.Contrast(im).enhance(1.8)
+    return im
+
+
+def _ocr_from_image_bytes(data: bytes) -> str:
+    if not data or pytesseract is None:
+        return ""
+    try:
+        im = Image.open(io.BytesIO(data))
+        im.load()
+        im_proc = _preprocess_for_ocr(im)
+        buf = io.BytesIO()
+        im_proc.save(buf, format="PNG")
+        buf.seek(0)
+        im_clean = Image.open(buf)
+        im_clean.load()
+        return pytesseract.image_to_string(im_clean, config="--psm 6 --oem 3") or ""
+    except Exception:
+        return ""
+
+
+def ocr_document_images(
+    image_urls: list[str],
+    session: requests.Session,
+    timeout: int = 30,
+    max_pages: int = 6,
+) -> tuple[str, str]:
+    texts: list[str] = []
+    used = "none"
+    for i, u in enumerate(image_urls[:max_pages], 1):
+        try:
+            rr = session.get(u, timeout=timeout)
+            rr.raise_for_status()
+            ctype = (rr.headers.get("Content-Type") or "").lower()
+            if "image" not in ctype:
+                continue
+            txt = _ocr_from_image_bytes(rr.content)
+            if txt.strip():
+                used = "tesseract-image"
+                texts.append(f"\n\n--- PAGE {i} ---\n{txt.strip()}")
+        except Exception:
+            continue
+    return "\n".join(texts).strip(), used
+
+
+def _regex_principal(text: str) -> str:
+    pats = [
+        r"(?:original\s+principal|principal\s+balance|loan\s+amount|sum\s+of)[^$\n]{0,100}(\$[\d,]+(?:\.\d{2})?)",
+        r"(?:amount|balance)[:\s]{1,3}(\$[\d,]+(?:\.\d{2})?)",
+    ]
+    for p in pats:
+        m = re.search(p, text, re.I | re.S | re.M)
+        if m:
+            v = m.group(1).strip()
+            num_str = re.sub(r"[^\d.]", "", v)
+            try:
+                if float(num_str) >= 100:
+                    if not v.startswith("$"):
+                        v = "$" + v
+                    return v
+            except Exception:
+                pass
+    return ""
+
+
+def _regex_address(text: str) -> str:
+    exclude = [r"\bDEED OF TRUST\b", r"\bLegal Lot Block\b", r"Section.*Township"]
+    pats = [
+        r"\b\d{1,5}\s+[A-Z][A-Za-z\s.,#\-]{6,60}(?:ST|AVE|RD|DR|LN|BLVD|CT|PL|WAY)(?:[,\s]+[A-Z][A-Za-z ]+[,\s]+AZ)?",
+        r"(?:property\s+address|premises)[:\s]{1,3}([^\n]{8,80})",
+    ]
+    for p in pats:
+        m = re.search(p, text, re.I | re.M)
+        if m:
+            val = m.group(1) if m.lastindex and m.group(1) else m.group(0)
+            val = re.sub(r"\s+", " ", val).strip(" ,")
+            if len(val) >= 8 and not any(re.search(e, val, re.I) for e in exclude):
+                return val
+    return ""
+
+
+def _regex_party(text: str, label: str) -> str:
+    m = re.search(rf"{label}\s*[:\-]?\s*([A-Z][A-Z0-9 ,.&'\-]{{3,80}})", text, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def enrich_record(
+    record: dict,
+    session: requests.Session,
+    use_groq: bool = True,
+    groq_api_key: str = "",
+    max_image_pages: int = 6,
+) -> dict:
+    dk = record.get("documentId", "")
+    if not dk:
+        return record
+    try:
+        detail = fetch_detail(dk, session)
+    except Exception as e:
+        record["analysisError"] = f"detail fetch failed: {e}"
+        return record
+    for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
+        if detail.get(key):
+            record[key] = detail[key]
+    image_urls = discover_image_urls(dk, session, detail.get("imageUrls", []), max_probe_pages=max_image_pages)
+    record["imageUrls"] = " | ".join(image_urls)
+    ocr_text, ocr_method = ocr_document_images(image_urls, session, max_pages=max_image_pages)
+    record["ocrMethod"] = ocr_method
+    record["ocrChars"] = len(ocr_text)
+    merged = (detail.get("rawText", "") + "\n" + ocr_text).strip()
+    if not record.get("principalAmount"):
+        record["principalAmount"] = _regex_principal(merged)
+    if not record.get("propertyAddress"):
+        record["propertyAddress"] = _regex_address(merged)
+    return record
+
+
+def export_csv(records: list[dict], out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+        w.writeheader()
+        for r in records:
+            w.writerow({k: r.get(k, "") for k in CSV_FIELDS})
+
+
+def export_json(records: list[dict], out_path: Path, meta: dict | None = None) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "meta": meta or {},
+        "count": len(records),
+        "records": [{k: r.get(k, "") for k in CSV_FIELDS} for r in records],
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def run_lapaz_pipeline(
+    start_date: str,
+    end_date: str,
+    doc_types: list[str] | None = None,
+    max_pages: int = 0,
+    ocr_limit: int = 10,
+    use_groq: bool = True,
+    headless: bool = True,
+    verbose: bool = False,
+) -> dict:
+    doc_types = doc_types or DEFAULT_DOCUMENT_TYPES
+    cookie_header, records = playwright_collect_results(
+        start_date=start_date,
+        end_date=end_date,
+        doc_types=doc_types,
+        max_pages=max_pages,
+        headless=headless,
+        verbose=verbose,
+    )
+    session = _make_session(cookie_header)
+    groq_key = os.getenv("GROQ_API_KEY", "")
+    use_groq = bool(use_groq and groq_key)
+    if ocr_limit < 0:
+        enrich_count = 0
+    elif ocr_limit == 0:
+        enrich_count = len(records)
+    else:
+        enrich_count = min(ocr_limit, len(records))
+    for i, rec in enumerate(records, 1):
+        if verbose:
+            print(f"[ENRICH] {i}/{len(records)} DK={rec.get('documentId','')}")
+        if i <= enrich_count:
+            enrich_record(rec, session, use_groq=use_groq, groq_api_key=groq_key)
+        else:
+            try:
+                detail = fetch_detail(rec.get("documentId", ""), session)
+                for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
+                    if detail.get(key):
+                        rec[key] = detail[key]
+            except Exception as e:
+                rec["analysisError"] = f"detail fetch failed: {e}"
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_path = OUTPUT_DIR / f"lapaz_leads_{ts}.csv"
+    json_path = OUTPUT_DIR / f"lapaz_leads_{ts}.json"
+    meta = {
+        "county": "La Paz County, AZ",
+        "platform": "TheCountyRecorder (ASP.NET WebForms)",
+        "baseUrl": BASE_URL,
+        "startDate": _normalise_date(start_date),
+        "endDate": _normalise_date(end_date),
+        "documentTypes": doc_types,
+        "recordsFound": len(records),
+        "recordsOCR": enrich_count,
+        "usedGroq": use_groq,
+        "timestamp": datetime.now().isoformat(),
+    }
+    export_csv(records, csv_path)
+    export_json(records, json_path, meta=meta)
+    return {
+        "records": records,
+        "csv_path": str(csv_path),
+        "json_path": str(json_path),
+        "summary": meta,
+    }

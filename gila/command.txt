@@ -1,8 +1,9 @@
 Start Command:- 
 cd /Users/vishaljha/Automated-Scrapping-for-Real-estate-leads-within-24-hours
-/Users/vishaljha/.pyenv/versions/3.10.13/bin/python gila/run_demo.py \
-  --start-date "10/1/2025" \
-  --end-date   "3/14/2026" \
+/Users/vishaljha/.pyenv/versions/3.10.13/bin/python gila/live_pipeline.py \
+  --start-date "3/9/2026" \
+  --end-date   "3/15/2026" \
+  --ocr-limit 3 --no-groq \
   > /tmp/gila_run.log 2>&1 &
 
 echo "PID=$!  →  tail -f /tmp/gila_run.log"
@@ -11,15 +12,15 @@ echo "PID=$!  →  tail -f /tmp/gila_run.log"
 Live Logs: tail -f /tmp/gila_run.log
 
 
-wailt for finish + full log :- while pgrep -f "gila/run_demo" > /dev/null; do sleep 5; done \
+Wait for finish + full log :- while pgrep -f "gila/live_pipeline" > /dev/null; do sleep 5; done \
   && echo "=== DONE ===" && cat /tmp/gila_run.log
 
 
-Insepct Output Csv :- 
+Inspect Output Csv :- 
 
 /Users/vishaljha/.pyenv/versions/3.10.13/bin/python3 -c "
 import csv, pathlib
-csvf = sorted(pathlib.Path('gila/output').glob('gila_demo_*.csv'))[-1]
+csvf = sorted(pathlib.Path('gila/output').glob('gila_leads_*.csv'))[-1]
 rows = list(csv.DictReader(open(csvf)))
 print('File:', csvf.name, '|', len(rows), 'rows')
 for i, r in enumerate(rows, 1):

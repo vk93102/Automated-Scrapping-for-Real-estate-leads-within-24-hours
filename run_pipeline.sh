@@ -18,7 +18,42 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-PY_BIN="$DIR/.venv/bin/python"
+# Python selection order:
+#  1) explicit PY_BIN env override
+#  2) repo-local virtualenv
+#  3) pyenv-selected python
+#  4) system python3
+PY_BIN_CANDIDATES=()
+if [[ -n "${PY_BIN:-}" ]]; then
+  PY_BIN_CANDIDATES+=("$PY_BIN")
+fi
+PY_BIN_CANDIDATES+=("$DIR/.venv/bin/python")
+if command -v pyenv >/dev/null 2>&1; then
+  _PYENV_PY="$(pyenv which python 2>/dev/null || true)"
+  [[ -n "${_PYENV_PY:-}" ]] && PY_BIN_CANDIDATES+=("$_PYENV_PY")
+fi
+_SYS_PY="$(command -v python3 2>/dev/null || true)"
+[[ -n "${_SYS_PY:-}" ]] && PY_BIN_CANDIDATES+=("$_SYS_PY")
+
+PY_BIN=""
+for candidate in "${PY_BIN_CANDIDATES[@]}"; do
+  if [[ -x "$candidate" ]] && "$candidate" -c "import psycopg" >/dev/null 2>&1; then
+    PY_BIN="$candidate"
+    break
+  fi
+done
+
+# Fallback to first executable candidate even if psycopg is missing,
+# so we can show a clear install hint below.
+if [[ -z "$PY_BIN" ]]; then
+  for candidate in "${PY_BIN_CANDIDATES[@]}"; do
+    if [[ -x "$candidate" ]]; then
+      PY_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
 LOG_DIR="$DIR/logs"
 OUTPUT_DIR="$DIR/output"
 TODAY="$(date +%Y-%m-%d)"
@@ -50,7 +85,13 @@ export TZ="${TZ:-America/Phoenix}"
 
 # ── Validate required env vars ────────────────────────────────────────────────
 if [[ ! -x "$PY_BIN" ]]; then
-  echo "[pipeline] FATAL: Python venv not found at $PY_BIN" | tee -a "$LOG_FILE"
+  echo "[pipeline] FATAL: Python executable not found (resolved path: $PY_BIN)" | tee -a "$LOG_FILE"
+  exit 1
+fi
+
+if ! "$PY_BIN" -c "import psycopg" >/dev/null 2>&1; then
+  echo "[pipeline] FATAL: Missing dependency 'psycopg' for $PY_BIN" | tee -a "$LOG_FILE"
+  echo "[pipeline] Run: $PY_BIN -m pip install -r $DIR/requirements.txt" | tee -a "$LOG_FILE"
   exit 1
 fi
 
@@ -105,7 +146,7 @@ EXIT_CODE=0
   --pdf-mode memory \
   --sleep 0.3 \
   --only-new \
-  "${USE_PROXY_FLAG[@]}" \
+  ${USE_PROXY_FLAG[@]+"${USE_PROXY_FLAG[@]}"}  \
   --db-url "$DATABASE_URL" \
   --log-level INFO \
   --out-json  "$OUTPUT_DIR/pipeline_latest.json" \

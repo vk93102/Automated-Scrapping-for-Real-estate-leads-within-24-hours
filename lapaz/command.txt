@@ -1,0 +1,5 @@
+# La Paz County quick run (last 7 days)
+python lapaz/live_pipeline.py --start-date 3/9/2026 --end-date 3/16/2026 --ocr-limit 5 --pages 0
+
+# Headful debug mode
+python lapaz/live_pipeline.py --start-date 3/9/2026 --end-date 3/16/2026 --headful --verbose --pages 2 --ocr-limit 2

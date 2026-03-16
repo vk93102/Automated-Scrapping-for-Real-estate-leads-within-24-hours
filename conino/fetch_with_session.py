@@ -144,21 +144,23 @@ def run_automation(
         # Inject document type filters via JS hidden inputs (mirrors what the autocomplete widget does).
         # The server reads repeated "field_selfservice_documentTypes-searchInput" entries.
         if document_types:
-            js_types = json.dumps(document_types)
-            page.evaluate(f"""
-                (types) => {{
+            # Pass the Python list directly — Playwright serialises it to a real JS array.
+            # Previously json.dumps() was used, which made `types` a JS string, not an array,
+            # causing "types.forEach is not a function".
+            page.evaluate("""
+                (types) => {
                     const form = document.querySelector('form');
                     if (!form) return;
                     // Remove any previously injected hidden inputs
                     form.querySelectorAll('input[data-injected-doctype]').forEach(el => el.remove());
-                    types.forEach(t => {{
+                    types.forEach(t => {
                         const h = document.createElement('input');
                         h.type = 'hidden';
                         h.name = 'field_selfservice_documentTypes-searchInput';
                         h.value = t;
                         h.setAttribute('data-injected-doctype', '1');
                         form.appendChild(h);
-                    }});
+                    });
                     // Also inject the -containsInput operator hidden field
                     const op = document.createElement('input');
                     op.type = 'hidden';
@@ -166,8 +168,8 @@ def run_automation(
                     op.value = 'Contains Any';
                     op.setAttribute('data-injected-doctype', '1');
                     form.appendChild(op);
-                }}
-            """, js_types)
+                }
+            """, document_types)
 
         # Trigger search button when present
         if page.locator("#searchButton").count() > 0:
