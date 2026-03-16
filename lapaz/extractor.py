@@ -198,8 +198,11 @@ def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5
 
         # Pass 2: normalized contains (handles apostrophes, extra spaces, punctuation)
         for opt in opts:
-            txt_norm = _norm(opt.get("text") or "")
-            if tgt_norm and (tgt_norm in txt_norm or txt_norm in tgt_norm):
+            txt = (opt.get("text") or "").strip()
+            txt_norm = _norm(txt)
+            if not txt_norm or txt.upper() in {"LOADING..."}:
+                continue
+            if tgt_norm and tgt_norm in txt_norm:
                 locator.select_option(value=opt["value"], timeout=timeout)
                 return True
 
@@ -424,6 +427,18 @@ def _execute_search_for_doc_type(
                             pass
                         page.wait_for_timeout(500)
                     type_ok = _select_option_containing(page, type_sel, doc_type)
+                    # Validate that selected option is really the requested type.
+                    if type_ok:
+                        try:
+                            selected_text = page.locator(type_sel).first.evaluate(
+                                "el => (el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : '').trim()"
+                            )
+                            wanted = re.sub(r"[^A-Z0-9]+", "", doc_type.upper())
+                            got = re.sub(r"[^A-Z0-9]+", "", (selected_text or "").upper())
+                            if not got or wanted not in got:
+                                type_ok = False
+                        except Exception:
+                            type_ok = False
                 if type_ok:
                     break
         page.wait_for_timeout(400)
