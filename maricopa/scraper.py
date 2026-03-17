@@ -137,6 +137,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--db-url", default=os.environ.get("DATABASE_URL", ""), help="Postgres connection string")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
     p.add_argument("--workers", type=int, default=4, help="Number of worker threads for OCR/LLM processing")
+    p.add_argument(
+        "--db-only",
+        action="store_true",
+        help="DB-only mode: no local JSON/CSV/state artifacts; keep processing in DB pipeline.",
+    )
     return p.parse_args()
 
 
@@ -151,6 +156,13 @@ def _parse_iso_date(s: str) -> date:
 def main() -> None:
     args = _parse_args()
     load_dotenv_if_present(args.dotenv)
+    if args.db_only and args.no_db:
+        raise SystemExit("--db-only cannot be used with --no-db")
+
+    # DB-only mode should never persist PDFs to disk.
+    if args.db_only and str(args.pdf_mode) != "memory":
+        args.pdf_mode = "memory"
+
     if not (args.db_url or "").strip():
         args.db_url = (os.environ.get("DATABASE_URL") or "").strip()
     logger = setup_logging(level=args.log_level)
@@ -258,14 +270,16 @@ def main() -> None:
                     pass
         except Exception:
             # fallback to file write if DB fails
-            _write_recording_numbers("output/recording_numbers_found.txt", recs)
+            if not args.db_only:
+                _write_recording_numbers("output/recording_numbers_found.txt", recs)
     else:
-        _write_recording_numbers("output/recording_numbers_found.txt", recs)
+        if not args.db_only:
+            _write_recording_numbers("output/recording_numbers_found.txt", recs)
 
     if args.limit and args.limit > 0:
         recs = recs[: int(args.limit)]
     # Persist planned list (fallback to file)
-    if conn is None:
+    if conn is None and not args.db_only:
         _write_recording_numbers("output/recording_numbers_planned.txt", recs)
 
     proxy_provider = ProxyProvider.from_file(args.proxy_list)
@@ -296,7 +310,8 @@ def main() -> None:
     n_llm = 0
 
     out_path = Path(args.out_json)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not args.db_only:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
     results: list[dict[str, Any]] = []
     new_results: list[dict[str, Any]] = []
 
@@ -534,23 +549,26 @@ def main() -> None:
             # Fall back to existing results
             pass
 
-    out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    logger.info(f"Saved {len(results)} results to {out_path}")
+    if not args.db_only:
+        out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        logger.info(f"Saved {len(results)} results to {out_path}")
 
-    # NEW-records CSV + JSON (for filtering in the server endpoint)
-    csv_path = Path(args.out_csv)
-    write_csv(str(csv_path), new_results, include_meta=bool(args.csv_include_meta))
-    csv_path.with_suffix(".json").write_text(
-        json.dumps(new_results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    logger.info(f"Saved {len(new_results)} NEW records CSV to {csv_path}")
-
-    if args.out_csv_dated:
-        p2 = write_dated_csv(str(csv_path.parent), new_results, include_meta=bool(args.csv_include_meta))
-        p2.with_suffix(".json").write_text(
+        # NEW-records CSV + JSON (for filtering in the server endpoint)
+        csv_path = Path(args.out_csv)
+        write_csv(str(csv_path), new_results, include_meta=bool(args.csv_include_meta))
+        csv_path.with_suffix(".json").write_text(
             json.dumps(new_results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        logger.info(f"Saved dated NEW records CSV to {p2}")
+        logger.info(f"Saved {len(new_results)} NEW records CSV to {csv_path}")
+
+        if args.out_csv_dated:
+            p2 = write_dated_csv(str(csv_path.parent), new_results, include_meta=bool(args.csv_include_meta))
+            p2.with_suffix(".json").write_text(
+                json.dumps(new_results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            )
+            logger.info(f"Saved dated NEW records CSV to {p2}")
+    else:
+        logger.info("DB-only mode enabled: skipped local JSON/CSV artifact writes")
 
     # ── Run summary ───────────────────────────────────────────────────────────
     logger.info(
