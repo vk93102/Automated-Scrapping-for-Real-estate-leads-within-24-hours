@@ -141,6 +141,8 @@ def _parse_iso_date(s: str) -> date:
 def main() -> None:
     args = _parse_args()
     load_dotenv_if_present(args.dotenv)
+    if not (args.db_url or "").strip():
+        args.db_url = (os.environ.get("DATABASE_URL") or "").strip()
     logger = setup_logging(level=args.log_level)
 
     end = _parse_iso_date(args.end_date) if args.end_date else date.today()

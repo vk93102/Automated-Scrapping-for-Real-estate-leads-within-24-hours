@@ -9,7 +9,7 @@ from urllib.parse import parse_qs, urlencode, urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from maricopa_scraper.http_client import RetryConfig, new_session, with_retry
+from maricopa.http_client import RetryConfig, new_session, with_retry
 
 logger = logging.getLogger(__name__)
 

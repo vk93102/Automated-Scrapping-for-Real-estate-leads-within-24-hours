@@ -377,12 +377,11 @@ def run_pipeline(
     print(f"[DETAIL] Done in {time.time() - t0:.1f}s")
 
     # ── Stage 6+7: OCR + Groq for records still missing fields ──────────────
-    needs_ocr = [
-        r for r in records
-        if not str(r.get("propertyAddress", "")).strip()
-        or not str(r.get("principalAmount", "")).strip()
-    ]
-    ocr_count = min(len(needs_ocr), max(0, ocr_limit))
+    needs_ocr = list(records)
+    if ocr_limit == 0:
+        ocr_count = len(needs_ocr)
+    else:
+        ocr_count = min(len(needs_ocr), max(0, ocr_limit))
     print(f"\n[OCR] {len(needs_ocr)} records still need OCR  (running on {ocr_count})")
 
     for idx, record in enumerate(needs_ocr[:ocr_count], 1):
@@ -465,6 +464,7 @@ def run_pipeline(
         "nonEmptyPropertyAddress": non_empty_addr,
         "nonEmptyPrincipalAmount": non_empty_amt,
         "ocrProcessed": ocr_count,
+        "records": records,
         "csvFile": csv_path.name,
         "csvPath": str(csv_path),
         "summary": summary,

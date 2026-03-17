@@ -122,7 +122,7 @@ def _load_local_env() -> None:
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip('"').strip("'")
-            if k and k not in os.environ:
+            if k:
                 os.environ[k] = v
     except Exception:
         return
@@ -1022,35 +1022,39 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
     ]
     last_err = ""
     for model in model_candidates:
-        try:
-            resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "temperature": 0,
-                    "response_format": {"type": "json_object"},
-                    "messages": messages,
-                },
-                timeout=timeout_s,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            content = (
-                payload.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            data = json.loads(content) if content else {}
-            if isinstance(data, dict):
-                return data, model
-            last_err = "invalid JSON object"
-        except Exception as exc:
-            last_err = str(exc)
-            continue
+        for use_response_format in (True, False):
+            body = {
+                "model": model,
+                "temperature": 0,
+                "messages": messages,
+            }
+            if use_response_format:
+                body["response_format"] = {"type": "json_object"}
+            try:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=body,
+                    timeout=timeout_s,
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                content = (
+                    payload.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.I)
+                data = json.loads(content) if content else {}
+                if isinstance(data, dict):
+                    return data, model
+                last_err = "invalid JSON object"
+            except Exception as exc:
+                last_err = str(exc)
+                continue
     raise RuntimeError(last_err or "Groq request failed")
 
 
@@ -1091,8 +1095,8 @@ def _groq_extract_fields(
         "documentId": document_id,
         "recordingNumber": recording_number,
         "documentType": document_type,
-        "ocrText": (ocr_text or "")[:18000],
-        "detailText": (detail_text or "")[:6000],
+        "ocrText": (ocr_text or "")[:6000],
+        "detailText": (detail_text or "")[:2500],
     }
     messages = [
         {"role": "system", "content": system_prompt},

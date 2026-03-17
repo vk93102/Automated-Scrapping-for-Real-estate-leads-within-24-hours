@@ -11,10 +11,10 @@ from pathlib import Path
 from typing import Any
 
 from arizona.apache_assessor import ApacheAssessorClient, ApacheAssessorError
-from maricopa_scraper.dotenv import load_dotenv_if_present
-from maricopa_scraper.http_client import RetryConfig
-from maricopa_scraper.logging_setup import setup_logging
-from maricopa_scraper.proxies import ProxyProvider
+from maricopa.dotenv import load_dotenv_if_present
+from maricopa.http_client import RetryConfig
+from maricopa.logging_setup import setup_logging
+from maricopa.proxies import ProxyProvider
 
 
 def _parse_args() -> argparse.Namespace:

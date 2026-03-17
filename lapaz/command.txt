@@ -6,3 +6,12 @@ python3 live_pipeline.py \
   --ocr-limit 0 \
   --workers 3 \
   --verbose
+
+# La Paz one-shot validation (last 7 days, DB upsert)
+python3 lapaz/run_lapaz_interval.py --once --interval-minutes 10 --lookback-days 7
+
+# La Paz continuous runner every 12 hours (rolling 7 days)
+python3 lapaz/run_lapaz_interval.py --interval-minutes 720 --lookback-days 7
+
+# One-time 90-day backfill into DB
+python3 lapaz/run_lapaz_interval.py --once --interval-minutes 10 --lookback-days 90
