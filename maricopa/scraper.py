@@ -51,6 +51,16 @@ def _is_valid_metadata(meta) -> bool:
     return bool((meta.recording_number or "").strip() and meta.document_codes)
 
 
+def _canon_doc_code(code: str) -> str:
+    raw = str(code or "").strip().upper()
+    aliases = {
+        "NS": "N/TR SALE",
+        "NTR SALE": "N/TR SALE",
+        "N/TRSALE": "N/TR SALE",
+    }
+    return aliases.get(raw, raw)
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Maricopa Recorder scraping pipeline")
     p.add_argument(
@@ -151,9 +161,15 @@ def main() -> None:
     else:
         begin = end - timedelta(days=int(args.days))
 
-    # Pass the document code straight to the API — no splitting, no filtering.
-    # The API accepts a single code string (e.g. "NS", "N/TR SALE").
     document_code_raw = str(args.document_code or "").strip()
+    requested_doc_codes = [
+        c.strip()
+        for c in re.split(r"[,|]", document_code_raw)
+        if c and c.strip()
+    ]
+    if any(c.upper() == "ALL" for c in requested_doc_codes):
+        requested_doc_codes = []
+    requested_doc_codes_set = {_canon_doc_code(c) for c in requested_doc_codes}
 
     recs: list[str] = []
     if args.recording_numbers_file:
@@ -184,16 +200,36 @@ def main() -> None:
         api_session = new_session()
         retry = RetryConfig(attempts=3, base_sleep_s=1.0, max_sleep_s=10.0)
 
-        doc_codes_for_api = [document_code_raw] if document_code_raw and document_code_raw.upper() != "ALL" else None
-        recs = search_recording_numbers(
-            api_session,
-            document_codes=doc_codes_for_api,
-            begin_date=begin,
-            end_date=end,
-            page_size=5000,
-            max_results=None,
-            retry=retry,
-        )
+        if requested_doc_codes:
+            merged: list[str] = []
+            seen: set[str] = set()
+            for code in requested_doc_codes:
+                subset = search_recording_numbers(
+                    api_session,
+                    document_codes=[code],
+                    begin_date=begin,
+                    end_date=end,
+                    page_size=5000,
+                    max_results=None,
+                    retry=retry,
+                )
+                logger.info("Search API returned %d records for doc code '%s'", len(subset), code)
+                for rn in subset:
+                    if rn in seen:
+                        continue
+                    seen.add(rn)
+                    merged.append(rn)
+            recs = merged
+        else:
+            recs = search_recording_numbers(
+                api_session,
+                document_codes=None,
+                begin_date=begin,
+                end_date=end,
+                page_size=5000,
+                max_results=None,
+                retry=retry,
+            )
     if not recs:
         logger.warning("No recording numbers found (empty results or blocked)")
     logger.info(f"Found {len(recs)} recording numbers")
@@ -288,6 +324,19 @@ def main() -> None:
                 n_skipped += 1
                 continue
 
+            # Safety filter: enforce requested doc-code(s) against fetched metadata.
+            if requested_doc_codes_set:
+                meta_codes = {_canon_doc_code(c) for c in (meta.document_codes or []) if str(c or "").strip()}
+                if not (meta_codes & requested_doc_codes_set):
+                    logger.info(
+                        "Skipping %s — metadata codes %s not in requested filter %s",
+                        rec,
+                        sorted(meta_codes),
+                        sorted(requested_doc_codes_set),
+                    )
+                    n_skipped += 1
+                    continue
+
             # Add basic metadata row for outputs (will be enriched after OCR/LLM)
             results.append({
                 "recordingNumber": meta.recording_number,
@@ -315,15 +364,26 @@ def main() -> None:
                     except Exception:
                         doc_id = None
 
-                # If OCR text already exists and --force not set, skip OCR/LLM
+                # If OCR already exists and extracted properties already exist, skip OCR/LLM.
+                # If properties are missing, still run LLM extraction to populate DB.
                 try:
                     with conn.cursor() as cur:
-                        cur.execute("select ocr_text from documents where recording_number = %s", (rec,))
+                        cur.execute(
+                            """
+                            select d.ocr_text,
+                                   exists(select 1 from properties p where p.document_id = d.id) as has_properties
+                            from documents d
+                            where d.recording_number = %s
+                            """,
+                            (rec,),
+                        )
                         row = cur.fetchone()
                         ocr_text = (row[0] if row and row[0] else "")
+                        has_properties = bool(row[1]) if row and len(row) > 1 else False
                 except Exception:
                     ocr_text = ""
-                if ocr_text and not args.force:
+                    has_properties = False
+                if ocr_text and has_properties and not args.force:
                     logger.info("Skipping OCR/LLM for %s — ocr already present", rec)
                     n_skipped += 1
                     continue
@@ -353,6 +413,7 @@ def main() -> None:
         ocr_done = False
         llm_done = False
         error_msg = None
+        skipped_pdf = False
         try:
             if not args.no_db:
                 local_conn = connect(args.db_url)
@@ -396,21 +457,35 @@ def main() -> None:
             processed = True
         except Exception as e:
             error_msg = str(e)
+            # Known case: PDF is unavailable for some recording numbers (404 on all fallback URLs).
+            # Keep metadata row, mark as skipped, and don't count as hard failure.
+            if "Could not fetch PDF" in error_msg and "404" in error_msg:
+                skipped_pdf = True
+                try:
+                    if local_conn is None and not args.no_db:
+                        local_conn = connect(args.db_url)
+                    if local_conn is not None:
+                        mark_processed(local_conn, rec)
+                        mark_resolved(local_conn, rec)
+                except Exception:
+                    pass
+                error_msg = None
             # record failure in DB if available
-            try:
-                if local_conn is None and not args.no_db:
-                    local_conn = connect(args.db_url)
-                if local_conn is not None:
-                    record_failure(local_conn, rec, stage=(pdf_stage if 'pdf_stage' in locals() else 'pdf'), error=error_msg)
-            except Exception:
-                pass
+            if error_msg:
+                try:
+                    if local_conn is None and not args.no_db:
+                        local_conn = connect(args.db_url)
+                    if local_conn is not None:
+                        record_failure(local_conn, rec, stage=(pdf_stage if 'pdf_stage' in locals() else 'pdf'), error=error_msg)
+                except Exception:
+                    pass
         finally:
             try:
                 if local_conn is not None:
                     local_conn.close()
             except Exception:
                 pass
-        return {"rec": rec, "processed": processed, "ocr": ocr_done, "llm": llm_done, "error": error_msg}
+        return {"rec": rec, "processed": processed, "ocr": ocr_done, "llm": llm_done, "error": error_msg, "skipped_pdf": skipped_pdf}
 
     if tasks:
         logger.info("Starting threaded OCR/LLM with %d workers for %d tasks", max(1, int(args.workers)), len(tasks))
@@ -425,6 +500,8 @@ def main() -> None:
                         n_ocr += 1
                     if r.get("llm"):
                         n_llm += 1
+                    if r.get("skipped_pdf"):
+                        n_skipped += 1
                     if r.get("error"):
                         n_failed += 1
                         logger.warning("Task %s failed: %s", r.get("rec"), r.get("error"))

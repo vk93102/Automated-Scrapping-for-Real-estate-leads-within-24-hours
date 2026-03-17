@@ -20,21 +20,38 @@ if [[ -f "$ROOT_DIR/.env" ]]; then
   set +a
 fi
 
-# Resolve python
-if [[ -n "${PY_BIN:-}" && -x "${PY_BIN}" ]]; then
-  PYTHON_BIN="$PY_BIN"
-elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
-elif command -v python3 >/dev/null 2>&1; then
-  PYTHON_BIN="$(command -v python3)"
-else
-  PYTHON_BIN="python"
+# Resolve python (prefer an interpreter that already has required deps)
+PYTHON_BIN=""
+CANDIDATES=()
+if [[ -n "${PY_BIN:-}" ]]; then CANDIDATES+=("$PY_BIN"); fi
+CANDIDATES+=("$ROOT_DIR/.venv/bin/python")
+if command -v pyenv >/dev/null 2>&1; then
+  _PYENV_PY="$(pyenv which python 2>/dev/null || true)"
+  [[ -n "${_PYENV_PY:-}" ]] && CANDIDATES+=("$_PYENV_PY")
+fi
+if command -v python3 >/dev/null 2>&1; then CANDIDATES+=("$(command -v python3)"); fi
+CANDIDATES+=("python")
+
+for C in "${CANDIDATES[@]}"; do
+  if [[ -x "$C" ]] && "$C" -c "import psycopg" >/dev/null 2>&1; then
+    PYTHON_BIN="$C"
+    break
+  fi
+done
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  for C in "${CANDIDATES[@]}"; do
+    if [[ -x "$C" ]]; then
+      PYTHON_BIN="$C"
+      break
+    fi
+  done
 fi
 
 # Defaults (override with env vars in Coolify)
-INTERVAL_SECONDS="${INTERVAL_SECONDS:-600}"   # 10 min for near real-time
+INTERVAL_SECONDS="${INTERVAL_SECONDS:-43200}" # 12h cadence (twice daily)
 DAYS_WINDOW="${DAYS_WINDOW:-1}"               # keep small to avoid search API 500
-DOC_CODE="${DOC_CODE:-ALL}"
+DOC_CODE="${DOC_CODE:-NS}"
 WORKERS="${WORKERS:-4}"
 SLEEP_BETWEEN_DOCS="${SLEEP_BETWEEN_DOCS:-0.3}"
 PDF_MODE="${PDF_MODE:-memory}"
@@ -49,6 +66,18 @@ fi
 
 if [[ ! -x "$PYTHON_BIN" ]]; then
   echo "[$(date '+%F %T')] FATAL: Python not executable: $PYTHON_BIN" | tee -a "$LOG_FILE"
+  exit 1
+fi
+
+# Ensure core dependency exists (helpful on fresh servers)
+if ! "$PYTHON_BIN" -c "import psycopg" >/dev/null 2>&1; then
+  echo "[$(date '+%F %T')] psycopg missing for $PYTHON_BIN — installing requirements" | tee -a "$LOG_FILE"
+  "$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel >> "$LOG_FILE" 2>&1 || true
+  "$PYTHON_BIN" -m pip install -r "$ROOT_DIR/requirements.txt" >> "$LOG_FILE" 2>&1 || true
+fi
+
+if ! "$PYTHON_BIN" -c "import psycopg" >/dev/null 2>&1; then
+  echo "[$(date '+%F %T')] FATAL: psycopg still missing for $PYTHON_BIN" | tee -a "$LOG_FILE"
   exit 1
 fi
 

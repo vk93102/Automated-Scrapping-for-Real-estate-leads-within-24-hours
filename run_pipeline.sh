@@ -2,7 +2,7 @@
 # =============================================================================
 # run_pipeline.sh — Production cron wrapper for Maricopa County Recorder scraper
 #
-# Schedule: Every 10 minutes (*/10 * * * *)
+# Schedule: Every 20 minutes (*/20 * * * *)
 #
 # Pipeline per run:
 #   1. Fetch today's recording numbers from Maricopa public API
@@ -129,8 +129,8 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 } >> "$LOG_FILE"
 
 # ── Run the scraper ───────────────────────────────────────────────────────────
-#   --document-code ALL    : capture all doc types (DEED TRST, WAR DEED, etc.)
-#   --days 1               : today only (begin_date = today-1 day to today)
+#   --document-code NS     : reliable notice-of-sale search code for API
+#   --days 2               : always scan last 2 days (rolling window)
 #   --limit 500            : process up to 500 new docs per 2-hour window
 #   --pdf-mode memory      : OCR from in-memory bytes (no disk writes)
 #   --sleep 0.3            : polite delay between requests
@@ -139,12 +139,17 @@ TIMESTAMP="$(date '+%Y-%m-%d %H:%M:%S')"
 #   --log-level INFO       : INFO-level logging to log file
 
 EXIT_CODE=0
-"$PY_BIN" -m maricopa_scraper.scraper \
-  --document-code "N/TR SALE" \
-  --days 1 \
+DOC_CODE="${DOC_CODE:-NS}"
+DAYS_WINDOW="${DAYS_WINDOW:-2}"
+WORKERS="${WORKERS:-4}"
+
+"$PY_BIN" -m maricopa.scraper \
+  --document-code "$DOC_CODE" \
+  --days "$DAYS_WINDOW" \
   --limit 0 \
   --pdf-mode memory \
   --sleep 0.3 \
+  --workers "$WORKERS" \
   --only-new \
   ${USE_PROXY_FLAG[@]+"${USE_PROXY_FLAG[@]}"}  \
   --db-url "$DATABASE_URL" \

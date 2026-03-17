@@ -94,6 +94,12 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
+
+        # Backward/forward-compatible logical names for Maricopa-specific querying.
+        cur.execute("create or replace view maricopa_documents as select * from documents;")
+        cur.execute("create or replace view maricopa_properties as select * from properties;")
+        cur.execute("create or replace view maricopa_cron_jobs as select * from cron_jobs;")
+        cur.execute("create or replace view maricopa_discovered_recordings as select * from discovered_recordings;")
     conn.commit()
 
 
