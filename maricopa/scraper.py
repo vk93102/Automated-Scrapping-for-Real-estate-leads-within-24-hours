@@ -321,7 +321,7 @@ def main() -> None:
     proxies = proxy_provider.as_requests_proxies() if args.use_proxy else None
 
     # Phase 1: prefetch metadata and upsert documents, build tasks for OCR/LLM
-    tasks: list[tuple[str, Any, Optional[int]]] = []
+    tasks: list[tuple[str, Any, Optional[int], str]] = []
     pre_session = new_session()
     for i, rec in enumerate(recs, start=1):
         logger.info(f"Prefetching metadata {rec} ({i}/{len(recs)})")
@@ -363,6 +363,9 @@ def main() -> None:
             new_results.append(results[-1])
 
             doc_id = None
+            ocr_text = ""
+            has_properties = False
+            has_unresolved_error = False
             if conn is not None:
                 try:
                     doc_id = upsert_document(conn, meta)
@@ -386,7 +389,8 @@ def main() -> None:
                         cur.execute(
                             """
                             select d.ocr_text,
-                                   exists(select 1 from properties p where p.document_id = d.id) as has_properties
+                                   exists(select 1 from properties p where p.document_id = d.id) as has_properties,
+                                   d.failed
                             from documents d
                             where d.recording_number = %s
                             """,
@@ -395,16 +399,39 @@ def main() -> None:
                         row = cur.fetchone()
                         ocr_text = (row[0] if row and row[0] else "")
                         has_properties = bool(row[1]) if row and len(row) > 1 else False
+                        has_unresolved_error = bool(row[2]) if row and len(row) > 2 else False
                 except Exception:
                     ocr_text = ""
                     has_properties = False
+                    has_unresolved_error = False
+
+                # If row was previously marked failed but now has complete data,
+                # clear stale failure state.
+                if has_unresolved_error and ocr_text and has_properties and not args.force:
+                    try:
+                        mark_resolved(conn, rec)
+                        has_unresolved_error = False
+                    except Exception:
+                        pass
+
                 if ocr_text and has_properties and not args.force:
                     logger.info("Skipping OCR/LLM for %s — ocr already present", rec)
                     n_skipped += 1
                     continue
 
+                # Recover from failed/incomplete records already in DB:
+                # if OCR exists but properties are missing OR record is marked failed,
+                # re-run only LLM using existing OCR (no PDF fetch needed).
+                if ocr_text and (has_unresolved_error or not has_properties):
+                    logger.info(
+                        "Reprocessing %s from existing OCR (failed=%s, has_properties=%s)",
+                        rec,
+                        has_unresolved_error,
+                        has_properties,
+                    )
+
             # Schedule for OCR/LLM processing
-            tasks.append((rec, meta, doc_id))
+            tasks.append((rec, meta, doc_id, ocr_text if ocr_text else ""))
 
         except Exception as e:
             logger.warning("Metadata prefetch failed %s: %s", rec, e)
@@ -419,8 +446,8 @@ def main() -> None:
             time.sleep(float(args.sleep))
 
     # Phase 2: threaded OCR + LLM processing
-    def _process_task(task: tuple[str, Any, Optional[int]]) -> dict:
-        rec, meta, doc_id = task
+    def _process_task(task: tuple[str, Any, Optional[int], str]) -> dict:
+        rec, meta, doc_id, existing_ocr_text = task
         local_session = new_session()
         local_retry = RetryConfig(attempts=3, base_sleep_s=1.0, max_sleep_s=10.0)
         local_conn = None
@@ -433,20 +460,26 @@ def main() -> None:
             if not args.no_db:
                 local_conn = connect(args.db_url)
 
-            # Download PDF and OCR
+            # OCR source: reuse existing OCR when available, otherwise fetch PDF and OCR.
             pdf_stage = "pdf"
-            if str(args.pdf_mode) == "memory":
-                pdf_bytes = fetch_pdf_bytes(local_session, rec, proxies=proxies, retry=local_retry)
-                pdf_stage = "ocr"
-                ocr_text = ocr_pdf_bytes_to_text(pdf_bytes)
+            if existing_ocr_text:
+                ocr_text = existing_ocr_text
+                logger.info("Using existing OCR text for %s (LLM reprocess)", rec)
+                ocr_done = True
             else:
-                pdf_stage = "ocr"
-                pdf_path = download_pdf(local_session, rec, proxies=proxies, retry=local_retry)
-                ocr_text = ocr_pdf_to_text(pdf_path)
-            ocr_done = True
+                if str(args.pdf_mode) == "memory":
+                    pdf_bytes = fetch_pdf_bytes(local_session, rec, proxies=proxies, retry=local_retry)
+                    pdf_stage = "ocr"
+                    ocr_text = ocr_pdf_bytes_to_text(pdf_bytes)
+                else:
+                    pdf_stage = "ocr"
+                    pdf_path = download_pdf(local_session, rec, proxies=proxies, retry=local_retry)
+                    ocr_text = ocr_pdf_to_text(pdf_path)
+                ocr_done = True
 
             if local_conn is not None:
                 try:
+                    # Keep DB OCR synced (safe for both newly OCR'd and reused OCR text)
                     update_document_ocr_text(local_conn, rec, ocr_text)
                 except Exception:
                     pass

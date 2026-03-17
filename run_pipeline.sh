@@ -28,6 +28,8 @@ if [[ -n "${PY_BIN:-}" ]]; then
   PY_BIN_CANDIDATES+=("$PY_BIN")
 fi
 PY_BIN_CANDIDATES+=("$DIR/.venv/bin/python")
+# Hardcoded pyenv path — works even when pyenv shell integration is absent (e.g. cron)
+PY_BIN_CANDIDATES+=("/Users/vishaljha/.pyenv/versions/3.10.13/bin/python")
 if command -v pyenv >/dev/null 2>&1; then
   _PYENV_PY="$(pyenv which python 2>/dev/null || true)"
   [[ -n "${_PYENV_PY:-}" ]] && PY_BIN_CANDIDATES+=("$_PYENV_PY")
