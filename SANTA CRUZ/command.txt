@@ -1,0 +1,8 @@
+python3 "SANTA CRUZ/live_pipeline.py" \
+  --start-date 3/10/2026 \
+  --end-date 3/17/2026 \
+  --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
+  --pages 0 \
+  --ocr-limit 0 \
+  --workers 3 \
+  --verbose
