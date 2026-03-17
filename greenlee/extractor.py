@@ -55,6 +55,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
+ROOT_DIR = Path(__file__).resolve().parent.parent
 
 DEFAULT_DOCUMENT_TYPES = [
     "NOTICE OF DEFAULT",
@@ -81,6 +82,9 @@ CSV_FIELDS = [
     "imageUrls",
     "ocrMethod",
     "ocrChars",
+    "usedGroq",
+    "groqModel",
+    "groqError",
     "sourceCounty",
     "analysisError",
 ]
@@ -104,6 +108,24 @@ def _cookie_header_from_cookies(cookies: list[dict]) -> str:
         if name:
             vals.append(f"{name}={value}")
     return "; ".join(vals)
+
+
+def _load_local_env() -> None:
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k and k not in os.environ:
+                os.environ[k] = v
+    except Exception:
+        return
 
 
 def _make_session(cookie_header: str) -> requests.Session:
@@ -177,6 +199,54 @@ def _value_by_id_contains(soup: BeautifulSoup, key: str) -> str:
     return (node.get("value") or "").strip()
 
 
+def _collect_detail_text(soup: BeautifulSoup) -> str:
+    """Collect document-focused text blocks and avoid full-page nav noise."""
+    blocks: list[str] = []
+    selectors = [
+        "table[id*='Table7']",
+        "table[id*='DescriptionTable']",
+        "table[id*='tableNameIndexingDetails']",
+        "table[id*='tableRelatedDocumentDetails']",
+        "span[id*='lblViewImage']",
+    ]
+    for sel in selectors:
+        for node in soup.select(sel):
+            txt = "\n".join(s.strip() for s in node.stripped_strings if s and s.strip())
+            if txt:
+                blocks.append(txt)
+
+    if not blocks:
+        for node in soup.select("table.Results"):
+            txt = "\n".join(s.strip() for s in node.stripped_strings if s and s.strip())
+            if txt:
+                blocks.append(txt)
+
+    if not blocks:
+        return _safe_text(soup)
+
+    uniq = list(dict.fromkeys(blocks))
+    return "\n\n".join(uniq)
+
+
+def _extract_named_rows_by_label(soup: BeautifulSoup, label: str) -> list[str]:
+    out: list[str] = []
+    target = (label or "").strip().upper()
+    for tbl in soup.select("table.Results"):
+        vals = [re.sub(r"\s+", " ", s).strip(" ,") for s in tbl.stripped_strings if s and s.strip()]
+        if not vals:
+            continue
+        head = (vals[0] or "").upper()
+        if head != target:
+            continue
+        for v in vals[1:]:
+            if not v:
+                continue
+            if v.upper() in {"SHOW NAME INDEXING DETAILS", "HIDE NAME INDEXING DETAILS"}:
+                continue
+            out.append(v)
+    return out
+
+
 def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5000) -> bool:
     """Select first option in <select> whose text contains target (case-insensitive)."""
     def _norm(s: str) -> str:
@@ -190,6 +260,17 @@ def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5
         tgt_upper = (target or "").upper()
         tgt_norm = _norm(target)
         tgt_tokens = [t for t in re.split(r"\W+", tgt_upper) if t]
+
+        # Pass 0: exact match (raw or normalized) to prevent accidental partial hits.
+        for opt in opts:
+            txt = (opt.get("text") or "").strip()
+            if not txt or txt.upper() in {"LOADING..."}:
+                continue
+            txt_up = txt.upper()
+            txt_norm = _norm(txt)
+            if (tgt_upper and txt_up == tgt_upper) or (tgt_norm and txt_norm == tgt_norm):
+                locator.select_option(value=opt["value"], timeout=timeout)
+                return True
 
         # Pass 1: direct contains
         for opt in opts:
@@ -586,7 +667,7 @@ def fetch_detail(dk: str, session: requests.Session, timeout: int = 30) -> dict:
     r = session.get(url, timeout=timeout)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
-    text = _safe_text(soup)
+    text = _collect_detail_text(soup)
     detail = {
         "detailUrl": url,
         "recordingNumber": _value_by_id_contains(soup, "tbReceptionNo") or "",
@@ -603,20 +684,30 @@ def fetch_detail(dk: str, session: requests.Session, timeout: int = 30) -> dict:
         "imageUrls": [],
         "imageAccessNote": "",
     }
-    name_rows = soup.select("table[id*='tableNameIndexingDetails'] tr")
-    parsed_names: list[str] = []
-    for tr in name_rows[1:]:
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-        parts = [_safe_text(td) for td in tds[:4]]
-        full = " ".join([p for p in parts if p]).strip()
-        if full:
-            parsed_names.append(full)
-    if parsed_names and not detail.get("grantors"):
-        detail["grantors"] = " | ".join(parsed_names[:1])
-    if len(parsed_names) > 1 and not detail.get("grantees"):
-        detail["grantees"] = " | ".join(parsed_names[1:2])
+    grantor_names = _extract_named_rows_by_label(soup, "Grantor")
+    grantee_names = _extract_named_rows_by_label(soup, "Grantee")
+
+    if grantor_names:
+        detail["grantors"] = " | ".join(grantor_names[:4])
+    if grantee_names:
+        detail["grantees"] = " | ".join(grantee_names[:4])
+
+    # Fallback only when labeled blocks are missing.
+    if not detail.get("grantors") and not detail.get("grantees"):
+        name_rows = soup.select("table[id*='tableNameIndexingDetails'] tr")
+        parsed_names: list[str] = []
+        for tr in name_rows[1:]:
+            tds = tr.find_all("td")
+            if not tds:
+                continue
+            parts = [_safe_text(td) for td in tds[:4]]
+            full = " ".join([p for p in parts if p]).strip()
+            if full:
+                parsed_names.append(full)
+        if parsed_names and not detail.get("grantors"):
+            detail["grantors"] = " | ".join(parsed_names[:1])
+        if len(parsed_names) > 1 and not detail.get("grantees"):
+            detail["grantees"] = " | ".join(parsed_names[1:2])
     desc = _value_by_id_contains(soup, "tbDescription")
     if desc:
         detail["rawText"] = (detail["rawText"] + "\n" + desc).strip()
@@ -831,8 +922,7 @@ def _regex_address(text: str) -> str:
                 return out
 
     pats = [
-        r"\b\d{1,5}\s+[A-Z][A-Za-z\s.,#\-]{6,60}(?:ST|AVE|RD|DR|LN|BLVD|CT|PL|WAY)(?:[,\s]+[A-Z][A-Za-z ]+[,\s]+AZ)?",
-        r"\bP\.?\s*O\.?\s*BOX\s+\d+\b(?:[,\s/]+[A-Z][A-Za-z .'-]+)?(?:,\s*AZ\s+\d{5})?",
+        r"\b\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Z0-9][A-Za-z0-9\s.,#\-']{3,90}\b(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|BLVD|BOULEVARD|CT|COURT|PL|PLACE|WAY|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE)\b(?:,\s*[A-Z][A-Za-z .'-]+,\s*AZ(?:\s+\d{5}(?:-\d{4})?)?)?",
     ]
     for p in pats:
         m = re.search(p, text, re.I | re.M)
@@ -845,8 +935,171 @@ def _regex_address(text: str) -> str:
 
 
 def _regex_party(text: str, label: str) -> str:
-    m = re.search(rf"{label}\s*[:\-]?\s*([A-Z][A-Z0-9 ,.&'\-]{{3,80}})", text, re.I)
-    return m.group(1).strip() if m else ""
+    lines = [re.sub(r"\s+", " ", ln).strip(" |:;,-") for ln in (text or "").splitlines()]
+    stop_terms = [
+        "SHOW NAME INDEXING",
+        "HIDE NAME INDEXING",
+        "UNDER THIS SECURITY INSTRUMENT",
+        "TO THE EXTENT OF",
+        "REQUESTED BY",
+    ]
+    label_re = re.compile(rf"\b{re.escape(label)}\b", re.I)
+    for i, line in enumerate(lines):
+        if not label_re.search(line):
+            continue
+        cand = label_re.sub("", line).strip(" :-|,")
+        if not cand and i + 1 < len(lines):
+            cand = lines[i + 1]
+        cand = re.sub(r"\s+", " ", cand).strip(" |:;,-")
+        if not cand:
+            continue
+        if any(t in cand.upper() for t in stop_terms):
+            continue
+        if len(cand) < 4:
+            continue
+        if not re.search(r"[A-Za-z]", cand):
+            continue
+        return cand
+    return ""
+
+
+def _extract_party_block(text: str, role: str) -> str:
+    if not text:
+        return ""
+    lines = [re.sub(r"\s+", " ", ln).strip(" |:;,-") for ln in text.splitlines() if ln and ln.strip()]
+    label_patterns = [
+        rf"name\s+and\s+address\s+of\s+(?:the\s+)?{role}",
+        rf"\b{role}\b",
+    ]
+    stop_patterns = [
+        r"name\s+and\s+address\s+of",
+        r"recording\s+requested\s+by",
+        r"when\s+recorded\s+mail\s+to",
+        r"notice\s+of",
+        r"apn\b",
+    ]
+    for i, line in enumerate(lines):
+        if not any(re.search(lp, line, re.I) for lp in label_patterns):
+            continue
+        candidate_parts: list[str] = []
+        after = line
+        for lp in label_patterns:
+            after = re.sub(lp, "", after, flags=re.I)
+        after = after.strip(" :-|,")
+        if after:
+            candidate_parts.append(after)
+        for j in range(i + 1, min(i + 4, len(lines))):
+            nxt = lines[j]
+            if any(re.search(sp, nxt, re.I) for sp in stop_patterns):
+                break
+            if nxt:
+                candidate_parts.append(nxt)
+            if len(" ".join(candidate_parts)) > 140:
+                break
+        cand = re.sub(r"\s+", " ", " ".join(candidate_parts)).strip(" |:;,-")
+        if not cand:
+            continue
+        bad = [
+            "UNDER THIS SECURITY INSTRUMENT",
+            "TO THE EXTENT OF",
+            "SHOW NAME INDEXING",
+            "HIDE NAME INDEXING",
+            "NAME AND ADDRESS",
+        ]
+        if any(b in cand.upper() for b in bad):
+            continue
+        if len(cand) < 5 or not re.search(r"[A-Za-z]", cand):
+            continue
+        return cand
+    return ""
+
+
+def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int = 60) -> tuple[dict, str]:
+    model_candidates = [
+        "llama-3.3-70b-versatile",
+        "llama-3.1-70b-versatile",
+        "llama3-70b-8192",
+    ]
+    last_err = ""
+    for model in model_candidates:
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "temperature": 0,
+                    "response_format": {"type": "json_object"},
+                    "messages": messages,
+                },
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            content = (
+                payload.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            data = json.loads(content) if content else {}
+            if isinstance(data, dict):
+                return data, model
+            last_err = "invalid JSON object"
+        except Exception as exc:
+            last_err = str(exc)
+            continue
+    raise RuntimeError(last_err or "Groq request failed")
+
+
+def _normalise_party(v: str) -> str:
+    return re.sub(r"\s+", " ", (v or "")).strip(" |:;,-")
+
+
+def _looks_bad_party(v: str) -> bool:
+    u = (v or "").upper()
+    if not u:
+        return True
+    bad = [
+        "UNDER THIS SECURITY INSTRUMENT",
+        "TO THE EXTENT OF",
+        "SHOW NAME INDEXING",
+        "HIDE NAME INDEXING",
+        "NAME AND ADDRESS",
+    ]
+    return any(b in u for b in bad)
+
+
+def _groq_extract_fields(
+    *,
+    document_id: str,
+    recording_number: str,
+    document_type: str,
+    ocr_text: str,
+    detail_text: str,
+    api_key: str,
+) -> tuple[dict, str]:
+    system_prompt = (
+        "Extract recorder document fields from OCR text. Return STRICT JSON with keys: "
+        "trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees, confidenceNote. "
+        "grantors and grantees must be arrays of names. Do not invent values. "
+        "If unknown, return empty string/empty array. principalAmount must be a dollar string like $123,456.78 when present."
+    )
+    user_payload = {
+        "documentId": document_id,
+        "recordingNumber": recording_number,
+        "documentType": document_type,
+        "ocrText": (ocr_text or "")[:18000],
+        "detailText": (detail_text or "")[:6000],
+    }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
+    data, model = _groq_request(messages, api_key=api_key, timeout_s=70)
+    return data, model
 
 
 def enrich_record(
@@ -876,14 +1129,51 @@ def enrich_record(
             ocr_method = "unavailable-county-blocked"
     record["ocrMethod"] = ocr_method
     record["ocrChars"] = len(ocr_text)
-    merged = (detail.get("rawText", "") + "\n" + ocr_text).strip()
-    if not record.get("principalAmount"):
-        record["principalAmount"] = _regex_principal(merged)
-    if not record.get("propertyAddress"):
-        record["propertyAddress"] = _regex_address(merged)
-    for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-        if not record.get(key):
-            record[key] = _regex_party(merged, label)
+    record.setdefault("usedGroq", False)
+    record.setdefault("groqModel", "")
+    record.setdefault("groqError", "")
+    merged = (ocr_text + "\n" + detail.get("rawText", "")).strip()
+
+    if use_groq and groq_api_key and (ocr_text.strip() or detail.get("rawText", "").strip()):
+        try:
+            llm, model = _groq_extract_fields(
+                document_id=dk,
+                recording_number=record.get("recordingNumber", ""),
+                document_type=record.get("documentType", ""),
+                ocr_text=ocr_text,
+                detail_text=detail.get("rawText", ""),
+                api_key=groq_api_key,
+            )
+            record["usedGroq"] = True
+            record["groqModel"] = model
+
+            # LLM-first mapping (no regex dependency when LLM is enabled).
+            for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
+                llm_val = (llm.get(key) or "").strip()
+                if llm_val:
+                    record[key] = llm_val
+
+            llm_grantors = llm.get("grantors") or []
+            llm_grantees = llm.get("grantees") or []
+            if isinstance(llm_grantors, list) and llm_grantors:
+                record["grantors"] = " | ".join(_normalise_party(x) for x in llm_grantors if str(x).strip())
+            if isinstance(llm_grantees, list) and llm_grantees:
+                record["grantees"] = " | ".join(_normalise_party(x) for x in llm_grantees if str(x).strip())
+        except Exception as e:
+            record["groqError"] = str(e)
+    else:
+        # Regex fallback path only when LLM is unavailable/disabled.
+        if not record.get("principalAmount"):
+            record["principalAmount"] = _regex_principal(merged)
+        if not record.get("propertyAddress"):
+            record["propertyAddress"] = _regex_address(merged)
+        for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
+            if not record.get(key):
+                record[key] = _extract_party_block(ocr_text, label)
+            if not record.get(key):
+                record[key] = _extract_party_block(merged, label)
+            if not record.get(key):
+                record[key] = _regex_party(merged, label)
     return record
 
 
@@ -926,6 +1216,7 @@ def run_greenlee_pipeline(
         headless=headless,
         verbose=verbose,
     )
+    _load_local_env()
     session = _make_session(cookie_header)
     groq_key = os.getenv("GROQ_API_KEY", "")
     use_groq = bool(use_groq and groq_key)
