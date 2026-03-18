@@ -52,12 +52,22 @@ end = date.today()
 start = end - timedelta(days=7)
 
 doc_types = [
-    "NOTICE OF DEFAULT",
-    "NOTICE OF TRUSTEE SALE",
+    "NOTICE",
     "LIS PENDENS",
-    "DEED IN LIEU",
-    "TREASURERS DEED",
-    "NOTICE OF REINSTATEMENT",
+    "FORECLOSURE",
+    "LIEU OF FORECLOSURE",
+    "TRUSTEE'S DEED",
+    "SHERIFF'S DEED",
+    "BANKRUPTCY",
+    "DIVORCE DECREE",
+    "DISSOLUTION",
+    "SEPARATION",
+    "PROBATE",
+    "PERSONAL REPRESENTATIVE",
+    "HEIRSHIP",
+    "TAX BILL",
+    "TREASURER'S DEED",
+    "TREASURER'S RETURN",
 ]
 
 _log("greenlee cron started")

@@ -18,8 +18,7 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from county_doc_types import UNIFIED_LEAD_DOC_TYPES
-from graham.extractor import run_graham_pipeline  # noqa: E402
+from graham.extractor import DEFAULT_DOCUMENT_TYPES, run_graham_pipeline  # noqa: E402
 
 
 def _load_env() -> None:
@@ -218,7 +217,14 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _run_once(
+    doc_types: list[str],
+    workers: int,
+    lookback_days: int,
+    strict_llm: bool,
+    ocr_limit: int,
+    verbose: bool,
+) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -231,20 +237,39 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
 
+    # CRITICAL: ocr_limit controls extraction behavior:
+    #  -1 = skip OCR/LLM entirely (WRONG for data population - use for speed when data already exists)
+    #   0 = process ALL documents with OCR + Groq LLM (RECOMMENDED for backfill/new data)
+    #   N = process first N docs with OCR + Groq LLM (for testing)
+    # For 30-day backfill, we MUST set ocr_limit to 0 to extract trustor/trustee/address/etc
+    effective_ocr_limit = ocr_limit
+    if ocr_limit < 0:
+        _log(f"warning: ocr_limit={ocr_limit} set to 0 for proper data extraction (trustor/trustee/address)")
+        effective_ocr_limit = 0
+
     res = run_graham_pipeline(
         start_date=start_date,
         end_date=end_date,
         doc_types=doc_types,
         max_pages=0,
-        ocr_limit=0,
+        ocr_limit=effective_ocr_limit,
         workers=max(1, workers),
         use_groq=True,
         headless=True,
-        verbose=False,
+        verbose=verbose,
         write_output_files=False,
     )
 
     records = res.get("records", [])
+    _log(f"processed {len(records)} documents; checking extraction quality...")
+    
+    # Validate data extraction
+    records_with_trustor = len([r for r in records if (r.get("trustor") or "").strip()])
+    records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
+    records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
+    
+    _log(f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, {records_with_trustor} have trustor")
+    
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
         if missing:
@@ -275,25 +300,35 @@ def main() -> None:
     p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--ocr-limit", type=int, default=0, help="0 process all docs with OCR+LLM (recommended), N cap, -1 maps to 0")
+    p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument(
         "--doc-types",
         nargs="+",
-        default=UNIFIED_LEAD_DOC_TYPES,
+        default=DEFAULT_DOCUMENT_TYPES,
     )
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
         f"starting graham interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
+        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} "
+        f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.workers, args.lookback_days, args.strict_llm)
+            total, ins, upd, llm_used = _run_once(
+                args.doc_types,
+                args.workers,
+                args.lookback_days,
+                args.strict_llm,
+                args.ocr_limit,
+                args.verbose,
+            )
             _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")

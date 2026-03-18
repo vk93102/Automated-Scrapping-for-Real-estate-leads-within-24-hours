@@ -35,8 +35,9 @@ COPY . .
 # Create runtime directories (logs, output, tmp)
 RUN mkdir -p /app/logs /app/output /app/tmp
 
-# ── Cron: run scraper every 20 minutes for NS documents in last 2 days ──────────────────────
-# Uses Python directly — no bash file-I/O, no EDEADLK risk
+# ── Cron: run scraper every 20 minutes for NS documents in last 2 days ────
+# DOC_CODE=NS filters to NotarizedSale documents only
+# DAYS_WINDOW=2 looks back 2 days from current date
 RUN echo "*/20 * * * * root cd /app && DOC_CODE=NS DAYS_WINDOW=2 ./run_pipeline.sh >> /app/logs/cron_master.log 2>&1" \
     > /etc/cron.d/maricopa-scraper \
  && chmod 0644 /etc/cron.d/maricopa-scraper \

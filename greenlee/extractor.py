@@ -247,6 +247,32 @@ def _extract_named_rows_by_label(soup: BeautifulSoup, label: str) -> list[str]:
     return out
 
 
+def _extract_image_like_urls(raw_html: str) -> list[str]:
+    """Extract direct/indirect image URLs from detail page HTML/JS blobs."""
+    if not raw_html:
+        return []
+    out: list[str] = []
+    seen = set()
+
+    patterns = [
+        r"((?:ImageHandler|ViewImage)\.aspx?[^\"'\s)<>]+)",
+        r"(ImageHandler\.ashx\?[^\"'\s)<>]+)",
+    ]
+
+    for pat in patterns:
+        for m in re.finditer(pat, raw_html, re.I):
+            cand = (m.group(1) or "").strip()
+            if not cand:
+                continue
+            cand = cand.replace("&amp;", "&")
+            full = urllib.parse.urljoin(BASE_URL + "/", cand)
+            if full not in seen:
+                seen.add(full)
+                out.append(full)
+
+    return out
+
+
 def _select_option_containing(page: Any, sel: str, target: str, timeout: int = 5000) -> bool:
     """Select first option in <select> whose text contains target (case-insensitive)."""
     def _norm(s: str) -> str:
@@ -726,6 +752,23 @@ def fetch_detail(dk: str, session: requests.Session, timeout: int = 30) -> dict:
             if full not in found:
                 found.add(full)
                 detail["imageUrls"].append(full)
+
+    # Many records expose image links in JS/onclick instead of plain anchors.
+    for node in soup.select("*[onclick], a[href], img[src], iframe[src]"):
+        for attr in ["onclick", "href", "src"]:
+            raw = (node.get(attr) or "").strip()
+            if not raw:
+                continue
+            for full in _extract_image_like_urls(raw):
+                if full not in found:
+                    found.add(full)
+                    detail["imageUrls"].append(full)
+
+    # Last-pass regex scan over full HTML for embedded URL strings.
+    for full in _extract_image_like_urls(r.text):
+        if full not in found:
+            found.add(full)
+            detail["imageUrls"].append(full)
     return detail
 
 
@@ -741,6 +784,23 @@ def discover_image_urls(
         if u not in seen:
             seen.add(u)
             urls.append(u)
+
+    # Resolve image viewer pages that contain actual ImageHandler URLs.
+    viewer_candidates = [
+        f"{BASE_URL}/ViewImage.aspx?DK={dk}",
+        f"{BASE_URL}/ViewImage.aspx?dk={dk}",
+    ]
+    for vu in viewer_candidates:
+        try:
+            rr = session.get(vu, timeout=15, allow_redirects=True)
+            if rr.status_code != 200:
+                continue
+            for full in _extract_image_like_urls(rr.text):
+                if full not in seen:
+                    seen.add(full)
+                    urls.append(full)
+        except Exception:
+            continue
     misses = 0
     for pn in range(1, max_probe_pages + 1):
         u = f"{IMAGE_HANDLER_URL}?DK={dk}&PN={pn}"
@@ -1062,6 +1122,15 @@ def _normalise_party(v: str) -> str:
     return re.sub(r"\s+", " ", (v or "")).strip(" |:;,-")
 
 
+def _first_party(parties: str) -> str:
+    vals = [
+        _normalise_party(x)
+        for x in str(parties or "").split("|")
+        if _normalise_party(x)
+    ]
+    return vals[0] if vals else ""
+
+
 def _looks_bad_party(v: str) -> bool:
     u = (v or "").upper()
     if not u:
@@ -1127,10 +1196,18 @@ def enrich_record(
     image_urls = discover_image_urls(dk, session, detail.get("imageUrls", []), max_probe_pages=max_image_pages)
     record["imageUrls"] = " | ".join(image_urls)
     ocr_text, ocr_method = ocr_document_images(image_urls, session, max_pages=max_image_pages)
+    blocked_no_image = False
     if not image_urls and detail.get("imageAccessNote"):
-        record["analysisError"] = detail.get("imageAccessNote", "")
-        if "unofficial images" in detail["imageAccessNote"].lower():
+        note = detail.get("imageAccessNote", "")
+        note_l = note.lower()
+        record["analysisError"] = note
+        blocked_no_image = True
+        if "unofficial images" in note_l:
             ocr_method = "unavailable-county-blocked"
+        elif "not perfected" in note_l:
+            ocr_method = "unavailable-not-perfected"
+        else:
+            ocr_method = "unavailable-no-images"
     record["ocrMethod"] = ocr_method
     record["ocrChars"] = len(ocr_text)
     record.setdefault("usedGroq", False)
@@ -1138,7 +1215,7 @@ def enrich_record(
     record.setdefault("groqError", "")
     merged = (ocr_text + "\n" + detail.get("rawText", "")).strip()
 
-    if use_groq and groq_api_key and (ocr_text.strip() or detail.get("rawText", "").strip()):
+    if use_groq and groq_api_key and not blocked_no_image and (ocr_text.strip() or detail.get("rawText", "").strip()):
         try:
             llm, model = _groq_extract_fields(
                 document_id=dk,
@@ -1163,8 +1240,47 @@ def enrich_record(
                 record["grantors"] = " | ".join(_normalise_party(x) for x in llm_grantors if str(x).strip())
             if isinstance(llm_grantees, list) and llm_grantees:
                 record["grantees"] = " | ".join(_normalise_party(x) for x in llm_grantees if str(x).strip())
+
+            # IMPORTANT: run deterministic fallback for fields still empty after LLM.
+            if not record.get("principalAmount"):
+                record["principalAmount"] = _regex_principal(merged)
+            if not record.get("propertyAddress"):
+                record["propertyAddress"] = _regex_address(merged)
+            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
+                if not record.get(key):
+                    record[key] = _extract_party_block(ocr_text, label)
+                if not record.get(key):
+                    record[key] = _extract_party_block(merged, label)
+                if not record.get(key):
+                    record[key] = _regex_party(merged, label)
+
+            # Final practical fallback from indexed parties when document text is sparse.
+            if not record.get("trustor"):
+                record["trustor"] = _first_party(record.get("grantors", ""))
+            if not record.get("beneficiary"):
+                record["beneficiary"] = _first_party(record.get("grantees", ""))
+            if not record.get("trustee"):
+                gr_first = _first_party(record.get("grantees", ""))
+                if re.search(r"TRUST|TRUSTEE", gr_first or "", re.I):
+                    record["trustee"] = gr_first
         except Exception as e:
             record["groqError"] = str(e)
+            # If LLM call fails, still execute deterministic extraction.
+            if not record.get("principalAmount"):
+                record["principalAmount"] = _regex_principal(merged)
+            if not record.get("propertyAddress"):
+                record["propertyAddress"] = _regex_address(merged)
+            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
+                if not record.get(key):
+                    record[key] = _extract_party_block(ocr_text, label)
+                if not record.get(key):
+                    record[key] = _extract_party_block(merged, label)
+                if not record.get(key):
+                    record[key] = _regex_party(merged, label)
+            if not record.get("trustor"):
+                record["trustor"] = _first_party(record.get("grantors", ""))
+            if not record.get("beneficiary"):
+                record["beneficiary"] = _first_party(record.get("grantees", ""))
     else:
         # Regex fallback path only when LLM is unavailable/disabled.
         if not record.get("principalAmount"):
@@ -1178,6 +1294,10 @@ def enrich_record(
                 record[key] = _extract_party_block(merged, label)
             if not record.get(key):
                 record[key] = _regex_party(merged, label)
+        if not record.get("trustor"):
+            record["trustor"] = _first_party(record.get("grantors", ""))
+        if not record.get("beneficiary"):
+            record["beneficiary"] = _first_party(record.get("grantees", ""))
     return record
 
 

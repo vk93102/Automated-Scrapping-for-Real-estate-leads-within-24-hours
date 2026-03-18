@@ -3,6 +3,17 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
+LOCK_DIR="$ROOT/tmp/greenlee_interval.lock"
+
+mkdir -p "$ROOT/tmp"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[greenlee-cron] another run is active; skipping overlap"
+  exit 0
+fi
+cleanup_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
 pick_python() {
   local c
@@ -15,7 +26,7 @@ pick_python() {
     "/usr/local/bin/python3"; do
     if [ -n "${c:-}" ] && [ -x "$c" ]; then
       if "$c" - <<'PY' >/dev/null 2>&1
-    import requests, bs4, PIL, playwright, psycopg
+import requests, bs4, PIL, playwright, psycopg
 PY
       then
         echo "$c"
@@ -32,10 +43,23 @@ if [ -z "$PY_BIN" ]; then
   exit 1
 fi
 
-LOOKBACK_DAYS="${GREENLEE_LOOKBACK_DAYS:-2}"
+LOOKBACK_DAYS="${GREENLEE_LOOKBACK_DAYS:-7}"
 WORKERS="${GREENLEE_WORKERS:-3}"
+# CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
+# This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
+OCR_LIMIT="${GREENLEE_OCR_LIMIT:-0}"
+VERBOSE_FLAG="${GREENLEE_VERBOSE:-0}"
+
+ARGS=(
+  --once
+  --lookback-days "$LOOKBACK_DAYS"
+  --workers "$WORKERS"
+  --ocr-limit "$OCR_LIMIT"
+)
+
+if [ "$VERBOSE_FLAG" = "1" ]; then
+  ARGS+=(--verbose)
+fi
 
 exec "$PY_BIN" "$DIR/run_greenlee_interval.py" \
-  --once \
-  --lookback-days "$LOOKBACK_DAYS" \
-  --workers "$WORKERS"
+  "${ARGS[@]}"

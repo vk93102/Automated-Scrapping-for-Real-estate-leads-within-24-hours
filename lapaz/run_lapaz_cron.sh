@@ -3,6 +3,17 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
+LOCK_DIR="$ROOT/tmp/lapaz_interval.lock"
+
+mkdir -p "$ROOT/tmp"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[lapaz-cron] another run is active; skipping overlap"
+  exit 0
+fi
+cleanup_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
 pick_python() {
   local c
@@ -15,7 +26,7 @@ pick_python() {
     "/usr/local/bin/python3"; do
     if [ -n "${c:-}" ] && [ -x "$c" ]; then
       if "$c" - <<'PY' >/dev/null 2>&1
-    import requests, bs4, PIL, playwright, psycopg
+import requests, bs4, PIL, playwright, psycopg
 PY
       then
         echo "$c"
@@ -34,8 +45,12 @@ fi
 
 LOOKBACK_DAYS="${LAPAZ_LOOKBACK_DAYS:-2}"
 WORKERS="${LAPAZ_WORKERS:-3}"
+# CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
+# This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
+OCR_LIMIT="${LAPAZ_OCR_LIMIT:-0}"
 
 exec "$PY_BIN" "$DIR/run_lapaz_interval.py" \
   --once \
   --lookback-days "$LOOKBACK_DAYS" \
-  --workers "$WORKERS"
+  --workers "$WORKERS" \
+  --ocr-limit "$OCR_LIMIT"

@@ -18,8 +18,7 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from county_doc_types import UNIFIED_LEAD_DOC_TYPES
-from lapaz.extractor import run_lapaz_pipeline  # noqa: E402
+from lapaz.extractor import DEFAULT_DOCUMENT_TYPES, run_lapaz_pipeline  # noqa: E402
 
 
 def _load_env() -> None:
@@ -123,23 +122,29 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
               total_records   integer default 0,
               inserted_rows   integer default 0,
               updated_rows    integer default 0,
+              llm_used_rows   integer default 0,
               status          text not null default 'running',
               error_message   text,
               created_at      timestamptz not null default now()
             );
             """
         )
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists llm_used_rows integer default 0;")
     conn.commit()
 
 
-def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: date) -> tuple[int, int]:
+def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: date) -> tuple[int, int, int]:
     inserted = 0
     updated = 0
+    llm_used = 0
     with conn.cursor() as cur:
         for r in records:
             doc_id = str(r.get("documentId", "") or "").strip()
             if not doc_id:
                 continue
+            used_groq = bool(r.get("usedGroq", False))
+            if used_groq:
+                llm_used += 1
             payload = {
                 "source_county": r.get("sourceCounty") or "La Paz",
                 "document_id": doc_id,
@@ -157,7 +162,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "image_urls": r.get("imageUrls", ""),
                 "ocr_method": r.get("ocrMethod", ""),
                 "ocr_chars": int(r.get("ocrChars") or 0),
-                "used_groq": bool(r.get("usedGroq", False)),
+                "used_groq": used_groq,
                 "groq_model": r.get("groqModel", ""),
                 "groq_error": r.get("groqError", ""),
                 "analysis_error": r.get("analysisError", ""),
@@ -209,10 +214,17 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             else:
                 updated += 1
     conn.commit()
-    return inserted, updated
+    return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int) -> tuple[int, int, int]:
+def _run_once(
+    doc_types: list[str],
+    workers: int,
+    lookback_days: int,
+    ocr_limit: int,
+    strict_llm: bool,
+    verbose: bool,
+) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -223,34 +235,50 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int) -> tuple[i
         end_date=end_date,
         doc_types=doc_types,
         max_pages=0,
-        ocr_limit=0,
+        ocr_limit=ocr_limit,
         workers=max(1, workers),
         use_groq=True,
         headless=True,
-        verbose=False,
+        verbose=verbose,
         write_output_files=False,
     )
 
     records = res.get("records", [])
+    _log(f"processed {len(records)} documents; checking extraction quality...")
+
+    records_with_trustor = len([r for r in records if (r.get("trustor") or "").strip()])
+    records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
+    records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
+    _log(
+        f"extraction quality: {records_with_ocr} with OCR text, "
+        f"{records_with_groq} used Groq LLM, {records_with_trustor} have trustor"
+    )
+
+    if strict_llm:
+        missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
+        if missing:
+            sample = ", ".join(x for x in missing[:10] if x)
+            raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+
     db_url = (os.environ.get("DATABASE_URL") or "").strip()
     if not db_url:
         raise RuntimeError("DATABASE_URL is missing")
 
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
-        inserted, updated = _upsert_records(conn, records, today)
+        inserted, updated, llm_used = _upsert_records(conn, records, today)
         with conn.cursor() as cur:
             cur.execute(
                 """
                 insert into lapaz_pipeline_runs
-                  (run_date, run_finished_at, total_records, inserted_rows, updated_rows, status)
-                values (%s, now(), %s, %s, %s, 'success');
+                  (run_date, run_finished_at, total_records, inserted_rows, updated_rows, llm_used_rows, status)
+                values (%s, now(), %s, %s, %s, %s, 'success');
                 """,
-                (today, len(records), inserted, updated),
+                (today, len(records), inserted, updated, llm_used),
             )
         conn.commit()
 
-    return len(records), inserted, updated
+    return len(records), inserted, updated, llm_used
 
 
 def main() -> None:
@@ -262,21 +290,32 @@ def main() -> None:
     p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--ocr-limit", type=int, default=0, help="0 process all docs with OCR+LLM (recommended), N cap, -1 skip OCR/LLM")
+    p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     p.add_argument("--once", action="store_true")
-    p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
+    p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
+    p.add_argument("--doc-types", nargs="+", default=DEFAULT_DOCUMENT_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
         f"starting lapaz interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
+        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} "
+        f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd = _run_once(args.doc_types, args.workers, args.lookback_days)
-            _log(f"run ok total={total} inserted={ins} updated={upd}")
+            total, ins, upd, llm_used = _run_once(
+                args.doc_types,
+                args.workers,
+                args.lookback_days,
+                args.ocr_limit,
+                args.strict_llm,
+                args.verbose,
+            )
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")
 

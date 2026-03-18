@@ -3,6 +3,17 @@ set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
+LOCK_DIR="$ROOT/tmp/gila_interval.lock"
+
+mkdir -p "$ROOT/tmp"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[gila-cron] another run is active; skipping overlap"
+  exit 0
+fi
+cleanup_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
 pick_python() {
   local c
@@ -33,7 +44,13 @@ if [ -z "$PY_BIN" ]; then
 fi
 
 LOOKBACK_DAYS="${GILA_LOOKBACK_DAYS:-2}"
+WORKERS="${GILA_WORKERS:-3}"
+# CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
+# This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
+OCR_LIMIT="${GILA_OCR_LIMIT:-0}"
 
 exec "$PY_BIN" "$DIR/run_gila_interval.py" \
   --once \
-  --lookback-days "$LOOKBACK_DAYS"
+  --lookback-days "$LOOKBACK_DAYS" \
+  --workers "$WORKERS" \
+  --ocr-limit "$OCR_LIMIT"

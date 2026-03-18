@@ -17,3 +17,21 @@ python3 greenlee/live_pipeline.py \
   --ocr-limit 0 \
   --workers 3 \
   --verbose
+
+
+
+python3 greenlee/live_pipeline.py \
+  --start-date 2/10/2026 \
+  --end-date 3/17/2026 \
+  --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
+  --ocr-limit 0 \
+  --workers 3 \
+  --verbose \
+  --store-db
+
+
+  
+
+
+
+GREENLEE_LOOKBACK_DAYS=2 GREENLEE_WORKERS=3 ./greenlee/run_greenlee_c

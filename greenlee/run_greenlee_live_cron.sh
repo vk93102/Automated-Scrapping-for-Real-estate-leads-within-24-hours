@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
+# Greenlee live pipeline cron runner - periodic execution with database storage
+
 set -euo pipefail
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
-LOCK_DIR="$ROOT/tmp/santacruz_interval.lock"
+LOCK_DIR="$ROOT/tmp/greenlee_live_cron.lock"
 
 mkdir -p "$ROOT/tmp"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  echo "[santacruz-cron] another run is active; skipping overlap"
+  echo "[greenlee-live-cron] another run is active; skipping overlap"
   exit 0
 fi
+
 cleanup_lock() {
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
@@ -43,14 +46,28 @@ if [ -z "$PY_BIN" ]; then
   exit 1
 fi
 
-LOOKBACK_DAYS="${SANTACRUZ_LOOKBACK_DAYS:-2}"
-WORKERS="${SANTACRUZ_WORKERS:-3}"
-# CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
-# This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
-OCR_LIMIT="${SANTACRUZ_OCR_LIMIT:-0}"
+# Configuration
+LOOKBACK_DAYS="${GREENLEE_LIVE_LOOKBACK_DAYS:-7}"
+WORKERS="${GREENLEE_LIVE_WORKERS:-3}"
+OCR_LIMIT="${GREENLEE_LIVE_OCR_LIMIT:-0}"
+VERBOSE_FLAG="${GREENLEE_LIVE_VERBOSE:-0}"
 
-exec "$PY_BIN" "$DIR/run_santacruz_interval.py" \
-  --once \
-  --lookback-days "$LOOKBACK_DAYS" \
-  --workers "$WORKERS" \
+ARGS=(
+  --lookback-days "$LOOKBACK_DAYS"
+  --workers "$WORKERS"
   --ocr-limit "$OCR_LIMIT"
+)
+
+if [ "$VERBOSE_FLAG" = "1" ]; then
+  ARGS+=(--verbose)
+fi
+
+# Load environment
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ROOT/.env"
+  set +a
+fi
+
+exec "$PY_BIN" "$DIR/run_greenlee_live_cron.py" "${ARGS[@]}"
