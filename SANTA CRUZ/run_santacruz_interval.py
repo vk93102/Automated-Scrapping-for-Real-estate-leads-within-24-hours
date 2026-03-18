@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Graham interval runner: fetch today's leads every N minutes and upsert unique rows to DB."""
+"""Santa Cruz interval runner: fetch last N days and upsert records to DB."""
 
 from __future__ import annotations
 
@@ -16,10 +16,11 @@ import psycopg
 
 COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
+sys.path.insert(0, str(COUNTY_DIR))
 sys.path.insert(0, str(ROOT_DIR))
 
 from county_doc_types import UNIFIED_LEAD_DOC_TYPES
-from graham.extractor import run_graham_pipeline  # noqa: E402
+from extractor import run_santacruz_pipeline  # noqa: E402
 
 
 def _load_env() -> None:
@@ -39,7 +40,7 @@ def _log(msg: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
     print(line, flush=True)
-    with (log_dir / "graham_interval.log").open("a", encoding="utf-8") as f:
+    with (log_dir / "santacruz_interval.log").open("a", encoding="utf-8") as f:
         f.write(line + "\n")
 
 
@@ -83,9 +84,9 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
     with conn.cursor() as cur:
         cur.execute(
             """
-            create table if not exists graham_leads (
+            create table if not exists santacruz_leads (
               id               bigserial primary key,
-              source_county    text not null default 'Graham',
+              source_county    text not null default 'Santa Cruz',
               document_id      text not null,
               recording_number text,
               recording_date   text,
@@ -115,7 +116,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
         )
         cur.execute(
             """
-            create table if not exists graham_pipeline_runs (
+            create table if not exists santacruz_pipeline_runs (
               id              bigserial primary key,
               run_started_at  timestamptz not null default now(),
               run_finished_at timestamptz,
@@ -130,7 +131,6 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
-        cur.execute("alter table graham_pipeline_runs add column if not exists llm_used_rows integer default 0;")
     conn.commit()
 
 
@@ -147,7 +147,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             if used_groq:
                 llm_used += 1
             payload = {
-                "source_county": r.get("sourceCounty") or "Graham",
+                "source_county": r.get("sourceCounty") or "Santa Cruz",
                 "document_id": doc_id,
                 "recording_number": r.get("recordingNumber", ""),
                 "recording_date": r.get("recordingDate", ""),
@@ -172,7 +172,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             }
             cur.execute(
                 """
-                insert into graham_leads (
+                insert into santacruz_leads (
                   source_county, document_id, recording_number, recording_date, document_type,
                   grantors, grantees, trustor, trustee, beneficiary, principal_amount, property_address,
                   detail_url, image_urls, ocr_method, ocr_chars, used_groq, groq_model, groq_error,
@@ -231,7 +231,7 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
 
-    res = run_graham_pipeline(
+    res = run_santacruz_pipeline(
         start_date=start_date,
         end_date=end_date,
         doc_types=doc_types,
@@ -250,12 +250,13 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
         if missing:
             sample = ", ".join(x for x in missing[:10] if x)
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
         with conn.cursor() as cur:
             cur.execute(
                 """
-                insert into graham_pipeline_runs
+                insert into santacruz_pipeline_runs
                   (run_date, run_finished_at, total_records, inserted_rows, updated_rows, llm_used_rows, status)
                 values (%s, now(), %s, %s, %s, %s, 'success');
                 """,
@@ -271,22 +272,18 @@ def main() -> None:
     if not (os.environ.get("GROQ_API_KEY") or "").strip():
         _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
 
-    p = argparse.ArgumentParser(description="Run Graham pipeline on interval and upsert into DB")
+    p = argparse.ArgumentParser(description="Run Santa Cruz pipeline on interval and upsert into DB")
     p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
-    p.add_argument(
-        "--doc-types",
-        nargs="+",
-        default=UNIFIED_LEAD_DOC_TYPES,
-    )
+    p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
-        f"starting graham interval runner interval_minutes={args.interval_minutes} "
+        f"starting santacruz interval runner interval_minutes={args.interval_minutes} "
         f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
     )
 

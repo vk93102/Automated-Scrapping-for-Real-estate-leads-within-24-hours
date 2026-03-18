@@ -336,6 +336,7 @@ def run_pipeline(
     use_groq: bool = True,
     csv_name: str | None = None,
     doc_types: list[str] | None = None,
+    write_output_files: bool = True,
 ) -> dict[str, Any]:
     load_env()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -359,9 +360,13 @@ def run_pipeline(
     records = _apply_filter(all_records)
     if not records:
         print("[WARN] No target documents found. Check document types and date range.")
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_path = export_csv([], csv_name=csv_name or f"coconino_pipeline_{ts}.csv")
-        return {"ok": True, "recordCount": 0, "csvFile": csv_path.name, "csvPath": str(csv_path)}
+        result = {"ok": True, "recordCount": 0, "csvFile": "", "csvPath": ""}
+        if write_output_files:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_path = export_csv([], csv_name=csv_name or f"coconino_pipeline_{ts}.csv")
+            result["csvFile"] = csv_path.name
+            result["csvPath"] = str(csv_path)
+        return result
 
     # ── Stage 4: Real-time display (initial pass) ────────────────────────────
     print(f"\n[DISPLAY] {len(records)} target documents found:")
@@ -448,11 +453,14 @@ def run_pipeline(
     print(f"  Records with principal: {non_empty_amt}/{len(records)}")
     print()
 
-    # ── Stage 8: Save CSV ────────────────────────────────────────────────────
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    effective_csv = csv_name or f"coconino_pipeline_{ts}.csv"
-    csv_path = export_csv(records, csv_name=effective_csv)
-    print(f"[CSV]  Saved → {csv_path}")
+    csv_path = Path("")
+    effective_csv = ""
+    if write_output_files:
+        # ── Stage 8: Save CSV ────────────────────────────────────────────────
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        effective_csv = csv_name or f"coconino_pipeline_{ts}.csv"
+        csv_path = export_csv(records, csv_name=effective_csv)
+        print(f"[CSV]  Saved → {csv_path}")
 
     result = {
         "ok": True,
@@ -465,14 +473,15 @@ def run_pipeline(
         "nonEmptyPrincipalAmount": non_empty_amt,
         "ocrProcessed": ocr_count,
         "records": records,
-        "csvFile": csv_path.name,
-        "csvPath": str(csv_path),
+        "csvFile": csv_path.name if csv_path else "",
+        "csvPath": str(csv_path) if csv_path else "",
         "summary": summary,
     }
 
-    json_path = OUTPUT_DIR / effective_csv.replace(".csv", ".json")
-    json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"[JSON] Saved → {json_path}")
+    if write_output_files and effective_csv:
+        json_path = OUTPUT_DIR / effective_csv.replace(".csv", ".json")
+        json_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"[JSON] Saved → {json_path}")
     return result
 
 

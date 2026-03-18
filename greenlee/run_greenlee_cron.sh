@@ -15,7 +15,7 @@ pick_python() {
     "/usr/local/bin/python3"; do
     if [ -n "${c:-}" ] && [ -x "$c" ]; then
       if "$c" - <<'PY' >/dev/null 2>&1
-import requests, bs4, PIL, playwright
+    import requests, bs4, PIL, playwright, psycopg
 PY
       then
         echo "$c"
@@ -28,8 +28,14 @@ PY
 
 PY_BIN="$(pick_python || true)"
 if [ -z "$PY_BIN" ]; then
-  echo "No usable python found with required packages (requests, bs4, Pillow, playwright)." >&2
+  echo "No usable python found with required packages (requests, bs4, Pillow, playwright, psycopg)." >&2
   exit 1
 fi
 
-exec "$PY_BIN" "$DIR/run_greenlee_cron.py"
+LOOKBACK_DAYS="${GREENLEE_LOOKBACK_DAYS:-2}"
+WORKERS="${GREENLEE_WORKERS:-3}"
+
+exec "$PY_BIN" "$DIR/run_greenlee_interval.py" \
+  --once \
+  --lookback-days "$LOOKBACK_DAYS" \
+  --workers "$WORKERS"

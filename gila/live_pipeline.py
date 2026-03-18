@@ -158,6 +158,7 @@ def run_pipeline(
     csv_name: str           = "",
     doc_types: list[str]    = None,
     verbose: bool           = False,
+    write_output_files: bool = True,
     on_record_discovered: callable = None,  # real-time callback
 ) -> dict:
     """
@@ -316,11 +317,15 @@ def run_pipeline(
         "timestamp":  datetime.now().isoformat(),
     }
 
-    export_csv(all_records, csv_path)
-    export_json(all_records, json_path, meta=meta)
-
-    print(f"  {_c('CSV ', _GREEN)} → {csv_path}")
-    print(f"  {_c('JSON', _GREEN)} → {json_path}")
+    if write_output_files:
+        export_csv(all_records, csv_path)
+        export_json(all_records, json_path, meta=meta)
+        print(f"  {_c('CSV ', _GREEN)} → {csv_path}")
+        print(f"  {_c('JSON', _GREEN)} → {json_path}")
+    else:
+        csv_path = Path("")
+        json_path = Path("")
+        print(f"  {_c('DB-ONLY', _GREEN)} mode active (CSV/JSON disabled)")
 
     # ── FINAL SUMMARY TABLE ───────────────────────────────────────────────────
     _print_summary(all_records, start_date, end_date)

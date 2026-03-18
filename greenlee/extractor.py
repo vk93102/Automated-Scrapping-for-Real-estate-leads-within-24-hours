@@ -1210,6 +1210,7 @@ def run_greenlee_pipeline(
     use_groq: bool = True,
     headless: bool = True,
     verbose: bool = False,
+    write_output_files: bool | None = None,
 ) -> dict:
     doc_types = doc_types or DEFAULT_DOCUMENT_TYPES
     cookie_header, records = playwright_collect_results(
@@ -1276,8 +1277,17 @@ def run_greenlee_pipeline(
         "usedGroq": use_groq,
         "timestamp": datetime.now().isoformat(),
     }
-    export_csv(records, csv_path)
-    export_json(records, json_path, meta=meta)
+
+    if write_output_files is None:
+        write_output_files = os.getenv("WRITE_OUTPUT_FILES", "true").strip().lower() == "true"
+
+    if write_output_files:
+        export_csv(records, csv_path)
+        export_json(records, json_path, meta=meta)
+    else:
+        csv_path = Path("")
+        json_path = Path("")
+
     return {
         "records": records,
         "csv_path": str(csv_path),

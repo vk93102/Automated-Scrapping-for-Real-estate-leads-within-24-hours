@@ -25,16 +25,17 @@ PY
   done
   return 1
 }
+
 PY_BIN="$(pick_python || true)"
 if [ -z "$PY_BIN" ]; then
   echo "No usable python found with required packages (requests, bs4, Pillow, playwright, psycopg)." >&2
   exit 1
 fi
 
-LOOKBACK_DAYS="${NAVAJO_LOOKBACK_DAYS:-2}"
-WORKERS="${NAVAJO_WORKERS:-3}"
+LOOKBACK_DAYS="${GRAHAM_LOOKBACK_DAYS:-2}"
+WORKERS="${GRAHAM_WORKERS:-3}"
 
-exec "$PY_BIN" "$DIR/run_navajo_interval.py" \
+exec "$PY_BIN" "$DIR/run_graham_interval.py" \
   --once \
   --lookback-days "$LOOKBACK_DAYS" \
   --workers "$WORKERS"

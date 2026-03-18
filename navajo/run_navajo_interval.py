@@ -18,6 +18,7 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
+from county_doc_types import UNIFIED_LEAD_DOC_TYPES
 from navajo.extractor import run_navajo_pipeline  # noqa: E402
 
 
@@ -241,6 +242,7 @@ def _run_once(interval_doc_types: list[str], workers: int, lookback_days: int) -
         use_groq=True,
         headless=True,
         verbose=False,
+        write_output_files=False,
     )
 
     records = res.get("records", [])
@@ -282,13 +284,7 @@ def main() -> None:
     parser.add_argument(
         "--doc-types",
         nargs="+",
-        default=[
-            "NOTICE OF TRUSTEE SALE",
-            "LIS PENDENS",
-            "DEED IN LIEU",
-            "TREASURERS DEED",
-            "NOTICE OF REINSTATEMENT",
-        ],
+        default=UNIFIED_LEAD_DOC_TYPES,
         help="Doc types to fetch",
     )
     args = parser.parse_args()

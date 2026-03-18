@@ -58,13 +58,25 @@ fi
 
 LOG_DIR="$DIR/logs"
 OUTPUT_DIR="$DIR/output"
+TMP_WORK_DIR="$DIR/tmp"
 TODAY="$(date +%Y-%m-%d)"
 
 # ── Ensure output dirs exist ──────────────────────────────────────────────────
-mkdir -p "$LOG_DIR" "$OUTPUT_DIR"
+mkdir -p "$LOG_DIR" "$OUTPUT_DIR" "$TMP_WORK_DIR"
 
 # ── Log file: one per day, append across all runs ─────────────────────────────
 LOG_FILE="$LOG_DIR/pipeline_${TODAY}.log"
+
+# ── Single-run lock (prevents overlapping cron executions) ───────────────────
+LOCK_DIR="$TMP_WORK_DIR/maricopa_pipeline.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "[pipeline] INFO: another run is already in progress; skipping this trigger" | tee -a "$LOG_FILE"
+  exit 0
+fi
+cleanup_lock() {
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_lock EXIT
 
 # ── Log rotation: delete logs older than 30 days ──────────────────────────────
 find "$LOG_DIR" -name "pipeline_*.log" -mtime +30 -delete 2>/dev/null || true
@@ -72,6 +84,10 @@ find "$LOG_DIR" -name "cron_*.log"     -mtime +30 -delete 2>/dev/null || true
 
 # ── Minimal PATH for cron environment ────────────────────────────────────────
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+# ── Use project temp dir to avoid /var/folders saturation on macOS ───────────
+export TMPDIR="$TMP_WORK_DIR"
+find "$TMP_WORK_DIR" -type f -name 'tmp*' -mtime +1 -delete 2>/dev/null || true
 
 # ── Load .env ─────────────────────────────────────────────────────────────────
 if [[ -f "$DIR/.env" ]]; then

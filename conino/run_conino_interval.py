@@ -18,7 +18,8 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from conino.live_pipeline import TARGET_DOC_TYPES, run_pipeline  # noqa: E402
+from county_doc_types import UNIFIED_LEAD_DOC_TYPES
+from conino.live_pipeline import run_pipeline  # noqa: E402
 
 
 def _load_env() -> None:
@@ -257,6 +258,7 @@ def _run_once(doc_types: list[str], lookback_days: int, page_limit: int | None, 
         use_groq=True,
         csv_name=None,
         doc_types=doc_types,
+        write_output_files=False,
     )
 
     records = res.get("records", [])
@@ -301,7 +303,7 @@ def main() -> None:
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
-    p.add_argument("--doc-types", nargs="+", default=TARGET_DOC_TYPES)
+    p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))

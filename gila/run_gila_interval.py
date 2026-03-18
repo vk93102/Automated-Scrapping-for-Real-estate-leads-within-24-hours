@@ -18,7 +18,7 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from gila.extractor import DEFAULT_DOCUMENT_TYPES  # noqa: E402
+from county_doc_types import UNIFIED_LEAD_DOC_TYPES
 from gila.live_pipeline import run_pipeline  # noqa: E402
 
 
@@ -239,6 +239,7 @@ def _run_once(doc_types: list[str], lookback_days: int, strict_llm: bool) -> tup
         csv_name="",
         doc_types=doc_types,
         verbose=False,
+        write_output_files=False,
     )
 
     records = res.get("records", [])
@@ -273,7 +274,7 @@ def main() -> None:
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
-    p.add_argument("--doc-types", nargs="+", default=DEFAULT_DOCUMENT_TYPES)
+    p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
