@@ -145,6 +145,7 @@ DOC_CODE="${DOC_CODE:-NS}"
 DAYS_WINDOW="${DAYS_WINDOW:-2}"
 WORKERS="${WORKERS:-4}"
 WRITE_OUTPUT_FILES="${WRITE_OUTPUT_FILES:-false}"
+WRITE_OUTPUT_FILES_LC="$(printf '%s' "$WRITE_OUTPUT_FILES" | tr '[:upper:]' '[:lower:]')"
 
 SCRAPER_ARGS=(
   --document-code "$DOC_CODE"
@@ -159,7 +160,7 @@ SCRAPER_ARGS=(
   --log-level INFO
 )
 
-if [[ "${WRITE_OUTPUT_FILES,,}" == "true" ]]; then
+if [[ "$WRITE_OUTPUT_FILES_LC" == "true" ]]; then
   SCRAPER_ARGS+=(
     --out-json "$OUTPUT_DIR/pipeline_latest.json"
     --out-csv "$OUTPUT_DIR/pipeline_latest.csv"
