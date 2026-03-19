@@ -33,6 +33,25 @@ if [[ -z "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+ensure_playwright_chromium() {
+  local browser_path
+  browser_path="$($PYTHON_BIN - <<'PY'
+from pathlib import Path
+from playwright.sync_api import sync_playwright
+
+with sync_playwright() as pw:
+    print(pw.chromium.executable_path)
+PY
+)"
+
+  if [[ -z "${browser_path:-}" || ! -x "$browser_path" ]]; then
+    echo "Playwright Chromium binary missing. Installing..." >&2
+    "$PYTHON_BIN" -m playwright install chromium
+  fi
+}
+
+ensure_playwright_chromium
+
 LOOKBACK_DAYS="${COCONINO_LOOKBACK_DAYS:-2}"
 OCR_LIMIT="${COCONINO_OCR_LIMIT:-0}"
 

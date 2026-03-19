@@ -1,4 +1,2 @@
 DOC_CODE=NS DAYS_WINDOW=2 WORKERS=4 ./run_pipeline.sh
-
-
-OC_CODE=NS DAYS_WINDOW=2 WORKERS=4 ./run_maricopa_daemon.sh 
+DOC_CODE=NS DAYS_WINDOW=2 WORKERS=4 ./run_maricopa_daemon.sh --once

@@ -218,7 +218,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit: int, strict_llm: bool) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -236,7 +236,7 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
         end_date=end_date,
         doc_types=doc_types,
         max_pages=0,
-        ocr_limit=0,
+        ocr_limit=ocr_limit,
         workers=max(1, workers),
         use_groq=True,
         headless=True,
@@ -275,6 +275,7 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Run Santa Cruz pipeline on interval and upsert into DB")
     p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
+    p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
@@ -284,13 +285,13 @@ def main() -> None:
     interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
         f"starting santacruz interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
+        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} ocr_limit={args.ocr_limit}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.workers, args.lookback_days, args.strict_llm)
+            total, ins, upd, llm_used = _run_once(args.doc_types, args.workers, args.lookback_days, args.ocr_limit, args.strict_llm)
             _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")

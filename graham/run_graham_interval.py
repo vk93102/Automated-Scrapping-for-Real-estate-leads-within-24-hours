@@ -302,7 +302,9 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 process all docs with OCR+LLM (recommended), N cap, -1 maps to 0")
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
-    p.add_argument("--once", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Run a single cycle and exit (default behavior)")
+    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument(
         "--doc-types",
@@ -312,9 +314,10 @@ def main() -> None:
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
+    run_once = not args.loop
     _log(
         f"starting graham interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} "
+        f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} "
         f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
 
@@ -333,7 +336,7 @@ def main() -> None:
         except Exception as exc:
             _log(f"run failed: {exc}")
 
-        if args.once:
+        if run_once:
             break
 
         elapsed = int((datetime.now() - started).total_seconds())

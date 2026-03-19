@@ -1,8 +1,7 @@
-python3 "SANTA CRUZ/live_pipeline.py" \
-  --start-date 3/10/2026 \
-  --end-date 3/17/2026 \
+python3 "SANTA CRUZ/run_santacruz_interval.py" \
+  --once \
+  --lookback-days 10 \
   --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
-  --pages 0 \
-  --ocr-limit 0 \
+  --ocr-limit 1 \
   --workers 3 \
-  --verbose
+  --interval-minutes 720

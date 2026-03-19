@@ -184,6 +184,18 @@ def _playwright_search(
             except Exception:
                 continue
 
+        # If we are still on disclaimer with reCAPTCHA, headless automation cannot proceed.
+        if "/web/user/disclaimer" in page.url:
+            has_recaptcha = page.locator(".g-recaptcha, iframe[src*='recaptcha']").count() > 0
+            if has_recaptcha:
+                if headless:
+                    raise RuntimeError(
+                        "Blocked by Coconino disclaimer reCAPTCHA. "
+                        "Run in headful mode once and manually click 'I Accept', then re-run interval job."
+                    )
+                print("[AUTH] Waiting for manual disclaimer/captcha acceptance in headful mode …")
+                page.wait_for_url("**/web/search/**", timeout=240_000)
+
         # Fill date range
         if page.locator("#field_rdate_DOT_StartDate").count() > 0:
             page.fill("#field_rdate_DOT_StartDate", start_date)

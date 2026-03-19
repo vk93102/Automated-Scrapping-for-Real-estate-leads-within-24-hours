@@ -1,5 +1,7 @@
 
-Command for coconino :- /Users/vishaljha/.pyenv/versions/3.10.13/bin/python /Users/vishaljha/Automated-Scrapping-for-Real-estate-leads-within-24-hours/conino/live_pipeline.py --start-date "3/9/2026" --end-date "3/15/2026" --ocr-limit 3 --no-groq 2>&1
+Command for coconino (DB upsert, last month) :- /Users/vishaljha/.pyenv/versions/3.10.13/bin/python /Users/vishaljha/Automated-Scrapping-for-Real-estate-leads-within-24-hours/conino/run_conino_interval.py --once --lookback-days 30 --pages 0 --ocr-limit 0 2>&1
+
+If blocked by disclaimer reCAPTCHA, run once in visible mode and accept manually :- /Users/vishaljha/.pyenv/versions/3.10.13/bin/python /Users/vishaljha/Automated-Scrapping-for-Real-estate-leads-within-24-hours/conino/run_conino_interval.py --once --lookback-days 30 --pages 0 --ocr-limit 0 --headful 2>&1
 
 
 ________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________

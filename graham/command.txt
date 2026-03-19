@@ -1,11 +1,11 @@
 # Graham one-shot validation (default last 7 days, DB upsert)
-python3 graham/run_graham_interval.py --once --interval-minutes 10
-
-# Graham one-shot 90-day backfill (all defined doc types)
-python3 graham/run_graham_interval.py --once --interval-minutes 10 --lookback-days 90 --workers 3 --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT"
-
-# Graham continuous runner every 10 minutes (last 7 days each run)
 python3 graham/run_graham_interval.py --interval-minutes 10
 
+# Graham one-shot 90-day backfill (all defined doc types)
+python3 graham/run_graham_interval.py --interval-minutes 10 --lookback-days 90 --workers 3 --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT"
+
+# Graham continuous runner every 10 minutes (last 7 days each run)
+python3 graham/run_graham_interval.py --interval-minutes 10 --loop
+
 # Production cadence: every 12 hours (last 7 days each run)
-python3 graham/run_graham_interval.py --interval-minutes 720
+python3 graham/run_graham_interval.py --interval-minutes 720 --loop

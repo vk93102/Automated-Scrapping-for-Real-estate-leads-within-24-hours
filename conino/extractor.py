@@ -965,10 +965,26 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, model: str, time
         },
         method="POST",
     )
-    with urlopen(request, timeout=timeout_s) as response:
-        body = response.read().decode("utf-8")
-    data = json.loads(body)
-    return data["choices"][0]["message"]["content"]
+    try:
+        with urlopen(request, timeout=timeout_s) as response:
+            body = response.read().decode("utf-8")
+        data = json.loads(body)
+        return data["choices"][0]["message"]["content"]
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")
+        except Exception:
+            body = ""
+        if exc.code in (401, 403):
+            hint = (
+                "Groq access denied (HTTP %s). "
+                "Check GROQ_API_KEY validity and network/egress policy (VPN, proxy, firewall, datacenter IP restrictions)."
+            ) % exc.code
+            if body:
+                hint = f"{hint} response={body[:220]}"
+            raise RuntimeError(hint)
+        raise
 
 
 def enrich_with_groq(records: list[ExtractedRecord], batch_size: int = 5, timeout_s: int = 60) -> list[dict[str, Any]]:

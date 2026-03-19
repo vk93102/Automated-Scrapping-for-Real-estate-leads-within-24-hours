@@ -1112,6 +1112,22 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
                 if isinstance(data, dict):
                     return data, model
                 last_err = "invalid JSON object"
+            except requests.HTTPError as exc:
+                status = exc.response.status_code if exc.response is not None else None
+                body = ""
+                try:
+                    body = (exc.response.text or "")[:220] if exc.response is not None else ""
+                except Exception:
+                    body = ""
+                if status in (401, 403):
+                    msg = (
+                        f"Groq access denied (HTTP {status}). "
+                        "Check GROQ_API_KEY validity and network/egress policy (VPN, proxy, firewall, datacenter IP restrictions)."
+                    )
+                    if body:
+                        msg = f"{msg} response={body}"
+                    raise RuntimeError(msg)
+                last_err = str(exc)
             except Exception as exc:
                 last_err = str(exc)
                 continue

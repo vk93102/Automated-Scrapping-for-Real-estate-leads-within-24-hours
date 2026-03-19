@@ -236,7 +236,14 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], lookback_days: int, page_limit: int | None, ocr_limit: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _run_once(
+    doc_types: list[str],
+    lookback_days: int,
+    page_limit: int | None,
+    ocr_limit: int,
+    strict_llm: bool,
+    headless: bool,
+) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -249,17 +256,44 @@ def _run_once(doc_types: list[str], lookback_days: int, page_limit: int | None, 
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
 
-    res = run_pipeline(
-        start_date=start_date,
-        end_date=end_date,
-        page_limit=page_limit,
-        ocr_limit=ocr_limit,
-        headless=True,
-        use_groq=True,
-        csv_name=None,
-        doc_types=doc_types,
-        write_output_files=False,
+    retryable_markers = (
+        "ERR_CONNECTION_TIMED_OUT",
+        "ERR_NETWORK_IO_SUSPENDED",
+        "Navigation timeout",
+        "Timeout",
     )
+    attempts = 3
+    res: dict = {}
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            res = run_pipeline(
+                start_date=start_date,
+                end_date=end_date,
+                page_limit=page_limit,
+                ocr_limit=ocr_limit,
+                headless=headless,
+                use_groq=True,
+                csv_name=None,
+                doc_types=doc_types,
+                write_output_files=False,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            message = str(exc)
+            is_retryable = any(marker in message for marker in retryable_markers)
+            if (not is_retryable) or attempt >= attempts:
+                raise
+            backoff = min(90, 15 * attempt)
+            _log(
+                f"transient pipeline error (attempt {attempt}/{attempts}): {message}; "
+                f"retrying in {backoff}s"
+            )
+            time.sleep(backoff)
+
+    if not res and last_exc is not None:
+        raise last_exc
 
     records = res.get("records", [])
     if strict_llm:
@@ -303,6 +337,7 @@ def main() -> None:
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
+    p.add_argument("--headful", action="store_true", help="Run visible browser for manual disclaimer/captcha handling")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
@@ -317,7 +352,14 @@ def main() -> None:
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.lookback_days, page_limit, args.ocr_limit, args.strict_llm)
+            total, ins, upd, llm_used = _run_once(
+                args.doc_types,
+                args.lookback_days,
+                page_limit,
+                args.ocr_limit,
+                args.strict_llm,
+                headless=not args.headful,
+            )
             _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")
