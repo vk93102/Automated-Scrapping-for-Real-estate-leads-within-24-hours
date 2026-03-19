@@ -1,28 +1,7 @@
-Start Command:- 
-cd /Users/vishaljha/Automated-Scrapping-for-Real-estate-leads-within-24-hours
-/Users/vishaljha/.pyenv/versions/3.10.13/bin/python gila/live_pipeline.py \
+python3 gila/live_pipeline.py \
   --start-date "3/9/2026" \
-  --end-date   "3/15/2026" \
-  --ocr-limit 3 --no-groq \
-  > /tmp/gila_run.log 2>&1 &
-
-echo "PID=$!  →  tail -f /tmp/gila_run.log"
-
-
-Live Logs: tail -f /tmp/gila_run.log
-
-
-Wait for finish + full log :- while pgrep -f "gila/live_pipeline" > /dev/null; do sleep 5; done \
-  && echo "=== DONE ===" && cat /tmp/gila_run.log
-
-
-Inspect Output Csv :- 
-
-/Users/vishaljha/.pyenv/versions/3.10.13/bin/python3 -c "
-import csv, pathlib
-csvf = sorted(pathlib.Path('gila/output').glob('gila_leads_*.csv'))[-1]
-rows = list(csv.DictReader(open(csvf)))
-print('File:', csvf.name, '|', len(rows), 'rows')
-for i, r in enumerate(rows, 1):
-    print(i, r['documentId'], r['documentType'][:18], r.get('principalAmount',''))
-"
+  --end-date "3/15/2026" \
+  --ocr-limit 3 \
+  --no-groq \
+  --store-db \
+  --write-files

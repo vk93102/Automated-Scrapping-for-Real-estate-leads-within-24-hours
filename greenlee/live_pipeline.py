@@ -222,6 +222,7 @@ def main() -> None:
     parser.add_argument("--headful", action="store_true", help="Run visible browser")
     parser.add_argument("--verbose", action="store_true", help="Verbose logs")
     parser.add_argument("--store-db", action="store_true", help="Store results to PostgreSQL database")
+    parser.add_argument("--write-files", action="store_true", help="Write output CSV/JSON files (default: disabled)")
 
     args = parser.parse_args()
 
@@ -243,6 +244,7 @@ def main() -> None:
         use_groq=not args.no_groq,
         headless=not args.headful,
         verbose=args.verbose,
+        write_output_files=args.write_files,
     )
 
     rows = res.get("records", [])
@@ -253,8 +255,9 @@ def main() -> None:
     print(f" Records      : {len(rows)}")
     print(f" With Address : {with_addr}")
     print(f" With Amount  : {with_amt}")
-    print(f" CSV          : {res.get('csv_path','')}")
-    print(f" JSON         : {res.get('json_path','')}")
+    if args.write_files:
+        print(f" CSV          : {res.get('csv_path','')}")
+        print(f" JSON         : {res.get('json_path','')}")
 
     # Store to database if requested
     db_inserted = 0
