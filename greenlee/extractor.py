@@ -744,6 +744,89 @@ def fetch_detail(dk: str, session: requests.Session, timeout: int = 30) -> dict:
         detail["recordingDate"] = _extract_date(text)
     if not detail["recordingNumber"]:
         detail["recordingNumber"] = _extract_recording_number(text)
+
+    # Extract property/location fields from tabular detail sections.
+    # These fields are critical for counties that block unofficial images.
+    street = ""
+    city = ""
+    parcel_id = ""
+    lot = ""
+    block = ""
+    subdivision = ""
+
+    # Preferred stable IDs used by county-recorder detail layouts.
+    street_cells = soup.select("table[id$='Table6'] tr.Input td")
+    if len(street_cells) >= 1:
+        street = _safe_text(street_cells[0])
+    if len(street_cells) >= 2:
+        city = _safe_text(street_cells[1])
+
+    parcel_cells = soup.select("table[id$='Table4'] tr.Input td")
+    if parcel_cells:
+        parcel_id = _safe_text(parcel_cells[0])
+
+    legal_cells = soup.select("table[id$='Table1'] tr.Input td")
+    if len(legal_cells) >= 1:
+        lot = _safe_text(legal_cells[0])
+    if len(legal_cells) >= 2:
+        block = _safe_text(legal_cells[1])
+    if len(legal_cells) >= 3:
+        subdivision = _safe_text(legal_cells[2])
+
+    # Fallback table scans by header text when IDs vary by county/account.
+    if not parcel_id:
+        for tbl in soup.select("table"):
+            vals = [s.strip() for s in tbl.stripped_strings if s and s.strip()]
+            if not vals:
+                continue
+            if vals[0].upper() == "PARCEL ID" and len(vals) > 1:
+                parcel_id = vals[1]
+                break
+
+    if not street and not city:
+        for tbl in soup.select("table"):
+            vals = [s.strip() for s in tbl.stripped_strings if s and s.strip()]
+            if len(vals) < 3:
+                continue
+            if vals[0].upper() == "STREET" and vals[1].upper() == "CITY":
+                # next values are first data row, if available
+                if len(vals) >= 4:
+                    street = vals[2]
+                if len(vals) >= 5:
+                    city = vals[3]
+                break
+
+    address_from_detail = ""
+    if street and city:
+        address_from_detail = f"{street}, {city}"
+    elif street:
+        address_from_detail = street
+    elif parcel_id:
+        address_from_detail = f"Parcel ID {parcel_id}"
+
+    if address_from_detail and not detail.get("propertyAddress"):
+        detail["propertyAddress"] = address_from_detail
+
+    # Make important non-image fields available to regex/LLM fallback by
+    # appending compact normalized lines into rawText.
+    enriched_bits: list[str] = []
+    if street:
+        enriched_bits.append(f"Street: {street}")
+    if city:
+        enriched_bits.append(f"City: {city}")
+    if parcel_id:
+        enriched_bits.append(f"Parcel ID: {parcel_id}")
+    legal_parts = [
+        f"Lot {lot}" if lot else "",
+        f"Block {block}" if block else "",
+        subdivision if subdivision else "",
+    ]
+    legal_line = " ".join(x for x in legal_parts if x).strip()
+    if legal_line:
+        enriched_bits.append(f"Legal: {legal_line}")
+    if enriched_bits:
+        detail["rawText"] = (detail["rawText"] + "\n" + "\n".join(enriched_bits)).strip()
+
     found = set()
     for tag in soup.select("a[href*='ImageHandler.ashx']"):
         u = tag.get("href") or ""
@@ -1206,7 +1289,19 @@ def enrich_record(
     except Exception as e:
         record["analysisError"] = f"detail fetch failed: {e}"
         return record
-    for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
+    for key in [
+        "detailUrl",
+        "recordingNumber",
+        "recordingDate",
+        "documentType",
+        "grantors",
+        "grantees",
+        "trustor",
+        "trustee",
+        "beneficiary",
+        "propertyAddress",
+        "principalAmount",
+    ]:
         if detail.get(key):
             record[key] = detail[key]
     image_urls = discover_image_urls(dk, session, detail.get("imageUrls", []), max_probe_pages=max_image_pages)
@@ -1314,6 +1409,12 @@ def enrich_record(
             record["trustor"] = _first_party(record.get("grantors", ""))
         if not record.get("beneficiary"):
             record["beneficiary"] = _first_party(record.get("grantees", ""))
+
+    if blocked_no_image and not record.get("principalAmount") and not record.get("propertyAddress"):
+        record["analysisError"] = (
+            f"{detail.get('imageAccessNote', 'Image unavailable')}; "
+            "detail page does not expose property address/principal amount"
+        )
     return record
 
 
@@ -1392,7 +1493,19 @@ def run_greenlee_pipeline(
             continue
         try:
             detail = fetch_detail(rec.get("documentId", ""), session)
-            for key in ["detailUrl", "recordingNumber", "recordingDate", "documentType", "grantors", "grantees"]:
+            for key in [
+                "detailUrl",
+                "recordingNumber",
+                "recordingDate",
+                "documentType",
+                "grantors",
+                "grantees",
+                "trustor",
+                "trustee",
+                "beneficiary",
+                "propertyAddress",
+                "principalAmount",
+            ]:
                 if detail.get(key):
                     rec[key] = detail[key]
         except Exception as e:

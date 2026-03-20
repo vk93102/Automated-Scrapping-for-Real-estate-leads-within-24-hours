@@ -7,34 +7,7 @@ python3 navajo/live_pipeline.py \
   --workers 3 \
   --verbose
 
-# Interval runner (Navajo only): every 12 hours, fetch last 7 days, upserts unique rows to DB.
-# Uses DATABASE_URL and GROQ_API_KEY from .env.
-python3 navajo/run_navajo_interval.py --interval-minutes 720 --lookback-days 7
 
-# One-shot test run (no loop) for immediate validation:
-python3 navajo/run_navajo_interval.py --once --interval-minutes 10 --lookback-days 7
 
-# One-time 90-day backfill into DB:
-python3 navajo/run_navajo_interval.py --once --interval-minutes 10 --lookback-days 90
 
-# Navajo expected sample from website screenshot (CORRECTED DEED OF TRUST):
-# Expected DKs include: 1085217, 1085218, 1085397 (plus 1084885 in this date window).
-python3 navajo/live_pipeline.py \
-  --start-date 1/1/2026 \
-  --end-date 1/20/2026 \
-  --doc-types "CORRECTED DEED OF TRUST" \
-  --pages 0 \
-  --ocr-limit -1 \
-  --workers 1 \
-  --verbose
-
-# Greenlee index may not expose NOTICE OF DEFAULT in some sessions.
-# Use this "always-available" foreclosure set if you want zero unavailable-type warnings.
-python3 greenlee/live_pipeline.py \
-  --start-date 3/10/2026 \
-  --end-date 3/17/2026 \
-  --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
-  --pages 0 \
-  --ocr-limit 0 \
-  --workers 3 \
-  --verbose
+  python3 navajo/run_navajo_interval.py --once --lookback-days 4 --workers 1 --ocr-limit 0

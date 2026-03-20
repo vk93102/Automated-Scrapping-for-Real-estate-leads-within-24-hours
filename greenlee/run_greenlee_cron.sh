@@ -44,7 +44,7 @@ if [ -z "$PY_BIN" ]; then
 fi
 
 LOOKBACK_DAYS="${GREENLEE_LOOKBACK_DAYS:-7}"
-WORKERS="${GREENLEE_WORKERS:-3}"
+WORKERS="${GREENLEE_WORKERS:-1}"
 # CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
 # This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
 OCR_LIMIT="${GREENLEE_OCR_LIMIT:-0}"

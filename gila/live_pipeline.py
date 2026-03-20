@@ -470,6 +470,10 @@ def run_pipeline(
 
     if ocr_limit == -1:
         print("  OCR skipped (pass --ocr-limit 0 to run on all docs)")
+    elif ocr_limit > 0 and len(ocr_run) < len(all_records):
+        skipped = len(all_records) - len(ocr_run)
+        print(f"  OCR capped by --ocr-limit: processing {len(ocr_run)}, skipping {skipped}")
+
     elif not use_groq and groq_key:
         print("  (Groq disabled by --no-groq flag)")
     elif not groq_key:
@@ -485,6 +489,15 @@ def run_pipeline(
             groq_api_key=groq_key,
             verbose=True,
         )
+
+    with_pdf_url = sum(1 for r in all_records if r.get("documentUrl"))
+    with_ocr = sum(1 for r in all_records if r.get("ocrTextPath"))
+    with_llm = sum(1 for r in all_records if r.get("usedGroq"))
+    print(
+        f"  Stage-7 coverage: PDF {with_pdf_url}/{len(all_records)}"
+        f"  | OCR {with_ocr}/{len(all_records)}"
+        f"  | LLM {with_llm}/{len(all_records)}"
+    )
 
     # ── STAGE 8: SAVE ────────────────────────────────────────────────────────
     print(_c("\n[STAGE 8/8] Saving Output", _BOLD))  # noqa: STAGE8

@@ -247,6 +247,8 @@ def _run_once(
         _log(f"warning: ocr_limit={ocr_limit} set to 0 for proper data extraction (trustor/trustee/address)")
         effective_ocr_limit = 0
 
+    _log("collecting Graham records (Playwright + OCR stage) ... this can take several minutes")
+    t0 = time.time()
     res = run_graham_pipeline(
         start_date=start_date,
         end_date=end_date,
@@ -259,6 +261,7 @@ def _run_once(
         verbose=verbose,
         write_output_files=False,
     )
+    _log(f"collection stage finished in {time.time() - t0:.1f}s")
 
     records = res.get("records", [])
     _log(f"processed {len(records)} documents; checking extraction quality...")

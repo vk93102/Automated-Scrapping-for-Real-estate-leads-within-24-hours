@@ -226,7 +226,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated
 
 
-def _run_once(interval_doc_types: list[str], workers: int, lookback_days: int) -> tuple[int, int, int]:
+def _run_once(interval_doc_types: list[str], workers: int, lookback_days: int, ocr_limit: int=0) -> tuple[int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -237,11 +237,11 @@ def _run_once(interval_doc_types: list[str], workers: int, lookback_days: int) -
         end_date=end_date,
         doc_types=interval_doc_types,
         max_pages=0,
-        ocr_limit=0,
-        workers=max(1, workers),
+        ocr_limit=ocr_limit,
+        workers=1,
         use_groq=True,
         headless=True,
-        verbose=False,
+        verbose=True,
         write_output_files=False,
     )
 
@@ -281,6 +281,7 @@ def main() -> None:
     parser.add_argument("--lookback-days", type=int, default=7, help="Fetch this many days including today (default: 7)")
     parser.add_argument("--workers", type=int, default=3, help="Pipeline workers (default: 3)")
     parser.add_argument("--once", action="store_true", help="Run once and exit (no sleep loop)")
+    parser.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     parser.add_argument(
         "--doc-types",
         nargs="+",
@@ -298,7 +299,7 @@ def main() -> None:
     while True:
         started = datetime.now()
         try:
-            total, inserted, updated = _run_once(args.doc_types, args.workers, args.lookback_days)
+            total, inserted, updated = _run_once(args.doc_types, args.workers, args.lookback_days, args.ocr_limit)
             _log(f"run ok total={total} inserted={inserted} updated={updated}")
         except Exception as exc:
             _log(f"run failed: {exc}")

@@ -235,7 +235,7 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
         end_date=end_date,
         doc_types=doc_types,
         max_pages=0,
-        ocr_limit=0,
+        ocr_limit=args.ocr_limit,
         workers=max(1, workers),
         use_groq=True,
         headless=True,

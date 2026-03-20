@@ -43,7 +43,7 @@ if [ -z "$PY_BIN" ]; then
 fi
 
 LOOKBACK_DAYS="${NAVAJO_LOOKBACK_DAYS:-2}"
-WORKERS="${NAVAJO_WORKERS:-3}"
+WORKERS="${NAVAJO_WORKERS:-1}"
 # CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
 # This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
 OCR_LIMIT="${NAVAJO_OCR_LIMIT:-0}"

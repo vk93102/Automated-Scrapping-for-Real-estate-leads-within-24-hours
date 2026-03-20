@@ -218,7 +218,24 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _fetch_db_snapshot(conn: psycopg.Connection) -> tuple[int, tuple | None]:
+    """Return total leads count and most recent pipeline run row."""
+    with conn.cursor() as cur:
+        cur.execute("select count(*) from santacruz_leads;")
+        leads_total = int(cur.fetchone()[0])
+        cur.execute(
+            """
+            select run_date, total_records, inserted_rows, updated_rows, llm_used_rows, status, run_finished_at
+            from santacruz_pipeline_runs
+            order by id desc
+            limit 1;
+            """
+        )
+        recent = cur.fetchone()
+    return leads_total, recent
+
+
+def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit: int, strict_llm: bool) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -231,6 +248,8 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit:
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
 
+    _log("collecting Santa Cruz records (Playwright + OCR stage) ... this can take several minutes")
+    t0 = time.time()
     res = run_santacruz_pipeline(
         start_date=start_date,
         end_date=end_date,
@@ -240,9 +259,10 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit:
         workers=max(1, workers),
         use_groq=True,
         headless=True,
-        verbose=False,
+        verbose=True,
         write_output_files=False,
     )
+    _log(f"collection stage finished in {time.time() - t0:.1f}s")
 
     records = res.get("records", [])
     if strict_llm:
@@ -263,8 +283,9 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit:
                 (today, len(records), inserted, updated, llm_used),
             )
         conn.commit()
+        leads_total, _ = _fetch_db_snapshot(conn)
 
-    return len(records), inserted, updated, llm_used
+    return len(records), inserted, updated, llm_used, leads_total
 
 
 def main() -> None:
@@ -277,26 +298,35 @@ def main() -> None:
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     p.add_argument("--workers", type=int, default=3)
-    p.add_argument("--once", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Run one cycle and exit (default)")
+    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
+    run_once = not args.loop
     _log(
         f"starting santacruz interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} ocr_limit={args.ocr_limit}"
+        f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} ocr_limit={args.ocr_limit}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.workers, args.lookback_days, args.ocr_limit, args.strict_llm)
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+            total, ins, upd, llm_used, leads_total = _run_once(
+                args.doc_types,
+                args.workers,
+                args.lookback_days,
+                args.ocr_limit,
+                args.strict_llm,
+            )
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
         except Exception as exc:
             _log(f"run failed: {exc}")
 
-        if args.once:
+        if run_once:
             break
 
         elapsed = int((datetime.now() - started).total_seconds())

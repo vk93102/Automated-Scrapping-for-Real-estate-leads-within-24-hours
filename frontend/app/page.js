@@ -12,13 +12,13 @@ const FILTERS = [
 const COUNTIES = [
   { key: "maricopa", name: "Maricopa", status: "Live" },
   { key: "gila", name: "Gila", status: "Planned" },
-  { key: "graham", name: "Graham", status: "Planned" },
-  { key: "greenlee", name: "Greenlee", status: "Planned" },
-  { key: "navajo", name: "Navajo", status: "Planned" },
-  { key: "cochise", name: "Cochise", status: "Planned" },
-  { key: "la-paz", name: "La Paz", status: "Planned" },
+  { key: "graham", name: "Graham", status: "Live" },
+  { key: "greenlee", name: "Greenlee", status: "Live" },
+  { key: "navajo", name: "Navajo", status: "Live" },
+  { key: "cochise", name: "Cochise", status: "Live" },
+  { key: "la-paz", name: "La Paz", status: "Live" },
   { key: "coconino", name: "Coconino", status: "Planned" },
-  { key: "santa-cruz", name: "Santa Cruz", status: "Planned" },
+  { key: "santa-cruz", name: "Santa Cruz", status: "Live" },
 ];
 
 const DOC_TYPES = [
@@ -64,20 +64,121 @@ const ICONS = {
   settings: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 16v-4 M12 8h.01",
   info: "M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20z M12 16v-4 M12 8h.01",
   check: "M20 6L9 17l-5-5",
+  download: "M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4 M7 10l5 5 5-5 M12 15V3",
+  printer: "M6 9V2h12v7M6 18H4a2 2 0 01-2-2v-5a2 2 0 012-2h16a2 2 0 012 2v5a2 2 0 01-2 2h-2M6 14h12v8H6z",
 };
 
 export default function HomePage() {
   const [activeCounty, setActiveCounty] = useState("maricopa");
   const [range, setRange] = useState("all");
+  const [addressFilter, setAddressFilter] = useState("all");
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
-  const isMaricopa = activeCounty === "maricopa";
+  
+  const handleExportCSV = () => {
+    if (rows.length === 0) return;
+    const displayRows = rows.filter(r => {
+      if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
+      if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+      return true;
+    });
+
+    const headers = ["Recording Number", "Type", "Recorded Date", "Borrower/Trustor", "Address", "City", "Principal Balance", "System Date"];
+    const csvRows = displayRows.map(row => {
+      const doc = row.documents || {};
+      return [
+        `"${doc.recording_number || ""}"`,
+        `"${doc.document_type || ""}"`,
+        `"${doc.recording_date || ""}"`,
+        `"${(row.trustor_1_full_name || row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
+        `"${(row.property_address || "").replace(/"/g, '""')}"`,
+        `"${row.address_city || ""}"`,
+        `"${row.original_principal_balance || ""}"`,
+        `"${formatDate(row.created_at)}"`
+      ].join(",");
+    });
+
+    const csvContent = [headers.join(","), ...csvRows].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.setAttribute("href", url);
+    link.setAttribute("download", `${activeCounty}_leads_${new Date().toISOString().slice(0,10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  const handleExportPDF = () => {
+    if (rows.length === 0) return;
+    const displayRows = rows.filter(r => {
+      if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
+      if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+      return true;
+    });
+
+    const printWindow = window.open("", "_blank");
+    printWindow.document.write(`
+      <html>
+        <head>
+          <title>${activeCounty.toUpperCase()} Leads - Export</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; padding: 20px; font-size: 12px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background-color: #f8f9fa; font-weight: bold; }
+            h2 { margin-top: 0; color: #111827; }
+            .print-btn { display: block; margin-bottom: 20px; background: #000; color: #fff; border: 0; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
+            @media print { .print-btn { display: none; } }
+          </style>
+        </head>
+        <body>
+          <button class="print-btn" onclick="window.print()">Print / Save as PDF</button>
+          <h2>${activeCounty.toUpperCase()} County - Foreclosure Records</h2>
+          <p>Generated on: ${new Date().toLocaleString()}</p>
+          <table>
+            <thead>
+              <tr>
+                <th>Recording</th>
+                <th>Type</th>
+                <th>Recorded Date</th>
+                <th>Borrower / Trustor</th>
+                <th>Address</th>
+                <th>Principal Bal</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${displayRows.map(row => {
+                const doc = row.documents || {};
+                return `
+                  <tr>
+                    <td>${doc.recording_number || "-"}</td>
+                    <td>${doc.document_type || "-"}</td>
+                    <td>${doc.recording_date || "-"}</td>
+                    <td>${row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
+                    <td>${row.property_address || "-"} ${row.address_city || ""}</td>
+                    <td>${row.original_principal_balance || "-"}</td>
+                  </tr>
+                `;
+              }).join("")}
+            </tbody>
+          </table>
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
+    printWindow.focus();
+  };
+
+  const isLiveCounty = ["maricopa", "graham", "la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(activeCounty);
+
+
 
   useEffect(() => {
-    if (!isMaricopa) {
+    if (!isLiveCounty) {
       setRows([]);
       setError("");
       setLoading(false);
@@ -91,7 +192,7 @@ export default function HomePage() {
         setLoading(true);
         setError("");
 
-        const res = await fetch(`/api/leads?range=${range}`, {
+        const res = await fetch(`/api/leads?range=${range}&county=${activeCounty}`, {
           signal: abort.signal,
           cache: "no-store",
         });
@@ -114,7 +215,7 @@ export default function HomePage() {
 
     load();
     return () => abort.abort();
-  }, [range, isMaricopa]);
+  }, [range, isLiveCounty, activeCounty]);
 
   const stats = useMemo(() => {
     const withAddress = rows.filter((r) => r.property_address).length;
@@ -133,7 +234,7 @@ export default function HomePage() {
         <div className="sidebar-header">
           <div className="brand">
             <div className="brand-logo"></div>
-            <span className="brand-text">LeadOps Pro</span>
+            <span className="brand-text">Arizona Foreclosure DB</span>
           </div>
           <button className="mobile-close" onClick={() => setMobileMenuOpen(false)}>×</button>
         </div>
@@ -171,7 +272,7 @@ export default function HomePage() {
       {/* Main Content Area */}
       <main className="main-content">
         {/* Top Header */}
-        <header className="top-header">
+                        <header className="top-header">
           <div className="header-left">
             <button className="mobile-menu-btn" onClick={() => setMobileMenuOpen(true)}>
               <Icon path={ICONS.menu} />
@@ -179,8 +280,7 @@ export default function HomePage() {
             <h1 className="page-title">{COUNTIES.find((c) => c.key === activeCounty)?.name} Real Estate Leads</h1>
           </div>
           <div className="user-profile">
-            <div className="avatar">A</div>
-            <span className="user-name">Admin User</span>
+            <Icon path={ICONS.database} />
           </div>
         </header>
 
@@ -191,28 +291,28 @@ export default function HomePage() {
               <div className="metric-icon-wrap bg-blue"><Icon path={ICONS.leads} /></div>
               <div className="metric-data">
                 <span className="metric-label">Total Leads</span>
-                <strong className="metric-value">{isMaricopa ? stats.total : "-"}</strong>
+                <strong className="metric-value">{isLiveCounty ? stats.total : "-"}</strong>
               </div>
             </div>
             <div className="metric-card">
               <div className="metric-icon-wrap bg-green"><Icon path={ICONS.location} /></div>
               <div className="metric-data">
                 <span className="metric-label">With Addresses</span>
-                <strong className="metric-value">{isMaricopa ? stats.withAddress : "-"}</strong>
+                <strong className="metric-value">{isLiveCounty ? stats.withAddress : "-"}</strong>
               </div>
             </div>
             <div className="metric-card">
               <div className="metric-icon-wrap bg-purple"><Icon path={ICONS.status} /></div>
               <div className="metric-data">
                 <span className="metric-label">County Status</span>
-                <strong className="metric-value">{isMaricopa ? "Active Now" : "Planned"}</strong>
+                <strong className="metric-value">{isLiveCounty ? "Active Now" : "Planned"}</strong>
               </div>
             </div>
             <div className="metric-card">
               <div className="metric-icon-wrap bg-orange"><Icon path={ICONS.calendar} /></div>
               <div className="metric-data">
                 <span className="metric-label">Latest Record</span>
-                <strong className="metric-value">{isMaricopa ? formatShortDate(stats.latestLeadDate) : "-"}</strong>
+                <strong className="metric-value">{isLiveCounty ? formatShortDate(stats.latestLeadDate) : "-"}</strong>
               </div>
             </div>
           </div>
@@ -234,7 +334,7 @@ export default function HomePage() {
               </div>
             </div>
 
-            {isMaricopa ? (
+            {isLiveCounty ? (
               <>
                 <div className="data-toolbar">
                   <div className="filter-group">
@@ -249,7 +349,21 @@ export default function HomePage() {
                       </button>
                     ))}
                   </div>
-                  <button className="action-btn">Export CSV</button>
+                  
+                  <div className="filter-group">
+                    <button className={`filter-btn ${addressFilter === "all" ? "active" : ""}`} onClick={() => setAddressFilter("all")}>All Records</button>
+                    <button className={`filter-btn ${addressFilter === "with" ? "active" : ""}`} onClick={() => setAddressFilter("with")}>Has Address</button>
+                    <button className={`filter-btn ${addressFilter === "without" ? "active" : ""}`} onClick={() => setAddressFilter("without")}>No Address</button>
+                  </div>
+
+                                    <div className="filter-group">
+                    <button className="filter-btn" onClick={handleExportCSV} disabled={rows.length===0} title="Download CSV" style={{border: '1px solid currentColor', background:'transparent'}}>
+                      <Icon path={ICONS.download} style={{marginRight: '6px'}}/> CSV
+                    </button>
+                    <button className="filter-btn" onClick={handleExportPDF} disabled={rows.length===0} title="Print / PDF" style={{border: '1px solid currentColor', background:'transparent'}}>
+                      <Icon path={ICONS.printer} style={{marginRight: '6px'}}/> PDF
+                    </button>
+                  </div>
                 </div>
 
                 {error && (
@@ -281,29 +395,37 @@ export default function HomePage() {
                         </tr>
                       </thead>
                       <tbody>
-                        {rows.length === 0 ? (
-                          <tr>
-                            <td colSpan={8} className="empty-state">
-                              No records found for the selected time range.
-                            </td>
-                          </tr>
-                        ) : null}
+                        {(() => {
+                          const displayRows = rows.filter(r => {
+                            if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
+                            if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+                            return true;
+                          });
 
-                        {rows.map((row) => {
-                          const doc = row.documents || {};
-                          return (
-                            <tr key={`${row.id}-${doc.recording_number || "none"}`}>
-                              <td className="fw-medium">{doc.recording_number || "-"}</td>
-                              <td><span className="doc-badge">{doc.document_type || "-"}</span></td>
-                              <td>{doc.recording_date || "-"}</td>
-                              <td>{row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
-                              <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
-                              <td>{row.address_city || "-"}</td>
-                              <td className="fw-medium">{row.original_principal_balance || "-"}</td>
-                              <td className="right-align text-xs text-muted">{formatDate(row.created_at)}</td>
+                          return displayRows.length === 0 ? (
+                            <tr>
+                              <td colSpan={8} className="empty-state">
+                                No records found for the selected view.
+                              </td>
                             </tr>
+                          ) : (
+                            displayRows.map((row) => {
+                              const doc = row.documents || {};
+                              return (
+                                <tr key={`${row.id}-${doc.recording_number || "none"}`}>
+                                  <td className="fw-medium">{doc.recording_number || "-"}</td>
+                                  <td><span className="doc-badge">{doc.document_type || "-"}</span></td>
+                                  <td>{doc.recording_date || "-"}</td>
+                                  <td>{row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
+                                  <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
+                                  <td>{row.address_city || "-"}</td>
+                                  <td className="fw-medium">{row.original_principal_balance || "-"}</td>
+                                  <td className="right-align text-xs text-muted">{formatDate(row.created_at)}</td>
+                                </tr>
+                              );
+                            })
                           );
-                        })}
+                        })()}
                       </tbody>
                     </table>
                   )}
