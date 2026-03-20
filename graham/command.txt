@@ -1,1 +1,39 @@
-python3 graham/run_graham_interval.py --interval-minutes 720 --lookback-days 1 --workers 3
+# GRAHAM COUNTY PIPELINE COMMANDS
+
+## ONE-SHOT EXECUTION (Recommended - Default Behavior)
+# Runs once, shows instant results, exits immediately (no daemon sleep)
+
+# Basic: 2-day lookback, 3 workers
+GRAHAM_LOOKBACK_DAYS=2 GRAHAM_WORKERS=3 ./graham/run_graham_cron.sh
+
+# With verbose output
+GRAHAM_LOOKBACK_DAYS=2 GRAHAM_WORKERS=3 GRAHAM_VERBOSE=1 ./graham/run_graham_cron.sh
+
+# Extended: 7 days, 5 workers  
+GRAHAM_LOOKBACK_DAYS=7 GRAHAM_WORKERS=5 ./graham/run_graham_cron.sh
+
+# Backfill: 30 days, 10 workers, full OCR+LLM
+GRAHAM_LOOKBACK_DAYS=30 GRAHAM_WORKERS=10 GRAHAM_OCR_LIMIT=0 ./graham/run_graham_cron.sh
+
+## CONTINUOUS MODE (Use --loop flag for daemon)
+# Runs continuously on 12-hour interval with instant results each cycle
+
+python3 graham/run_graham_interval.py \
+  --loop \
+  --interval-minutes 720 \
+  --lookback-days 2 \
+  --workers 3
+
+## DIRECT PYTHON (No Cron Wrapper - For Testing)
+
+# One-shot execution
+python3 graham/run_graham_interval.py \
+  --lookback-days 2 \
+  --workers 3 \
+  --ocr-limit 0
+
+# With verbose logging
+python3 graham/run_graham_interval.py \
+  --lookback-days 2 \
+  --workers 3 \
+  --verbose

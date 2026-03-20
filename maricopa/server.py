@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from .cities_az import ARIZONA_CITIES
 from .csv_export import filter_by_cities, render_csv_string
+from .llm_extract import extract_fields_llm_direct
 
 
 app = FastAPI(
@@ -171,6 +173,14 @@ class ArizonaApacheRunRequest(BaseModel):
         include_details: bool = Field(default=True, description="Fetch account.jsp detail pages for each result row")
         timeout_s: float = Field(default=30.0, description="HTTP timeout for assessor requests")
         use_proxy: bool = Field(default=False, description="Enable proxy rotation using PROXY_LIST_PATH")
+
+
+class LlmExtractRequest(BaseModel):
+    ocr_text: str = Field(..., min_length=1, description="OCR text to parse")
+    fallback_to_rule_based: bool = Field(
+        default=True,
+        description="If Groq fails, return rule-based extraction instead of empty fields",
+    )
 
 
 def _python_bin() -> str:
@@ -882,4 +892,31 @@ def api_v1_health() -> dict:
         "dbError": db_error,
         "activeJobs": active,
         "totalJobsSinceStart": total,
+    }
+
+
+@app.post(
+    "/api/v1/llm/extract",
+    summary="Extract structured property fields from OCR text",
+    tags=["v1", "llm"],
+)
+def api_v1_llm_extract(
+    req: LlmExtractRequest,
+    x_api_token: Optional[str] = Header(default=None),
+) -> dict:
+    """Hosted Groq extraction endpoint for reuse by county pipelines.
+
+    Clients can call this endpoint instead of calling Groq directly.
+    """
+    _require_token(x_api_token)
+
+    fields = extract_fields_llm_direct(
+        req.ocr_text,
+        fallback_to_rule_based=req.fallback_to_rule_based,
+    )
+    return {
+        "ok": True,
+        "provider": "groq",
+        "model": "llama-3.1-8b-instant",
+        "fields": asdict(fields),
     }

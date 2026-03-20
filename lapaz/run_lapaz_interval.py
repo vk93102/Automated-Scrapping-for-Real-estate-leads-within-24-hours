@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""La Paz interval runner: fetch today's leads every N minutes and upsert unique rows to DB."""
+"""La Paz runner: fetch recent leads and upsert unique rows to DB."""
 
 from __future__ import annotations
 
@@ -112,6 +112,36 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
+        # Backward-compatible schema migrations for existing installations.
+        cur.execute("alter table lapaz_leads add column if not exists source_county text not null default 'La Paz';")
+        cur.execute("alter table lapaz_leads add column if not exists recording_number text;")
+        cur.execute("alter table lapaz_leads add column if not exists recording_date text;")
+        cur.execute("alter table lapaz_leads add column if not exists document_type text;")
+        cur.execute("alter table lapaz_leads add column if not exists grantors text;")
+        cur.execute("alter table lapaz_leads add column if not exists grantees text;")
+        cur.execute("alter table lapaz_leads add column if not exists trustor text;")
+        cur.execute("alter table lapaz_leads add column if not exists trustee text;")
+        cur.execute("alter table lapaz_leads add column if not exists beneficiary text;")
+        cur.execute("alter table lapaz_leads add column if not exists principal_amount text;")
+        cur.execute("alter table lapaz_leads add column if not exists property_address text;")
+        cur.execute("alter table lapaz_leads add column if not exists detail_url text;")
+        cur.execute("alter table lapaz_leads add column if not exists image_urls text;")
+        cur.execute("alter table lapaz_leads add column if not exists ocr_method text;")
+        cur.execute("alter table lapaz_leads add column if not exists ocr_chars integer;")
+        cur.execute("alter table lapaz_leads add column if not exists used_groq boolean;")
+        cur.execute("alter table lapaz_leads add column if not exists groq_model text;")
+        cur.execute("alter table lapaz_leads add column if not exists groq_error text;")
+        cur.execute("alter table lapaz_leads add column if not exists analysis_error text;")
+        cur.execute("alter table lapaz_leads add column if not exists run_date date;")
+        cur.execute("alter table lapaz_leads add column if not exists raw_record jsonb not null default '{}'::jsonb;")
+        cur.execute("alter table lapaz_leads add column if not exists created_at timestamptz not null default now();")
+        cur.execute("alter table lapaz_leads add column if not exists updated_at timestamptz not null default now();")
+        cur.execute(
+            """
+            create unique index if not exists lapaz_leads_source_document_uidx
+            on lapaz_leads (source_county, document_id);
+            """
+        )
         cur.execute(
             """
             create table if not exists lapaz_pipeline_runs (
@@ -130,7 +160,29 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
         cur.execute("alter table lapaz_pipeline_runs add column if not exists llm_used_rows integer default 0;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists run_started_at timestamptz not null default now();")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists run_finished_at timestamptz;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists run_date date;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists total_records integer default 0;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists inserted_rows integer default 0;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists updated_rows integer default 0;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists status text not null default 'running';")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists error_message text;")
+        cur.execute("alter table lapaz_pipeline_runs add column if not exists created_at timestamptz not null default now();")
     conn.commit()
+
+
+def _fetch_db_snapshot(database_url: str) -> dict:
+    try:
+        with _connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select count(*) from lapaz_leads;")
+                row = cur.fetchone()
+                leads_total = int(row[0]) if row and row[0] is not None else 0
+        return {"lapaz_leads_total": leads_total}
+    except Exception as exc:
+        _log(f"warning: could not fetch DB snapshot: {exc}")
+        return {}
 
 
 def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: date) -> tuple[int, int, int]:
@@ -224,7 +276,7 @@ def _run_once(
     ocr_limit: int,
     strict_llm: bool,
     verbose: bool,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -249,10 +301,22 @@ def _run_once(
     records_with_trustor = len([r for r in records if (r.get("trustor") or "").strip()])
     records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
     records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
+    records_with_groq_error = len([r for r in records if (r.get("groqError") or "").strip()])
+    sample_groq_error = ""
+    for r in records:
+        err = (r.get("groqError") or "").strip()
+        if err:
+            sample_groq_error = err
+            break
     _log(
         f"extraction quality: {records_with_ocr} with OCR text, "
         f"{records_with_groq} used Groq LLM, {records_with_trustor} have trustor"
     )
+    if records_with_groq_error:
+        _log(
+            f"llm diagnostics: {records_with_groq_error} Groq call failures; "
+            f"sample_error={sample_groq_error[:220]}"
+        )
 
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
@@ -278,7 +342,9 @@ def _run_once(
             )
         conn.commit()
 
-    return len(records), inserted, updated, llm_used
+    db_snapshot = _fetch_db_snapshot(db_url)
+    leads_total = db_snapshot.get("lapaz_leads_total", 0)
+    return len(records), inserted, updated, llm_used, leads_total
 
 
 def main() -> None:
@@ -292,22 +358,25 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 process all docs with OCR+LLM (recommended), N cap, -1 skip OCR/LLM")
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
-    p.add_argument("--once", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=DEFAULT_DOCUMENT_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
+    run_once = not args.loop
     _log(
         f"starting lapaz interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} "
+        f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} "
         f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(
+            total, ins, upd, llm_used, db_total = _run_once(
                 args.doc_types,
                 args.workers,
                 args.lookback_days,
@@ -315,11 +384,11 @@ def main() -> None:
                 args.strict_llm,
                 args.verbose,
             )
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={db_total}")
         except Exception as exc:
             _log(f"run failed: {exc}")
 
-        if args.once:
+        if run_once:
             break
 
         elapsed = int((datetime.now() - started).total_seconds())

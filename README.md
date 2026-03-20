@@ -77,6 +77,27 @@ Returns DB connectivity status and active job count.
 
 ---
 
+### POST /api/v1/llm/extract
+Hosted OCR-to-fields extraction endpoint (Groq-backed on the server).
+
+Request body:
+```json
+{
+  "ocr_text": "...raw OCR text...",
+  "fallback_to_rule_based": true
+}
+```
+
+Response includes `fields` with trustor, address, sale date, and principal balance.
+
+To make pipelines use this endpoint instead of direct Groq calls, set:
+
+```bash
+GROQ_LLM_ENDPOINT_URL=https://your-server-domain/api/v1/llm/extract
+```
+
+---
+
 ### POST /api/v1/scrape
 Trigger a scrape for any date range. Returns a jobId immediately.
 

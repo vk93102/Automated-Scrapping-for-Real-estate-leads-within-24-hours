@@ -1,17 +1,1 @@
-python3 "SANTA CRUZ/run_santacruz_interval.py" \
-  --lookback-days 10 \
-  --doc-types "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
-  --ocr-limit 1 \
-  --workers 3 \
-  --interval-minutes 720
-
-# Continuous mode (explicit)
-python3 "SANTA CRUZ/run_santacruz_interval.py" \
-  --loop \
-  --lookback-days 10 \
-  --ocr-limit 0 \
-  --workers 3 \
-  --interval-minutes 720
-
-# DB verification (fetch latest integration status)
-python3 -c "import os;from pathlib import Path;import psycopg;[os.environ.__setitem__(*([k.strip(),v.strip().strip('\\\"').strip(\"'\")])) for l in Path('.env').read_text().splitlines() if (s:=l.strip()) and not s.startswith('#') and '=' in s for k,v in [s.split('=',1)]];conn=psycopg.connect(os.environ['DATABASE_URL']);cur=conn.cursor();cur.execute('select count(*) from santacruz_leads');print('santacruz_leads_count',cur.fetchone()[0]);cur.execute(\"select run_date,total_records,inserted_rows,updated_rows,llm_used_rows,status,run_finished_at from santacruz_pipeline_runs order by id desc limit 5\");[print(r) for r in cur.fetchall()];cur.close();conn.close()"
+SANTACRUZ_LOOKBACK_DAYS=10 SANTACRUZ_WORKERS=3 SANTACRUZ_OCR_LIMIT=0 SANTACRUZ_VERBOSE=1 ./"SANTA CRUZ"/run_santacruz_cron.sh

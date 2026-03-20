@@ -217,6 +217,20 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
+def _fetch_db_snapshot(database_url: str) -> dict:
+    """Fetch current state of graham_leads table from DB."""
+    try:
+        with _connect_db(database_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("select count(*) from graham_leads;")
+                row = cur.fetchone()
+                leads_count = int(row[0]) if row and row[0] is not None else 0
+        return {"graham_leads_total": leads_count}
+    except Exception as exc:
+        _log(f"warning: could not fetch DB snapshot: {exc}")
+        return {}
+
+
 def _run_once(
     doc_types: list[str],
     workers: int,
@@ -224,7 +238,7 @@ def _run_once(
     strict_llm: bool,
     ocr_limit: int,
     verbose: bool,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -270,8 +284,20 @@ def _run_once(
     records_with_trustor = len([r for r in records if (r.get("trustor") or "").strip()])
     records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
     records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
+    records_with_groq_error = len([r for r in records if (r.get("groqError") or "").strip()])
+    sample_groq_error = ""
+    for r in records:
+        err = (r.get("groqError") or "").strip()
+        if err:
+            sample_groq_error = err
+            break
     
     _log(f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, {records_with_trustor} have trustor")
+    if records_with_groq_error:
+        _log(
+            f"llm diagnostics: {records_with_groq_error} Groq call failures; "
+            f"sample_error={sample_groq_error[:220]}"
+        )
     
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
@@ -291,7 +317,11 @@ def _run_once(
             )
         conn.commit()
 
-    return len(records), inserted, updated, llm_used
+    # Fetch final DB snapshot
+    db_snapshot = _fetch_db_snapshot(db_url)
+    leads_total = db_snapshot.get("graham_leads_total", 0)
+    
+    return len(records), inserted, updated, llm_used, leads_total
 
 
 def main() -> None:
@@ -327,7 +357,7 @@ def main() -> None:
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(
+            total, ins, upd, llm_used, db_total = _run_once(
                 args.doc_types,
                 args.workers,
                 args.lookback_days,
@@ -335,7 +365,7 @@ def main() -> None:
                 args.ocr_limit,
                 args.verbose,
             )
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={db_total}")
         except Exception as exc:
             _log(f"run failed: {exc}")
 

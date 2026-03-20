@@ -8,6 +8,4 @@ python3 navajo/live_pipeline.py \
   --verbose
 
 
-
-
-  python3 navajo/run_navajo_interval.py --once --lookback-days 4 --workers 1 --ocr-limit 0
+ython3 navajo/run_navajo_interval.py --once --lookback-days 30 --workers 1 --ocr-limit 0

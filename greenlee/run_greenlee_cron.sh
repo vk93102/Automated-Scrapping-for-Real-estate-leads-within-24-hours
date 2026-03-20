@@ -4,13 +4,46 @@ set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
 LOCK_DIR="$ROOT/tmp/greenlee_interval.lock"
+LOCK_PID_FILE="$LOCK_DIR/pid"
 
 mkdir -p "$ROOT/tmp"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+acquire_lock() {
+  if mkdir "$LOCK_DIR" 2>/dev/null; then
+    echo "$$" > "$LOCK_PID_FILE"
+    return 0
+  fi
+
+  # Lock directory already exists: clear stale lock if owner process is gone.
+  if [ -f "$LOCK_PID_FILE" ]; then
+    local pid
+    pid="$(cat "$LOCK_PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$LOCK_PID_FILE"
+        echo "[greenlee-cron] cleared stale lock from pid=$pid"
+        return 0
+      fi
+    fi
+  else
+    # Legacy lock dir from older script versions had no pid marker.
+    rm -rf "$LOCK_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+      echo "$$" > "$LOCK_PID_FILE"
+      echo "[greenlee-cron] cleared legacy stale lock"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+if ! acquire_lock; then
   echo "[greenlee-cron] another run is active; skipping overlap"
   exit 0
 fi
 cleanup_lock() {
+  rm -f "$LOCK_PID_FILE" 2>/dev/null || true
   rmdir "$LOCK_DIR" 2>/dev/null || true
 }
 trap cleanup_lock EXIT
@@ -51,7 +84,6 @@ OCR_LIMIT="${GREENLEE_OCR_LIMIT:-0}"
 VERBOSE_FLAG="${GREENLEE_VERBOSE:-0}"
 
 ARGS=(
-  --once
   --lookback-days "$LOOKBACK_DAYS"
   --workers "$WORKERS"
   --ocr-limit "$OCR_LIMIT"

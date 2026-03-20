@@ -48,9 +48,17 @@ WORKERS="${SANTACRUZ_WORKERS:-3}"
 # CRITICAL: ocr_limit=0 means process ALL documents with OCR + Groq LLM
 # This is REQUIRED for proper data extraction (trustor, trustee, address, etc)
 OCR_LIMIT="${SANTACRUZ_OCR_LIMIT:-0}"
+VERBOSE_FLAG="${SANTACRUZ_VERBOSE:-0}"
+
+ARGS=(
+  --lookback-days "$LOOKBACK_DAYS"
+  --workers "$WORKERS"
+  --ocr-limit "$OCR_LIMIT"
+)
+
+if [ "$VERBOSE_FLAG" = "1" ]; then
+  ARGS+=(--verbose)
+fi
 
 exec "$PY_BIN" "$DIR/run_santacruz_interval.py" \
-  --once \
-  --lookback-days "$LOOKBACK_DAYS" \
-  --workers "$WORKERS" \
-  --ocr-limit "$OCR_LIMIT"
+  "${ARGS[@]}"

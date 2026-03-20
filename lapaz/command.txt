@@ -1,17 +1,1 @@
-python3 live_pipeline.py \
-  --start-date 3/10/2026 \
-  --end-date 3/17/2026 \
-  --doc-types "NOTICE OF DEFAULT" "NOTICE OF TRUSTEE SALE" "LIS PENDENS" "DEED IN LIEU" "TREASURERS DEED" "NOTICE OF REINSTATEMENT" \
-  --pages 0 \
-  --ocr-limit 0 \
-  --workers 3 \
-  --verbose
-
-# La Paz one-shot validation (last 7 days, DB upsert)
-python3 lapaz/run_lapaz_interval.py --once --interval-minutes 10 --lookback-days 7
-
-# La Paz continuous runner every 12 hours (rolling 7 days)
-python3 lapaz/run_lapaz_interval.py --interval-minutes 720 --lookback-days 7
-
-# One-time 90-day backfill into DB
-python3 lapaz/run_lapaz_interval.py --once --interval-minutes 10 --lookback-days 90
+LAPAZ_LOOKBACK_DAYS=7 LAPAZ_WORKERS=3 LAPAZ_OCR_LIMIT=0 LAPAZ_VERBOSE=1 ./lapaz/run_lapaz_cron.sh

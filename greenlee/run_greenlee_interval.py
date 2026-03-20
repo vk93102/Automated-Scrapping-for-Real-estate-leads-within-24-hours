@@ -243,6 +243,23 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
+def _fetch_db_snapshot(conn: psycopg.Connection) -> tuple[int, tuple | None]:
+    """Return total leads count and most recent pipeline run row."""
+    with conn.cursor() as cur:
+        cur.execute("select count(*) from greenlee_leads;")
+        leads_total = int(cur.fetchone()[0])
+        cur.execute(
+            """
+            select run_date, total_records, inserted_rows, updated_rows, llm_used_rows, status, run_finished_at
+            from greenlee_pipeline_runs
+            order by id desc
+            limit 1;
+            """
+        )
+        recent = cur.fetchone()
+    return leads_total, recent
+
+
 def _run_once(
     doc_types: list[str],
     workers: int,
@@ -250,7 +267,7 @@ def _run_once(
     strict_llm: bool,
     ocr_limit: int,
     verbose: bool,
-) -> tuple[int, int, int, int]:
+) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -273,6 +290,8 @@ def _run_once(
         _log(f"warning: ocr_limit={ocr_limit} set to 0 for proper data extraction (trustor/trustee/address)")
         effective_ocr_limit = 0
 
+    _log("collecting Greenlee records (Playwright + OCR stage) ... this can take several minutes")
+    t0 = time.time()
     res = run_greenlee_pipeline(
         start_date=start_date,
         end_date=end_date,
@@ -285,6 +304,7 @@ def _run_once(
         verbose=verbose,
         write_output_files=False,
     )
+    _log(f"collection stage finished in {time.time() - t0:.1f}s")
 
     records = res.get("records", [])
     before_filter = len(records)
@@ -323,8 +343,9 @@ def _run_once(
                 (today, len(records), inserted, updated, llm_used),
             )
         conn.commit()
+        leads_total, _ = _fetch_db_snapshot(conn)
 
-    return len(records), inserted, updated, llm_used
+    return len(records), inserted, updated, llm_used, leads_total
 
 
 def main() -> None:
@@ -338,22 +359,25 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records, -1 skip OCR")
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
-    p.add_argument("--once", action="store_true")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true", help="Run one cycle and exit (default)")
+    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=GREENLEE_TARGET_DOC_TYPES)
     args = p.parse_args()
 
     interval_seconds = max(60, int(args.interval_minutes * 60))
+    run_once = not args.loop
     _log(
         f"starting greenlee interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers} "
+        f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} "
         f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(
+            total, ins, upd, llm_used, leads_total = _run_once(
                 args.doc_types,
                 args.workers,
                 args.lookback_days,
@@ -361,11 +385,11 @@ def main() -> None:
                 args.ocr_limit,
                 args.verbose,
             )
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
         except Exception as exc:
             _log(f"run failed: {exc}")
 
-        if args.once:
+        if run_once:
             break
 
         elapsed = int((datetime.now() - started).total_seconds())

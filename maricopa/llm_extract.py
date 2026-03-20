@@ -16,6 +16,8 @@ import os
 import re
 from typing import Optional
 
+import requests
+
 from .extract_rules import ExtractedFields, extract_fields_rule_based
 from .cities_az import canonicalize_city
 
@@ -81,6 +83,29 @@ def extract_fields_llm(
         logger.debug("llm_extract: empty OCR text — returning empty fields")
         return _empty_fields()
 
+    endpoint_url = (os.environ.get("GROQ_LLM_ENDPOINT_URL") or "").strip()
+    if endpoint_url:
+        try:
+            fields = _call_hosted_llm_endpoint(
+                endpoint_url=endpoint_url,
+                ocr_text=ocr_text,
+                fallback_to_rule_based=fallback_to_rule_based,
+            )
+            logger.debug("llm_extract: successfully extracted fields via hosted endpoint")
+            return fields
+        except Exception as exc:
+            logger.warning("llm_extract: hosted endpoint failed (%s) — trying direct Groq", exc)
+
+    return extract_fields_llm_direct(ocr_text, fallback_to_rule_based=fallback_to_rule_based)
+
+
+def extract_fields_llm_direct(
+    ocr_text: str,
+    *,
+    fallback_to_rule_based: bool = True,
+) -> ExtractedFields:
+    """Extract fields by calling Groq directly (no hosted endpoint hop)."""
+
     if not _GROQ_API_KEY:
         logger.warning("llm_extract: GROQ_API_KEY not set — falling back to rule-based")
         return extract_fields_rule_based(ocr_text)
@@ -101,6 +126,67 @@ def extract_fields_llm(
             logger.info("llm_extract: falling back to rule-based extraction")
             return extract_fields_rule_based(ocr_text)
         return _empty_fields()
+
+
+def _call_hosted_llm_endpoint(
+    *,
+    endpoint_url: str,
+    ocr_text: str,
+    fallback_to_rule_based: bool,
+) -> ExtractedFields:
+    """Call a hosted extraction endpoint and map response JSON to ``ExtractedFields``."""
+    timeout_s = float(os.environ.get("GROQ_LLM_ENDPOINT_TIMEOUT_S", "60"))
+    payload = {
+        "ocr_text": ocr_text,
+        "fallback_to_rule_based": bool(fallback_to_rule_based),
+    }
+
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    api_token = (os.environ.get("API_TOKEN") or "").strip()
+    if api_token:
+        headers["X-API-Token"] = api_token
+
+    resp = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout_s)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError("Hosted endpoint returned non-object JSON")
+
+    fields = data.get("fields", data)
+    if not isinstance(fields, dict):
+        raise ValueError("Hosted endpoint response missing object field payload")
+
+    def _str_or_none(key: str) -> Optional[str]:
+        val = fields.get(key)
+        if val is None:
+            return None
+        s = str(val).strip()
+        return s if s else None
+
+    city_raw = _str_or_none("address_city")
+    state_raw = _str_or_none("address_state")
+    opb_raw = _str_or_none("original_principal_balance")
+
+    if opb_raw:
+        opb_raw = re.sub(r"[$,]", "", opb_raw).strip()
+        if not re.match(r"^\d+(\.\d+)?$", opb_raw):
+            opb_raw = None
+
+    return ExtractedFields(
+        trustor_1_full_name=_str_or_none("trustor_1_full_name"),
+        trustor_1_first_name=_str_or_none("trustor_1_first_name"),
+        trustor_1_last_name=_str_or_none("trustor_1_last_name"),
+        trustor_2_full_name=_str_or_none("trustor_2_full_name"),
+        trustor_2_first_name=_str_or_none("trustor_2_first_name"),
+        trustor_2_last_name=_str_or_none("trustor_2_last_name"),
+        property_address=_str_or_none("property_address"),
+        address_city=canonicalize_city(city_raw),
+        address_state=(state_raw.upper() if state_raw else None),
+        address_zip=_str_or_none("address_zip"),
+        address_unit=_str_or_none("address_unit"),
+        sale_date=_str_or_none("sale_date"),
+        original_principal_balance=opb_raw,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -56,6 +56,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
 ROOT_DIR = Path(__file__).resolve().parent.parent
+_GROQ_MODEL_CACHE: list[str] | None = None
 
 DEFAULT_DOCUMENT_TYPES = [
     "NOTICE OF DEFAULT",
@@ -1158,11 +1159,39 @@ def _extract_party_block(text: str, role: str) -> str:
 
 
 def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int = 60) -> tuple[dict, str]:
-    model_candidates = [
+    global _GROQ_MODEL_CACHE
+    preferred_models = [
         "llama-3.3-70b-versatile",
         "llama-3.1-70b-versatile",
-        "llama3-70b-8192",
+        "llama-3.1-8b-instant",
     ]
+    deprecated_models = {
+        "llama3-70b-8192",
+    }
+
+    if _GROQ_MODEL_CACHE is None:
+        resolved: list[str] = []
+        try:
+            mr = requests.get(
+                "https://api.groq.com/openai/v1/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=min(timeout_s, 20),
+            )
+            if mr.ok:
+                payload = mr.json() if mr.content else {}
+                available = {
+                    str(x.get("id", "")).strip()
+                    for x in payload.get("data", [])
+                    if isinstance(x, dict)
+                }
+                resolved = [m for m in preferred_models if m in available and m not in deprecated_models]
+        except Exception:
+            resolved = []
+
+        # Fallback to static order if model introspection fails.
+        _GROQ_MODEL_CACHE = resolved or [m for m in preferred_models if m not in deprecated_models]
+
+    model_candidates = list(_GROQ_MODEL_CACHE)
     last_err = ""
     for model in model_candidates:
         for use_response_format in (True, False):
@@ -1210,7 +1239,10 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
                     if body:
                         msg = f"{msg} response={body}"
                     raise RuntimeError(msg)
-                last_err = str(exc)
+                if status in (400, 413, 422):
+                    last_err = f"Groq HTTP {status} bad request; response={body or str(exc)}"
+                else:
+                    last_err = str(exc)
             except Exception as exc:
                 last_err = str(exc)
                 continue
@@ -1253,6 +1285,12 @@ def _groq_extract_fields(
     detail_text: str,
     api_key: str,
 ) -> tuple[dict, str]:
+    # Keep payload bounded to reduce Groq 400/context-limit errors on very large OCR dumps.
+    max_ocr_chars = 18000
+    max_detail_chars = 8000
+    ocr_text = (ocr_text or "")[:max_ocr_chars]
+    detail_text = (detail_text or "")[:max_detail_chars]
+
     system_prompt = (
         "Extract recorder document fields from OCR text. Return STRICT JSON with keys: "
         "trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees, confidenceNote. "

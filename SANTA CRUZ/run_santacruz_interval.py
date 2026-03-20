@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Santa Cruz interval runner: fetch last N days and upsert records to DB."""
+"""Santa Cruz one-shot runner: fetch last N days and upsert records to DB."""
 
 from __future__ import annotations
 
@@ -235,7 +235,14 @@ def _fetch_db_snapshot(conn: psycopg.Connection) -> tuple[int, tuple | None]:
     return leads_total, recent
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit: int, strict_llm: bool) -> tuple[int, int, int, int, int]:
+def _run_once(
+    doc_types: list[str],
+    workers: int,
+    lookback_days: int,
+    ocr_limit: int,
+    strict_llm: bool,
+    verbose: bool,
+) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -259,7 +266,7 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, ocr_limit:
         workers=max(1, workers),
         use_groq=True,
         headless=True,
-        verbose=True,
+        verbose=verbose,
         write_output_files=False,
     )
     _log(f"collection stage finished in {time.time() - t0:.1f}s")
@@ -293,46 +300,32 @@ def main() -> None:
     if not (os.environ.get("GROQ_API_KEY") or "").strip():
         _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
 
-    p = argparse.ArgumentParser(description="Run Santa Cruz pipeline on interval and upsert into DB")
-    p.add_argument("--interval-minutes", type=float, default=720.0)
+    p = argparse.ArgumentParser(description="Run Santa Cruz pipeline once and upsert into DB")
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records")
     p.add_argument("--workers", type=int, default=3)
-    mode = p.add_mutually_exclusive_group()
-    mode.add_argument("--once", action="store_true", help="Run one cycle and exit (default)")
-    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
+    p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
-    run_once = not args.loop
     _log(
-        f"starting santacruz interval runner interval_minutes={args.interval_minutes} "
-        f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} ocr_limit={args.ocr_limit}"
+        f"starting santacruz one-shot runner lookback_days={args.lookback_days} "
+        f"workers={args.workers} ocr_limit={args.ocr_limit} verbose={args.verbose}"
     )
 
-    while True:
-        started = datetime.now()
-        try:
-            total, ins, upd, llm_used, leads_total = _run_once(
-                args.doc_types,
-                args.workers,
-                args.lookback_days,
-                args.ocr_limit,
-                args.strict_llm,
-            )
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
-        except Exception as exc:
-            _log(f"run failed: {exc}")
-
-        if run_once:
-            break
-
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+    try:
+        total, ins, upd, llm_used, leads_total = _run_once(
+            args.doc_types,
+            args.workers,
+            args.lookback_days,
+            args.ocr_limit,
+            args.strict_llm,
+            args.verbose,
+        )
+        _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
+    except Exception as exc:
+        _log(f"run failed: {exc}")
 
 
 if __name__ == "__main__":
