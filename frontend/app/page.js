@@ -76,6 +76,8 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const isGrahamView = activeCounty === "graham";
+  const isMaricopaView = activeCounty === "maricopa";
 
   
   const handleExportCSV = () => {
@@ -86,23 +88,63 @@ export default function HomePage() {
       return true;
     });
 
-    const headers = [
-      "Recording Number",
-      "Recorded Date",
-      "Grantors",
-      "Grantees",
-      "Principal Amount",
-      "Property Address"
-    ];
+    const headers = isGrahamView
+      ? [
+          "Recording Number",
+          "Recorded Date",
+          "Grantors",
+          "Grantees",
+          "Principal Amount",
+          "Property Address"
+        ]
+      : isMaricopaView
+      ? [
+          "Trustor 1 Full Name",
+          "Trustor 2 Full Name",
+          "Property Address",
+          "Address City",
+          "Address State"
+        ]
+      : [
+          "Recording Number",
+          "Type",
+          "Recorded Date",
+          "Borrower/Trustor",
+          "Address",
+          "City",
+          "Principal Balance",
+          "System Date"
+        ];
     const csvRows = displayRows.map(row => {
       const doc = row.documents || {};
+      if (isGrahamView) {
+        return [
+          `"${doc.recording_number || ""}"`,
+          `"${doc.recording_date || ""}"`,
+          `"${(row.grantors || "").replace(/"/g, '""')}"`,
+          `"${(row.grantees || "").replace(/"/g, '""')}"`,
+          `"${row.original_principal_balance || row.principal_amount || ""}"`,
+          `"${(row.property_address || "").replace(/"/g, '""')}"`
+        ].join(",");
+      }
+      if (isMaricopaView) {
+        return [
+          `"${(row.trustor_1_full_name || "").replace(/"/g, '""')}"`,
+          `"${(row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
+          `"${(row.property_address || "").replace(/"/g, '""')}"`,
+          `"${(row.address_city || "").replace(/"/g, '""')}"`,
+          `"${(row.address_state || "").replace(/"/g, '""')}"`
+        ].join(",");
+      }
       return [
         `"${doc.recording_number || ""}"`,
+        `"${doc.document_type || ""}"`,
         `"${doc.recording_date || ""}"`,
-        `"${(row.grantors || "").replace(/"/g, '""')}"`,
-        `"${(row.grantees || "").replace(/"/g, '""')}"`,
-        `"${row.original_principal_balance || row.principal_amount || ""}"`,
-        `"${(row.property_address || "").replace(/"/g, '""')}"`
+        `"${(row.trustor_1_full_name || row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
+        `"${(row.property_address || "").replace(/"/g, '""')}"`,
+        `"${row.address_city || ""}"`,
+        `"${row.original_principal_balance || ""}"`,
+        `"${formatDate(row.created_at)}"`
       ].join(",");
     });
 
@@ -147,25 +189,67 @@ export default function HomePage() {
           <table>
             <thead>
               <tr>
-                <th>Recording</th>
-                <th>Recorded Date</th>
-                <th>Grantors</th>
-                <th>Grantees</th>
-                <th>Principal Amount</th>
-                <th>Property Address</th>
+                ${isGrahamView
+                  ? `
+                    <th>Recording</th>
+                    <th>Recorded Date</th>
+                    <th>Grantors</th>
+                    <th>Grantees</th>
+                    <th>Principal Amount</th>
+                    <th>Property Address</th>
+                  `
+                  : isMaricopaView
+                  ? `
+                    <th>Trustor 1 Full Name</th>
+                    <th>Trustor 2 Full Name</th>
+                    <th>Property Address</th>
+                    <th>Address City</th>
+                    <th>Address State</th>
+                  `
+                  : `
+                    <th>Recording</th>
+                    <th>Type</th>
+                    <th>Recorded Date</th>
+                    <th>Borrower / Trustor</th>
+                    <th>Address</th>
+                    <th>Principal Bal</th>
+                  `}
               </tr>
             </thead>
             <tbody>
               ${displayRows.map(row => {
                 const doc = row.documents || {};
+                if (isGrahamView) {
+                  return `
+                    <tr>
+                      <td>${doc.recording_number || "-"}</td>
+                      <td>${doc.recording_date || "-"}</td>
+                      <td>${row.grantors || "-"}</td>
+                      <td>${row.grantees || "-"}</td>
+                      <td>${row.original_principal_balance || row.principal_amount || "-"}</td>
+                      <td>${row.property_address || "-"}</td>
+                    </tr>
+                  `;
+                }
+                if (isMaricopaView) {
+                  return `
+                    <tr>
+                      <td>${row.trustor_1_full_name || "-"}</td>
+                      <td>${row.trustor_2_full_name || "-"}</td>
+                      <td>${row.property_address || "-"}</td>
+                      <td>${row.address_city || "-"}</td>
+                      <td>${row.address_state || "-"}</td>
+                    </tr>
+                  `;
+                }
                 return `
                   <tr>
                     <td>${doc.recording_number || "-"}</td>
+                    <td>${doc.document_type || "-"}</td>
                     <td>${doc.recording_date || "-"}</td>
-                    <td>${row.grantors || "-"}</td>
-                    <td>${row.grantees || "-"}</td>
-                    <td>${row.original_principal_balance || row.principal_amount || "-"}</td>
-                    <td>${row.property_address || "-"}</td>
+                    <td>${row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
+                    <td>${row.property_address || "-"} ${row.address_city || ""}</td>
+                    <td>${row.original_principal_balance || "-"}</td>
                   </tr>
                 `;
               }).join("")}
@@ -389,12 +473,35 @@ export default function HomePage() {
                     <table className="data-table">
                       <thead>
                         <tr>
-                          <th>Recording</th>
-                          <th>Recorded Date</th>
-                          <th>Grantors</th>
-                          <th>Grantees</th>
-                          <th>Principal Amount</th>
-                          <th>Property Address</th>
+                          {isGrahamView ? (
+                            <>
+                              <th>Recording</th>
+                              <th>Recorded Date</th>
+                              <th>Grantors</th>
+                              <th>Grantees</th>
+                              <th>Principal Amount</th>
+                              <th>Property Address</th>
+                            </>
+                          ) : isMaricopaView ? (
+                            <>
+                              <th>Trustor 1 Full Name</th>
+                              <th>Trustor 2 Full Name</th>
+                              <th>Property Address</th>
+                              <th>Address City</th>
+                              <th>Address State</th>
+                            </>
+                          ) : (
+                            <>
+                              <th>Recording</th>
+                              <th>Type</th>
+                              <th>Recorded Date</th>
+                              <th>Borrower / Trustor</th>
+                              <th>Address</th>
+                              <th>City</th>
+                              <th>Principal Bal</th>
+                              <th className="right-align">System Date</th>
+                            </>
+                          )}
                         </tr>
                       </thead>
                       <tbody>
@@ -407,7 +514,7 @@ export default function HomePage() {
 
                           return displayRows.length === 0 ? (
                             <tr>
-                              <td colSpan={6} className="empty-state">
+                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 5 : 8} className="empty-state">
                                 No records found for the selected view.
                               </td>
                             </tr>
@@ -416,12 +523,35 @@ export default function HomePage() {
                               const doc = row.documents || {};
                               return (
                                 <tr key={`${row.id}-${doc.recording_number || "none"}`}>
-                                  <td className="fw-medium">{doc.recording_number || "-"}</td>
-                                  <td>{doc.recording_date || "-"}</td>
-                                  <td className="td-truncate" title={row.grantors}>{row.grantors || "-"}</td>
-                                  <td className="td-truncate" title={row.grantees}>{row.grantees || "-"}</td>
-                                  <td className="fw-medium">{row.original_principal_balance || row.principal_amount || "-"}</td>
-                                  <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
+                                  {isGrahamView ? (
+                                    <>
+                                      <td className="fw-medium">{doc.recording_number || "-"}</td>
+                                      <td>{doc.recording_date || "-"}</td>
+                                      <td className="td-truncate" title={row.grantors}>{row.grantors || "-"}</td>
+                                      <td className="td-truncate" title={row.grantees}>{row.grantees || "-"}</td>
+                                      <td className="fw-medium">{row.original_principal_balance || row.principal_amount || "-"}</td>
+                                      <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
+                                    </>
+                                  ) : isMaricopaView ? (
+                                    <>
+                                      <td>{row.trustor_1_full_name || "-"}</td>
+                                      <td>{row.trustor_2_full_name || "-"}</td>
+                                      <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
+                                      <td>{row.address_city || "-"}</td>
+                                      <td>{row.address_state || "-"}</td>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <td className="fw-medium">{doc.recording_number || "-"}</td>
+                                      <td><span className="doc-badge">{doc.document_type || "-"}</span></td>
+                                      <td>{doc.recording_date || "-"}</td>
+                                      <td>{row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
+                                      <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
+                                      <td>{row.address_city || "-"}</td>
+                                      <td className="fw-medium">{row.original_principal_balance || "-"}</td>
+                                      <td className="right-align text-xs text-muted">{formatDate(row.created_at)}</td>
+                                    </>
+                                  )}
                                 </tr>
                               );
                             })

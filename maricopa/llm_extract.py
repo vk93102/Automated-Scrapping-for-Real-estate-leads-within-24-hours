@@ -32,30 +32,34 @@ _MODEL = "llama-3.1-8b-instant"
 # Prompt template
 # ---------------------------------------------------------------------------
 _SYSTEM_PROMPT = """\
-Extract real estate document fields with strict quality rules. Return JSON with keys: "
-        "trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees. "
-        "STRICT RULES FOR REAL PERSON NAMES: "
-        "1. Extract ONLY the primary borrower/trustor name (single person or business entity). "
-        "2. If multiple names appear, select ONLY the first/primary one—ignore 'and', 'or', co-borrowers. "
-        "3. Remove ALL descriptive text after the name: ignore 'as trustee for', 'dba', 'et al', 'a California LLC', etc. "
-        "4. Only keep business suffixes if they are part of the true entity name: LLC, INC, CORP, COMPANY, TRUST, BANK, ASSOCIATION. "
-        "5. Do NOT return generic titles, roles, or descriptors. Real name only. "
-        "6. If multiple completely different entities, return first primary one only. "
-        "7. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
-        "STRICT RULES FOR PROPERTY ADDRESS: "
-        "1. Extract ONLY the actual property street address (street number + street name + optional city/state/zip). "
-        "2. Must be a real US street address format: e.g., '123 Main St, Phoenix, AZ 85001'. "
-        "3. Do NOT include: legal descriptions, parcel IDs, 'Lot X Block Y', subdivision names, recording boilerplate. "
-        "4. If multiple addresses appear, use the specific property address (not mailing addresses). "
-        "5. Arizona cities only (Maricopa, Phoenix, Tucson, Glendale, Chandler, Gilbert, etc.)—no foreign locations. "
-        "6. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
+You extract Maricopa county recorder fields into strict flat JSON.
 
-        "DOLLAR AMOUNTS & ARRAYS: "
-        "1. principalAmount must be dollar format: '$123,456.78' when present; only if >= $1,000. "
-        "2. grantors/grantees are arrays of real names (keep up to 2 each if multiple). "
-        "3. If unknown or unclear, return empty string or empty array—DO NOT GUESS. "
-        "4. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
-        "OUTPUT: Return valid JSON only. Must extract only REAL data, never invent values."
+Return ONLY one JSON object with keys:
+trustor_1_full_name, trustor_1_first_name, trustor_1_last_name,
+trustor_2_full_name, trustor_2_first_name, trustor_2_last_name,
+property_address, address_city, address_state, address_zip,
+address_unit, sale_date, original_principal_balance.
+
+CRITICAL NAME RULES:
+1) Keep PERSON/ENTITY names only. Remove descriptors/roles after names.
+2) Remove phrases like: "a single woman", "a single man", "married woman",
+     "husband and wife", "as joint tenants", "aka", "fka", "dba", "et al".
+3) If two trustors exist, put first in trustor_1_* and second in trustor_2_*.
+4) Never return role text as names.
+
+Examples:
+- "ASHLEY REYNOLDS, A SINGLE WOMAN AND KYLE DORAN, A SINGLE MAN"
+    => trustor_1_full_name="ASHLEY REYNOLDS", trustor_2_full_name="KYLE DORAN"
+- "Heidi Kathleen Noriega, A Married Woman, and Carlos Antonio Noriega Jr, as Joint Tenants"
+    => trustor_1_full_name="Heidi Kathleen Noriega", trustor_2_full_name="Carlos Antonio Noriega Jr"
+- "KELLY E JOHNSON AND CEDRIC B. JOHNSON II, WIFE AND HUSBAND"
+    => trustor_1_full_name="KELLY E JOHNSON", trustor_2_full_name="CEDRIC B. JOHNSON II"
+
+ADDRESS RULES:
+- property_address is only street line (no city/state/zip mixed in this field).
+- address_city/address_state/address_zip must be separate fields.
+
+If unknown, use null. Do not invent.
 """
 
 _FEW_SHOT_EXAMPLES = """\
@@ -136,6 +140,56 @@ Document text:
 """
 
 _MAX_OCR_CHARS = 6_000   # keep well within 8k context limit
+
+
+_NAME_ROLE_CUT_RE = re.compile(
+    r"\b(?:A\s+SINGLE\s+WOMAN|A\s+SINGLE\s+MAN|MARRIED\s+WOMAN|MARRIED\s+MAN|HUSBAND\s+AND\s+WIFE|WIFE\s+AND\s+HUSBAND|AS\s+JOINT\s+TENANTS|AS\s+TRUSTEE(?:S)?|AKA|FKA|DBA|ET\s+AL)\b",
+    re.I,
+)
+
+
+def _clean_person_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    s = re.sub(r"\s+", " ", str(name)).strip(" ,;:-")
+    if not s:
+        return None
+    # Split out descriptor tail.
+    s = _NAME_ROLE_CUT_RE.split(s, maxsplit=1)[0].strip(" ,;:-")
+    # Remove leading conjunctions.
+    s = re.sub(r"^(?:AND|OR)\s+", "", s, flags=re.I).strip(" ,;:-")
+    # Remove trailing article left by descriptor removal (e.g., ", A").
+    s = re.sub(r",?\s+(?:A|AN)$", "", s, flags=re.I).strip(" ,;:-")
+    if not s or len(s) < 2:
+        return None
+    return s
+
+
+def _split_two_trustors(primary: Optional[str], secondary: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    raw_primary = re.sub(r"\s+", " ", str(primary or "")).strip()
+    p = _clean_person_name(raw_primary)
+    s = _clean_person_name(secondary)
+    if raw_primary and not s:
+        # Handle combined string before descriptor stripping: "NAME1 ... AND NAME2 ..."
+        parts = re.split(r"\s*(?:,\s*and\s+|\band\b|&)\s*", raw_primary, maxsplit=1, flags=re.I)
+        if len(parts) == 2:
+            p1 = _clean_person_name(parts[0])
+            p2 = _clean_person_name(parts[1])
+            if p1 and p2:
+                return p1, p2
+    return p, s
+
+
+def _name_parts(full_name: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    n = _clean_person_name(full_name)
+    if not n:
+        return None, None
+    toks = [t for t in re.split(r"\s+", n) if t]
+    if not toks:
+        return None, None
+    if len(toks) == 1:
+        return toks[0], None
+    return toks[0], toks[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -287,37 +341,7 @@ def _call_hosted_llm_endpoint(
     if not isinstance(fields, dict):
         raise ValueError("Hosted endpoint response missing object field payload")
 
-    def _str_or_none(key: str) -> Optional[str]:
-        val = fields.get(key)
-        if val is None:
-            return None
-        s = str(val).strip()
-        return s if s else None
-
-    city_raw = _str_or_none("address_city")
-    state_raw = _str_or_none("address_state")
-    opb_raw = _str_or_none("original_principal_balance")
-
-    if opb_raw:
-        opb_raw = re.sub(r"[$,]", "", opb_raw).strip()
-        if not re.match(r"^\d+(\.\d+)?$", opb_raw):
-            opb_raw = None
-
-    return ExtractedFields(
-        trustor_1_full_name=_str_or_none("trustor_1_full_name"),
-        trustor_1_first_name=_str_or_none("trustor_1_first_name"),
-        trustor_1_last_name=_str_or_none("trustor_1_last_name"),
-        trustor_2_full_name=_str_or_none("trustor_2_full_name"),
-        trustor_2_first_name=_str_or_none("trustor_2_first_name"),
-        trustor_2_last_name=_str_or_none("trustor_2_last_name"),
-        property_address=_str_or_none("property_address"),
-        address_city=canonicalize_city(city_raw),
-        address_state=(state_raw.upper() if state_raw else None),
-        address_zip=_str_or_none("address_zip"),
-        address_unit=_str_or_none("address_unit"),
-        sale_date=_str_or_none("sale_date"),
-        original_principal_balance=opb_raw,
-    )
+    return _map_fields_dict(fields)
 
 
 # ---------------------------------------------------------------------------
@@ -426,13 +450,28 @@ def _map_fields_dict(fields: dict) -> ExtractedFields:
         if not re.match(r"^\d+(\.\d+)?$", opb_raw):
             opb_raw = None
 
+    t1_full, t2_full = _split_two_trustors(
+        _str_or_none("trustor_1_full_name"),
+        _str_or_none("trustor_2_full_name"),
+    )
+    t1_first_raw = _clean_person_name(_str_or_none("trustor_1_first_name"))
+    t1_last_raw = _clean_person_name(_str_or_none("trustor_1_last_name"))
+    t2_first_raw = _clean_person_name(_str_or_none("trustor_2_first_name"))
+    t2_last_raw = _clean_person_name(_str_or_none("trustor_2_last_name"))
+    t1_first_derived, t1_last_derived = _name_parts(t1_full)
+    t2_first_derived, t2_last_derived = _name_parts(t2_full)
+    t1_first = t1_first_raw or t1_first_derived
+    t1_last = t1_last_raw or t1_last_derived
+    t2_first = t2_first_raw or t2_first_derived
+    t2_last = t2_last_raw or t2_last_derived
+
     return ExtractedFields(
-        trustor_1_full_name=_str_or_none("trustor_1_full_name"),
-        trustor_1_first_name=_str_or_none("trustor_1_first_name"),
-        trustor_1_last_name=_str_or_none("trustor_1_last_name"),
-        trustor_2_full_name=_str_or_none("trustor_2_full_name"),
-        trustor_2_first_name=_str_or_none("trustor_2_first_name"),
-        trustor_2_last_name=_str_or_none("trustor_2_last_name"),
+        trustor_1_full_name=t1_full,
+        trustor_1_first_name=t1_first,
+        trustor_1_last_name=t1_last,
+        trustor_2_full_name=t2_full,
+        trustor_2_first_name=t2_first,
+        trustor_2_last_name=t2_last,
         property_address=_str_or_none("property_address"),
         address_city=canonicalize_city(city_raw),
         address_state=(state_raw.upper() if state_raw else None),

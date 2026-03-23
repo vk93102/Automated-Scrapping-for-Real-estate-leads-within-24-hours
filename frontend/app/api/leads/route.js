@@ -31,16 +31,8 @@ export async function GET(request) {
     const sinceIso = getSinceIso(range);
 
     let query = "";
-    if (["graham", "la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(county)) {
-      const tableMap = {
-        "graham": "graham_leads",
-        "la-paz": "lapaz_leads",
-        "navajo": "navajo_leads",
-        "santa-cruz": "santacruz_leads",
-        "greenlee": "greenlee_leads",
-        "cochise": "cochise_leads"
-      };
-      const tableName = tableMap[county];
+    if (county === "graham") {
+      const tableName = "graham_leads";
       query = `
         SELECT
           id,
@@ -98,6 +90,59 @@ export async function GET(request) {
           ocr_method,
           ocr_chars,
           used_groq,
+          groq_model as llm_model
+        FROM ${tableName}
+        WHERE ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
+        ORDER BY created_at DESC
+        LIMIT 10000;
+      `;
+    } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(county)) {
+      const tableMap = {
+        "la-paz": "lapaz_leads",
+        "navajo": "navajo_leads",
+        "santa-cruz": "santacruz_leads",
+        "greenlee": "greenlee_leads",
+        "cochise": "cochise_leads"
+      };
+      const tableName = tableMap[county];
+      query = `
+        SELECT
+          id,
+          source_county,
+          document_id,
+          recording_number,
+          recording_date,
+          document_type,
+          NULL as grantors,
+          NULL as grantees,
+          NULL as trustor,
+          NULL as trustee,
+          NULL as beneficiary,
+          created_at,
+          updated_at,
+          COALESCE(
+            NULLIF(BTRIM(trustor), ''),
+            NULLIF(BTRIM(raw_record->>'trustor'), '')
+          ) AS trustor_1_full_name,
+          NULL as trustor_2_full_name,
+          COALESCE(
+            NULLIF(BTRIM(property_address), ''),
+            NULLIF(BTRIM(raw_record->>'propertyAddress'), '')
+          ) AS property_address,
+          NULL as address_city,
+          NULL as address_state,
+          NULL as address_zip,
+          NULL as sale_date,
+          COALESCE(
+            NULLIF(BTRIM(principal_amount), ''),
+            NULLIF(BTRIM(raw_record->>'principalAmount'), '')
+          ) AS original_principal_balance,
+          NULL as principal_amount,
+          NULL as detail_url,
+          NULL as image_urls,
+          NULL as ocr_method,
+          NULL::integer as ocr_chars,
+          NULL::boolean as used_groq,
           groq_model as llm_model
         FROM ${tableName}
         WHERE ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
