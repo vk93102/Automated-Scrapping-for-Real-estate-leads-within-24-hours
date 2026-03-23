@@ -1,0 +1,7 @@
+Greenle -> Some Addresses are Inaacurate , they have more Address than required 
+Lapaz -> Ok
+Graham -> You need real addresses in that 
+Navazo -> Ok 
+Maricopa -> HAs Address filter not working because there are many other values than addresses also 
+Lapaz -> Names are not Proper 
+Santa Cruz -> Addresses are needed

@@ -8,3 +8,6 @@ GREENLEE: 10
 LAPAZ: 10
 NAVAJO: 4
 SANTACRUIZ: broken pipeline
+
+
+

@@ -103,7 +103,12 @@ def main() -> None:
         if records:
             try:
                 import psycopg
-                from greenlee.live_pipeline import _connect_db, _ensure_schema, _upsert_records_to_db
+                from greenlee.live_pipeline import (
+                    _connect_db,
+                    _ensure_schema,
+                    _sanitize_existing_record_fields,
+                    _upsert_records_to_db,
+                )
                 from datetime import date
 
                 db_url = (os.environ.get("DATABASE_URL") or "").strip()
@@ -113,7 +118,10 @@ def main() -> None:
                     with _connect_db(db_url) as conn:
                         _ensure_schema(conn)
                         inserted, updated, llm_used = _upsert_records_to_db(conn, records, date.today())
+                        sanitized_existing = _sanitize_existing_record_fields(conn)
                         _log(f"upserted to DB: {inserted} inserted, {updated} updated, {llm_used} used LLM")
+                        if sanitized_existing:
+                            _log(f"sanitized existing property_address rows: {sanitized_existing}")
             except Exception as e:
                 _log(f"ERROR: DB upsert failed: {e}")
         else:

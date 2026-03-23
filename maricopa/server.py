@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import threading
 import time
+import base64
 from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field
 from .cities_az import ARIZONA_CITIES
 from .csv_export import filter_by_cities, render_csv_string
 from .llm_extract import extract_fields_llm_direct
+from .ocr_pipeline import ocr_pdf_bytes_to_text
 
 
 app = FastAPI(
@@ -177,6 +179,15 @@ class ArizonaApacheRunRequest(BaseModel):
 
 class LlmExtractRequest(BaseModel):
     ocr_text: str = Field(..., min_length=1, description="OCR text to parse")
+    fallback_to_rule_based: bool = Field(
+        default=True,
+        description="If Groq fails, return rule-based extraction instead of empty fields",
+    )
+
+
+class LlmExtractDocumentRequest(BaseModel):
+    pdf_base64: str = Field(..., min_length=1, description="Base64-encoded PDF content")
+    recording_number: str = Field(default="", description="Optional recording number for observability")
     fallback_to_rule_based: bool = Field(
         default=True,
         description="If Groq fails, return rule-based extraction instead of empty fields",
@@ -918,5 +929,48 @@ def api_v1_llm_extract(
         "ok": True,
         "provider": "groq",
         "model": "llama-3.1-8b-instant",
+        "fields": asdict(fields),
+    }
+
+
+@app.post(
+    "/api/v1/llm/extract-document",
+    summary="Extract structured fields from a PDF document",
+    tags=["v1", "llm"],
+)
+def api_v1_llm_extract_document(
+    req: LlmExtractDocumentRequest,
+    x_api_token: Optional[str] = Header(default=None),
+) -> dict:
+    """Hosted PDF -> OCR -> Groq extraction endpoint.
+
+    This endpoint allows workers to avoid local OCR and send the document directly.
+    """
+    _require_token(x_api_token)
+
+    try:
+        pdf_bytes = base64.b64decode(req.pdf_base64, validate=True)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid pdf_base64 payload: {exc}")
+
+    if not pdf_bytes:
+        raise HTTPException(status_code=422, detail="Empty PDF payload")
+
+    try:
+        ocr_text = ocr_pdf_bytes_to_text(pdf_bytes)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OCR failed: {exc}")
+
+    fields = extract_fields_llm_direct(
+        ocr_text,
+        fallback_to_rule_based=req.fallback_to_rule_based,
+    )
+    return {
+        "ok": True,
+        "provider": "groq",
+        "model": "llama-3.1-8b-instant",
+        "recording_number": req.recording_number,
+        "ocr_chars": len(ocr_text),
+        "ocr_text": ocr_text,
         "fields": asdict(fields),
     }

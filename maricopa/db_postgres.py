@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Optional, Any, Dict
+from typing import Optional, Any, Dict, Iterable
 
 import psycopg
 
@@ -169,6 +169,34 @@ def insert_discovered_recording(conn: psycopg.Connection, recording_number: str,
         rid = int(row[0]) if row else None
     conn.commit()
     return rid
+
+
+def insert_discovered_recordings_bulk(
+    conn: psycopg.Connection,
+    recording_numbers: Iterable[str],
+) -> int:
+    """Bulk upsert discovered recording numbers. Returns attempted row count."""
+    rows = [
+        (str(r).strip(), None)
+        for r in recording_numbers
+        if str(r).strip()
+    ]
+    if not rows:
+        return 0
+
+    with conn.cursor() as cur:
+        cur.executemany(
+            """
+            insert into discovered_recordings (recording_number, metadata)
+            values (%s, %s::jsonb)
+            on conflict (recording_number) do update set
+              metadata = coalesce(discovered_recordings.metadata, excluded.metadata),
+              discovered_at = coalesce(discovered_recordings.discovered_at, now());
+            """,
+            rows,
+        )
+    conn.commit()
+    return len(rows)
 
 
 def update_document_ocr_text(

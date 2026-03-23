@@ -18,7 +18,12 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from graham.extractor import DEFAULT_DOCUMENT_TYPES, run_graham_pipeline  # noqa: E402
+from graham.extractor import (  # noqa: E402
+    DEFAULT_DOCUMENT_TYPES,
+    run_graham_pipeline,
+    sanitize_borrower_name,
+    sanitize_property_address,
+)
 
 
 def _load_env() -> None:
@@ -142,6 +147,11 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             doc_id = str(r.get("documentId", "") or "").strip()
             if not doc_id:
                 continue
+            clean_address = sanitize_property_address(r.get("propertyAddress", ""))
+            clean_trustor = sanitize_borrower_name(r.get("trustor", ""))
+            r_clean = dict(r)
+            r_clean["propertyAddress"] = clean_address
+            r_clean["trustor"] = clean_trustor
             used_groq = bool(r.get("usedGroq", False))
             if used_groq:
                 llm_used += 1
@@ -153,11 +163,11 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "document_type": r.get("documentType", ""),
                 "grantors": r.get("grantors", ""),
                 "grantees": r.get("grantees", ""),
-                "trustor": r.get("trustor", ""),
+                "trustor": clean_trustor,
                 "trustee": r.get("trustee", ""),
                 "beneficiary": r.get("beneficiary", ""),
                 "principal_amount": r.get("principalAmount", ""),
-                "property_address": r.get("propertyAddress", ""),
+                "property_address": clean_address,
                 "detail_url": r.get("detailUrl", ""),
                 "image_urls": r.get("imageUrls", ""),
                 "ocr_method": r.get("ocrMethod", ""),
@@ -167,7 +177,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "groq_error": r.get("groqError", ""),
                 "analysis_error": r.get("analysisError", ""),
                 "run_date": run_date,
-                "raw_record": psycopg.types.json.Jsonb(r),
+                "raw_record": psycopg.types.json.Jsonb(r_clean),
             }
             cur.execute(
                 """
@@ -183,24 +193,24 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                   %(analysis_error)s, %(run_date)s, %(raw_record)s
                 )
                 on conflict (source_county, document_id) do update set
-                  recording_number = excluded.recording_number,
-                  recording_date   = excluded.recording_date,
-                  document_type    = excluded.document_type,
-                  grantors         = excluded.grantors,
-                  grantees         = excluded.grantees,
-                  trustor          = excluded.trustor,
-                  trustee          = excluded.trustee,
-                  beneficiary      = excluded.beneficiary,
-                  principal_amount = excluded.principal_amount,
-                  property_address = excluded.property_address,
-                  detail_url       = excluded.detail_url,
-                  image_urls       = excluded.image_urls,
-                  ocr_method       = excluded.ocr_method,
-                  ocr_chars        = excluded.ocr_chars,
+                                    recording_number = coalesce(nullif(excluded.recording_number, ''), graham_leads.recording_number),
+                                    recording_date   = coalesce(nullif(excluded.recording_date, ''), graham_leads.recording_date),
+                                    document_type    = coalesce(nullif(excluded.document_type, ''), graham_leads.document_type),
+                                    grantors         = coalesce(nullif(excluded.grantors, ''), graham_leads.grantors),
+                                    grantees         = coalesce(nullif(excluded.grantees, ''), graham_leads.grantees),
+                                    trustor          = coalesce(nullif(excluded.trustor, ''), graham_leads.trustor),
+                                    trustee          = coalesce(nullif(excluded.trustee, ''), graham_leads.trustee),
+                                    beneficiary      = coalesce(nullif(excluded.beneficiary, ''), graham_leads.beneficiary),
+                                    principal_amount = coalesce(nullif(excluded.principal_amount, ''), graham_leads.principal_amount),
+                                    property_address = coalesce(nullif(excluded.property_address, ''), graham_leads.property_address),
+                                    detail_url       = coalesce(nullif(excluded.detail_url, ''), graham_leads.detail_url),
+                                    image_urls       = coalesce(nullif(excluded.image_urls, ''), graham_leads.image_urls),
+                                    ocr_method       = coalesce(nullif(excluded.ocr_method, ''), graham_leads.ocr_method),
+                                    ocr_chars        = greatest(coalesce(excluded.ocr_chars, 0), coalesce(graham_leads.ocr_chars, 0)),
                   used_groq        = excluded.used_groq,
-                  groq_model       = excluded.groq_model,
-                  groq_error       = excluded.groq_error,
-                  analysis_error   = excluded.analysis_error,
+                                    groq_model       = coalesce(nullif(excluded.groq_model, ''), graham_leads.groq_model),
+                                    groq_error       = coalesce(nullif(excluded.groq_error, ''), graham_leads.groq_error),
+                                    analysis_error   = coalesce(nullif(excluded.analysis_error, ''), graham_leads.analysis_error),
                   run_date         = excluded.run_date,
                   raw_record       = excluded.raw_record,
                   updated_at       = now()
@@ -215,6 +225,65 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 updated += 1
     conn.commit()
     return inserted, updated, llm_used
+
+
+def _sanitize_existing_record_fields(conn: psycopg.Connection) -> int:
+    """Normalize property_address/trustor for already stored rows without deleting anything."""
+    changed = 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, trustor, property_address, raw_record
+            from graham_leads
+            where coalesce(trim(property_address), '') <> ''
+               or coalesce(trim(trustor), '') <> ''
+               or (raw_record ? 'propertyAddress')
+               or (raw_record ? 'trustor');
+            """
+        )
+        rows = cur.fetchall()
+
+        for row_id, trustor, property_address, raw_record in rows:
+            raw_obj = raw_record if isinstance(raw_record, dict) else {}
+            raw_addr = str(raw_obj.get("propertyAddress", "") or "")
+            raw_trustor = str(raw_obj.get("trustor", "") or "")
+
+            clean_prop = sanitize_property_address(str(property_address or ""))
+            clean_raw_prop = sanitize_property_address(raw_addr)
+            prev_prop = str(property_address or "")
+            best_addr = clean_prop or clean_raw_prop or prev_prop
+
+            clean_trustor = sanitize_borrower_name(str(trustor or ""))
+            clean_raw_trustor = sanitize_borrower_name(raw_trustor)
+            prev_trustor = str(trustor or "")
+            best_trustor = clean_trustor or clean_raw_trustor or prev_trustor
+
+            next_raw = dict(raw_obj)
+            prev_raw_addr = raw_addr
+            prev_raw_trustor = raw_trustor
+            next_raw["propertyAddress"] = best_addr
+            next_raw["trustor"] = best_trustor
+
+            if (
+                best_addr != prev_prop
+                or best_addr != prev_raw_addr
+                or best_trustor != prev_trustor
+                or best_trustor != prev_raw_trustor
+            ):
+                cur.execute(
+                    """
+                    update graham_leads
+                    set trustor = %s,
+                        property_address = %s,
+                        raw_record = %s,
+                        updated_at = now()
+                    where id = %s;
+                    """,
+                    (best_trustor, best_addr, psycopg.types.json.Jsonb(next_raw), row_id),
+                )
+                changed += 1
+    conn.commit()
+    return changed
 
 
 def _fetch_db_snapshot(database_url: str) -> dict:
@@ -285,6 +354,7 @@ def _run_once(
     records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
     records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
     records_with_groq_error = len([r for r in records if (r.get("groqError") or "").strip()])
+    records_with_addr = len([r for r in records if (r.get("propertyAddress") or "").strip()])
     sample_groq_error = ""
     for r in records:
         err = (r.get("groqError") or "").strip()
@@ -292,7 +362,10 @@ def _run_once(
             sample_groq_error = err
             break
     
-    _log(f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, {records_with_trustor} have trustor")
+    _log(
+        f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, "
+        f"{records_with_trustor} have trustor, {records_with_addr} have address"
+    )
     if records_with_groq_error:
         _log(
             f"llm diagnostics: {records_with_groq_error} Groq call failures; "
@@ -306,6 +379,9 @@ def _run_once(
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
+        sanitized_existing = _sanitize_existing_record_fields(conn)
+        if sanitized_existing:
+            _log(f"sanitized borrower/address on {sanitized_existing} existing rows")
         with conn.cursor() as cur:
             cur.execute(
                 """

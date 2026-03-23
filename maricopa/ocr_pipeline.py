@@ -41,16 +41,17 @@ def ocr_pdf_to_text(
     if not p.exists():
         raise FileNotFoundError(str(p))
 
-    td = _tmpdir()
-    images = convert_from_path(str(p), dpi=dpi, output_folder=td)
-    if max_pages and max_pages > 0:
-        images = images[:max_pages]
+    base_tmp = _tmpdir()
+    with tempfile.TemporaryDirectory(dir=base_tmp) as td:
+        images = convert_from_path(str(p), dpi=dpi, output_folder=td)
+        if max_pages and max_pages > 0:
+            images = images[:max_pages]
 
-    chunks: list[str] = []
-    for img in images:
-        txt = pytesseract.image_to_string(img, lang=lang)
-        chunks.append(txt or "")
-    return "\n\n".join(chunks).strip()
+        chunks: list[str] = []
+        for img in images:
+            txt = pytesseract.image_to_string(img, lang=lang)
+            chunks.append(txt or "")
+        return "\n\n".join(chunks).strip()
 
 
 def ocr_pdf_bytes_to_text(
@@ -79,23 +80,23 @@ def ocr_pdf_bytes_to_text(
     # Allow Pillow to process truncated/incomplete image data without raising.
     ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-    td = _tmpdir()
+    base_tmp = _tmpdir()
+    with tempfile.TemporaryDirectory(dir=base_tmp) as td:
+        # Try default pdftoppm renderer first; fall back to pdftocairo on any
+        # Poppler error (e.g. exit code -2 "Estimating resolution as …").
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=dpi, output_folder=td)
+        except Exception:
+            images = convert_from_bytes(
+                pdf_bytes, dpi=dpi, output_folder=td, use_pdftocairo=True
+            )
 
-    # Try default pdftoppm renderer first; fall back to pdftocairo on any
-    # Poppler error (e.g. exit code -2 "Estimating resolution as …").
-    try:
-        images = convert_from_bytes(pdf_bytes, dpi=dpi, output_folder=td)
-    except Exception:
-        images = convert_from_bytes(
-            pdf_bytes, dpi=dpi, output_folder=td, use_pdftocairo=True
-        )
+        if max_pages and max_pages > 0:
+            images = images[:max_pages]
 
-    if max_pages and max_pages > 0:
-        images = images[:max_pages]
-
-    chunks: list[str] = []
-    for img in images:
-        txt = pytesseract.image_to_string(img, lang=lang)
-        chunks.append(txt or "")
-    return "\n\n".join(chunks).strip()
+        chunks: list[str] = []
+        for img in images:
+            txt = pytesseract.image_to_string(img, lang=lang)
+            chunks.append(txt or "")
+        return "\n\n".join(chunks).strip()
 

@@ -1225,34 +1225,47 @@ def extract_ocr_text(pdf_path: Path) -> tuple[str, str]:
 # ── Groq LLM Analysis ─────────────────────────────────────────────────────────
 
 _GROQ_SYSTEM_PROMPT = """\
-You are a county recorder document analyst. Extract structured information from
-OCR text of real estate recording documents. Return ONLY valid JSON with this schema:
+Extract real estate document fields with strict quality rules. Return JSON with keys:
+trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees.
 
-{
-  "summary": "one sentence description",
-  "parties": {
-    "grantors": ["name1", "name2"],
-    "grantees": ["name1"]
-  },
-  "property": {
-    "legalDescription": "...",
-    "address": "full street address or empty string"
-  },
-  "financials": {
-    "principalAmount": "$X,XXX.XX or empty string",
-    "loanAmount": "$X,XXX.XX or empty string"
-  },
-  "dates": {
-    "recordingDate": "MM/DD/YYYY or empty string",
-    "saleDate": "MM/DD/YYYY or empty string"
-  }
-}
+STRICT RULES FOR REAL PERSON NAMES:
+ "Extract real estate document fields with strict quality rules. Return JSON with keys: "
+        "trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees. "
+        "STRICT RULES FOR REAL PERSON NAMES: "
+        "1. Extract ONLY the primary borrower/trustor name (single person or business entity). "
+        "2. If multiple names appear, select ONLY the first/primary one—ignore 'and', 'or', co-borrowers. "
+        "3. Remove ALL descriptive text after the name: ignore 'as trustee for', 'dba', 'et al', 'a California LLC', etc. "
+        "4. Only keep business suffixes if they are part of the true entity name: LLC, INC, CORP, COMPANY, TRUST, BANK, ASSOCIATION. "
+        "5. Do NOT return generic titles, roles, or descriptors. Real name only. "
+        "6. If multiple completely different entities, return first primary one only. "
+        "7. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
+        "STRICT RULES FOR PROPERTY ADDRESS: "
+        "1. Extract ONLY the actual property street address (street number + street name + optional city/state/zip). "
+        "2. Must be a real US street address format: e.g., '123 Main St, Phoenix, AZ 85001'. "
+        "3. Do NOT include: legal descriptions, parcel IDs, 'Lot X Block Y', subdivision names, recording boilerplate. "
+        "4. If multiple addresses appear, use the specific property address (not mailing addresses). "
+        "5. Arizona cities only (Maricopa, Phoenix, Tucson, Glendale, Chandler, Gilbert, etc.)—no foreign locations. "
+        "6. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
 
-Rules:
-- Do NOT invent data — use empty strings when information is absent.
-- principalAmount/loanAmount: include $ sign and commas (e.g. $150,000.00).
-- address: full street address only; omit legal descriptions, subdivision names.
-- Return raw JSON only, no markdown fences.\
+        "DOLLAR AMOUNTS & ARRAYS: "
+        "1. principalAmount must be dollar format: '$123,456.78' when present; only if >= $1,000. "
+        "2. grantors/grantees are arrays of real names (keep up to 2 each if multiple). "
+        "3. If unknown or unclear, return empty string or empty array—DO NOT GUESS. "
+        "4. If there is no meaningfull result is present in the text, you can kept as empty there or not found record there"
+        "OUTPUT: Return valid JSON only. Must extract only REAL data, never invent values."
+
+GOOD EXAMPLES:
+- Raw='ANDREW ROMERO, A SINGLE MAN, AND KRISTINA CATHCART' → Extract='Andrew Romero' (first primary only)
+- Address='853 S Lucile Ln, Thatcher, AZ 85552' Amount='$347,588.00'
+- Raw='Clayton James' → Extract='Clayton James' (clean)
+- Address='1614 N Porter Lane, Thatcher, AZ 85552' Amount='$202,482.00'
+
+BAD EXAMPLES (REJECT):
+- 'Parcel ID 103-19-020C' as address (legal descriptor only)
+- 'Lot 112 DESERT HILLS UN 3' as address (subdivision/lot)
+- Multiple full names without selecting first
+
+OUTPUT: Return valid JSON only. Must extract only REAL data, never invent values.
 """
 
 

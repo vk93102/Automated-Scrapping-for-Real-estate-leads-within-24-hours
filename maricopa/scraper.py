@@ -23,8 +23,8 @@ from .db_postgres import (
     mark_resolved,
     record_failure,
     start_pipeline_run,
-    update_document_ocr_text,
     upsert_document,
+    insert_discovered_recordings_bulk,
     upsert_properties,
 )
 from .csv_export import write_csv, write_dated_csv
@@ -33,10 +33,11 @@ from .llm_extract import extract_fields_llm
 from .http_client import RetryConfig, new_session
 from .logging_setup import setup_logging
 from .maricopa_api import fetch_metadata, search_recording_numbers
-from .ocr_pipeline import ocr_pdf_bytes_to_text, ocr_pdf_to_text
-from .pdf_downloader import download_pdf, fetch_pdf_bytes
+from .pdf_downloader import fetch_pdf_bytes
+from .tesseract_ocr import ocr_pdf_pages_tesseract, validate_ocr_text
 from .proxies import ProxyProvider
 from .state import append_seen, load_seen
+from .extract_rules import ExtractedFields
 
 
 def _write_recording_numbers(path: str | Path, recs: list[str]) -> None:
@@ -136,7 +137,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-db", action="store_true", help="Skip Postgres writes")
     p.add_argument("--db-url", default=os.environ.get("DATABASE_URL", ""), help="Postgres connection string")
     p.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"))
-    p.add_argument("--workers", type=int, default=4, help="Number of worker threads for OCR/LLM processing")
+    p.add_argument("--workers", type=int, default=2, help="Number of worker threads for OCR/LLM processing")
     p.add_argument(
         "--db-only",
         action="store_true",
@@ -151,6 +152,42 @@ def _parse_iso_date(s: str) -> date:
         raise ValueError("bad date")
     y, m, d = (int(x) for x in parts)
     return date(y, m, d)
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = str(os.environ.get(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _metadata_to_llm_text(meta: Any) -> str:
+    names = [str(n).strip() for n in (getattr(meta, "names", []) or []) if str(n).strip()]
+    doc_codes = [str(c).strip() for c in (getattr(meta, "document_codes", []) or []) if str(c).strip()]
+    return (
+        "Maricopa Recorder document metadata:\n"
+        f"recording_number: {getattr(meta, 'recording_number', '')}\n"
+        f"recording_date: {getattr(meta, 'recording_date', '')}\n"
+        f"document_codes: {', '.join(doc_codes)}\n"
+        f"names: {', '.join(names)}\n"
+        f"page_amount: {getattr(meta, 'page_amount', '')}\n"
+        "Note: Extract strictly from available text. If address/principal are unavailable, return null.\n"
+    )
+
+
+def _normalize_mmddyyyy(s: str) -> str:
+    t = str(s or "").strip()
+    if not t:
+        return ""
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})$", t)
+    if not m:
+        return ""
+    mm = int(m.group(1))
+    dd = int(m.group(2))
+    yy = int(m.group(3))
+    if yy < 100:
+        yy += 2000
+    if mm < 1 or mm > 12 or dd < 1 or dd > 31:
+        return ""
+    return f"{mm:02d}/{dd:02d}/{yy:04d}"
 
 
 def main() -> None:
@@ -260,14 +297,9 @@ def main() -> None:
     if conn is not None:
         # store discovered recs into DB table
         try:
-            for r in recs:
-                try:
-                    # do not attach metadata here; metadata will be fetched in prefetch phase
-                    from .db_postgres import insert_discovered_recording
-
-                    insert_discovered_recording(conn, r, metadata=None)
-                except Exception:
-                    pass
+            logger.info("Persisting %d discovered recording numbers...", len(recs))
+            n_bulk = insert_discovered_recordings_bulk(conn, recs)
+            logger.info("Persisted discovered recordings (attempted=%d)", n_bulk)
         except Exception:
             # fallback to file write if DB fails
             if not args.db_only:
@@ -363,7 +395,6 @@ def main() -> None:
             new_results.append(results[-1])
 
             doc_id = None
-            ocr_text = ""
             has_properties = False
             has_unresolved_error = False
             if conn is not None:
@@ -382,14 +413,12 @@ def main() -> None:
                     except Exception:
                         doc_id = None
 
-                # If OCR already exists and extracted properties already exist, skip OCR/LLM.
-                # If properties are missing, still run LLM extraction to populate DB.
+                # If properties already exist and no force flag, skip reprocessing.
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
                             """
-                            select d.ocr_text,
-                                   exists(select 1 from properties p where p.document_id = d.id) as has_properties,
+                            select exists(select 1 from properties p where p.document_id = d.id) as has_properties,
                                    d.failed
                             from documents d
                             where d.recording_number = %s
@@ -397,41 +426,28 @@ def main() -> None:
                             (rec,),
                         )
                         row = cur.fetchone()
-                        ocr_text = (row[0] if row and row[0] else "")
-                        has_properties = bool(row[1]) if row and len(row) > 1 else False
-                        has_unresolved_error = bool(row[2]) if row and len(row) > 2 else False
+                        has_properties = bool(row[0]) if row and len(row) > 0 else False
+                        has_unresolved_error = bool(row[1]) if row and len(row) > 1 else False
                 except Exception:
-                    ocr_text = ""
                     has_properties = False
                     has_unresolved_error = False
 
                 # If row was previously marked failed but now has complete data,
                 # clear stale failure state.
-                if has_unresolved_error and ocr_text and has_properties and not args.force:
+                if has_unresolved_error and has_properties and not args.force:
                     try:
                         mark_resolved(conn, rec)
                         has_unresolved_error = False
                     except Exception:
                         pass
 
-                if ocr_text and has_properties and not args.force:
-                    logger.info("Skipping OCR/LLM for %s — ocr already present", rec)
+                if has_properties and not args.force:
+                    logger.info("Skipping LLM for %s — properties already present", rec)
                     n_skipped += 1
                     continue
 
-                # Recover from failed/incomplete records already in DB:
-                # if OCR exists but properties are missing OR record is marked failed,
-                # re-run only LLM using existing OCR (no PDF fetch needed).
-                if ocr_text and (has_unresolved_error or not has_properties):
-                    logger.info(
-                        "Reprocessing %s from existing OCR (failed=%s, has_properties=%s)",
-                        rec,
-                        has_unresolved_error,
-                        has_properties,
-                    )
-
-            # Schedule for OCR/LLM processing
-            tasks.append((rec, meta, doc_id, ocr_text if ocr_text else ""))
+            # Schedule for metadata->LLM processing
+            tasks.append((rec, meta, doc_id, ""))
 
         except Exception as e:
             logger.warning("Metadata prefetch failed %s: %s", rec, e)
@@ -445,7 +461,7 @@ def main() -> None:
         if args.sleep and args.sleep > 0:
             time.sleep(float(args.sleep))
 
-    # Phase 2: threaded OCR + LLM processing
+    # Phase 2: threaded Tesseract OCR + LLM processing with quality validation
     def _process_task(task: tuple[str, Any, Optional[int], str]) -> dict:
         rec, meta, doc_id, existing_ocr_text = task
         local_session = new_session()
@@ -456,83 +472,122 @@ def main() -> None:
         llm_done = False
         error_msg = None
         skipped_pdf = False
+        
         try:
             if not args.no_db:
                 local_conn = connect(args.db_url)
 
-            # OCR source: reuse existing OCR when available, otherwise fetch PDF and OCR.
-            pdf_stage = "pdf"
-            if existing_ocr_text:
-                ocr_text = existing_ocr_text
-                logger.info("Using existing OCR text for %s (LLM reprocess)", rec)
-                ocr_done = True
-            else:
-                if str(args.pdf_mode) == "memory":
-                    pdf_bytes = fetch_pdf_bytes(local_session, rec, proxies=proxies, retry=local_retry)
-                    pdf_stage = "ocr"
-                    ocr_text = ocr_pdf_bytes_to_text(pdf_bytes)
-                else:
-                    pdf_stage = "ocr"
-                    pdf_path = download_pdf(local_session, rec, proxies=proxies, retry=local_retry)
-                    ocr_text = ocr_pdf_to_text(pdf_path)
-                ocr_done = True
-
-            if local_conn is not None:
-                try:
-                    # Keep DB OCR synced (safe for both newly OCR'd and reused OCR text)
-                    update_document_ocr_text(local_conn, rec, ocr_text)
-                except Exception:
-                    pass
-
-            # LLM extraction
+            # Tesseract OCR → LLM pipeline with quality validation
             if not args.metadata_only:
-                fields = extract_fields_llm(ocr_text)
-                llm_done = True
-                if local_conn is not None and fields is not None:
-                    try:
-                        from .llm_extract import _MODEL as _LLM_MODEL
+                llm_input = ""
+                ocr_result = None
+                
+                # Step 1: Try Tesseract OCR
+                try:
+                    logger.info(f"Fetching PDF for OCR: {rec}")
+                    pdf_bytes = fetch_pdf_bytes(local_session, rec, proxies=proxies, retry=local_retry)
+                    
+                    if pdf_bytes:
+                        logger.info(f"OCRing with Tesseract: {rec}")
+                        ocr_result = ocr_pdf_pages_tesseract(pdf_bytes, max_pages=8)
+                        
+                        if ocr_result['success']:
+                            ocr_quality = validate_ocr_text(ocr_result['text'])
+                            logger.info(f"OCR quality for {rec}: confidence={ocr_quality['confidence']:.2f}")
+                            
+                            if ocr_quality['valid'] or ocr_quality['confidence'] > 0.5:
+                                llm_input = ocr_result['text']
+                                ocr_done = True
+                            else:
+                                logger.warning(f"Poor OCR quality for {rec}: {ocr_quality['issues']}")
+                        else:
+                            logger.warning(f"OCR failed for {rec}: {ocr_result['error']}")
+                except Exception as ocr_err:
+                    logger.warning(f"OCR exception for {rec}: {ocr_err}")
+                
+                # Step 2: Fallback to metadata if OCR failed
+                if not llm_input.strip():
+                    logger.info(f"Using metadata fallback for {rec}")
+                    llm_input = _metadata_to_llm_text(meta)
+                
+                # Step 3: Extract fields via LLM
+                logger.info(f"Extracting fields via LLM for {rec}")
+                fields = extract_fields_llm(llm_input)
+                
+                # Step 4: Fill in date if missing
+                if fields and not fields.sale_date:
+                    rec_date = _normalize_mmddyyyy(getattr(meta, "recording_date", "") or "")
+                    if rec_date:
+                        fields = ExtractedFields(
+                            trustor_1_full_name=fields.trustor_1_full_name,
+                            trustor_1_first_name=fields.trustor_1_first_name,
+                            trustor_1_last_name=fields.trustor_1_last_name,
+                            trustor_2_full_name=fields.trustor_2_full_name,
+                            trustor_2_first_name=fields.trustor_2_first_name,
+                            trustor_2_last_name=fields.trustor_2_last_name,
+                            property_address=fields.property_address,
+                            address_city=fields.address_city,
+                            address_state=fields.address_state,
+                            address_zip=fields.address_zip,
+                            address_unit=fields.address_unit,
+                            sale_date=rec_date,
+                            original_principal_balance=fields.original_principal_balance,
+                        )
+                
+                # Step 5: Strict quality validation
+                if fields:
+                    record_dict = {
+                        'trustor_1_full_name': fields.trustor_1_full_name,
+                        'property_address': fields.property_address,
+                        'address_city': fields.address_city,
+                        'address_state': fields.address_state,
+                        'address_zip': fields.address_zip,
+                        'sale_date': fields.sale_date,
+                        'original_principal_balance': fields.original_principal_balance,
+                    }
+                
+                llm_done = bool(fields)
+                
+                # Step 6: Store in database (db-only mode)
+                if fields is not None:
+                    
+                    if local_conn is not None:
+                        try:
+                            from .llm_extract import _MODEL as _LLM_MODEL
+                            llm_model_name = f"{_LLM_MODEL}-tesseract-ocr" if ocr_done else f"{_LLM_MODEL}-metadata"
+                            upsert_properties(local_conn, doc_id, fields, llm_model=llm_model_name)
+                            logger.info(f"Stored properties for {rec} (model={llm_model_name})")
+                        except Exception as db_err:
+                            logger.error(f"Failed to store properties for {rec}: {db_err}")
+                            error_msg = str(db_err)
 
-                        upsert_properties(local_conn, doc_id, fields, llm_model=_LLM_MODEL)
-                    except Exception:
-                        pass
-
-            if local_conn is not None:
+            if local_conn is not None and not error_msg:
                 try:
                     mark_processed(local_conn, rec)
                     mark_resolved(local_conn, rec)
                 except Exception:
                     pass
-            processed = True
+            
+            processed = bool(not error_msg)
+            
         except Exception as e:
             error_msg = str(e)
-            # Known case: PDF is unavailable for some recording numbers (404 on all fallback URLs).
-            # Keep metadata row, mark as skipped, and don't count as hard failure.
-            if "Could not fetch PDF" in error_msg and "404" in error_msg:
-                skipped_pdf = True
-                try:
-                    if local_conn is None and not args.no_db:
-                        local_conn = connect(args.db_url)
-                    if local_conn is not None:
-                        mark_processed(local_conn, rec)
-                        mark_resolved(local_conn, rec)
-                except Exception:
-                    pass
-                error_msg = None
-            # record failure in DB if available
-            if error_msg:
-                try:
-                    if local_conn is None and not args.no_db:
-                        local_conn = connect(args.db_url)
-                    if local_conn is not None:
-                        record_failure(local_conn, rec, stage=(pdf_stage if 'pdf_stage' in locals() else 'pdf'), error=error_msg)
-                except Exception:
-                    pass
+            logger.error(f"Task exception for {rec}: {error_msg}", exc_info=True)
+            
+            try:
+                if local_conn is None and not args.no_db:
+                    local_conn = connect(args.db_url)
+                if local_conn is not None:
+                    record_failure(local_conn, rec, stage="ocr-llm", error=error_msg)
+            except Exception:
+                pass
         finally:
             try:
                 if local_conn is not None:
                     local_conn.close()
             except Exception:
                 pass
+        
         return {"rec": rec, "processed": processed, "ocr": ocr_done, "llm": llm_done, "error": error_msg, "skipped_pdf": skipped_pdf}
 
     if tasks:

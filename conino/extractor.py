@@ -43,6 +43,42 @@ DEFAULT_MODEL_CANDIDATES = [
     "llama-3.1-8b-instant",
 ]
 
+COCONINO_SYSTEM_PROMPT = """
+Extract Coconino recorder document fields from OCR/detail text.
+
+Return STRICT JSON object with keys exactly:
+- trustor (string)
+- trustee (string)
+- beneficiary (string)
+- principalAmount (string)
+- propertyAddress (string)
+- grantors (array of strings)
+- grantees (array of strings)
+
+NAME RULES (STRICT):
+1) Return only ONE primary real name/entity for trustor/trustee/beneficiary.
+2) If multiple names/entities appear, keep only the first primary one.
+3) Remove descriptors and extra clauses: "as trustee", "dba", "fka", "et al", role boilerplate, mailing labels.
+4) Keep business suffixes only when part of legal name: LLC, INC, CORP, COMPANY, LTD, TRUST, BANK, ASSOCIATION.
+5) Never return generic role labels as values.
+
+ADDRESS RULES (STRICT):
+1) propertyAddress must be actual US property street address (number + street + optional city/state/zip).
+2) Exclude APN/parcel-only text, lot/block-only text, subdivision-only text, legal description, and recorder boilerplate.
+3) If multiple addresses appear, return property/situs address only (not mailing address).
+
+AMOUNT RULES:
+1) principalAmount must be dollar format "$123,456.78" when present.
+2) Return principalAmount only for meaningful values >= $1,000.
+
+NOT_FOUND RULE:
+If a field is not confidently extractable, return "NOT_FOUND" for string fields and [] for arrays.
+
+Do not guess. Do not invent. Return JSON only.
+""".strip()
+
+
+
 
 @dataclass
 class ExtractedRecord:
@@ -739,13 +775,7 @@ def analyze_document_text_with_groq(
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing")
-    system_prompt = (
-        "You analyze county recorder OCR text into strict JSON. "
-        "Return a JSON object with keys: summary, parties, property, financials, dates, confidenceNotes. "
-        "parties must contain grantors and grantees arrays. property must contain legalDescription and address if visible. "
-        "financials must contain amount and loanAmount if visible. dates must contain recordingDate and saleDate if visible. "
-        "Do not invent data. Use empty strings or empty arrays when unknown."
-    )
+
     user_payload = {
         "documentId": document_id,
         "recordingNumber": recording_number,
@@ -753,14 +783,14 @@ def analyze_document_text_with_groq(
         "ocrText": ocr_text[:18000],
     }
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": COCONINO_SYSTEM_PROMPT},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
     last_error: Exception | None = None
     for model in DEFAULT_MODEL_CANDIDATES:
         try:
             content = _groq_request(messages, api_key=api_key, model=model, timeout_s=timeout_s)
-            data = json.loads(content)
+            data = _parse_llm_json(content)
             if isinstance(data, dict):
                 data["model"] = model
                 return data
@@ -987,19 +1017,21 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, model: str, time
         raise
 
 
+def _parse_llm_json(content: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.IGNORECASE)
+    data = json.loads(cleaned) if cleaned else {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Groq returned non-object JSON")
+    return data
+
+
 def enrich_with_groq(records: list[ExtractedRecord], batch_size: int = 5, timeout_s: int = 60) -> list[dict[str, Any]]:
     load_env()
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GROQ_API_KEY is missing")
     normalized: list[dict[str, Any]] = []
-    system_prompt = (
-        "You extract Arizona recorder search result rows into strict JSON. "
-        "Return one object per input row in the same order. "
-        "Each object must have keys: documentId, recordingNumber, documentType, recordingDate, "
-        "grantors, grantees, legalDescriptions, detailUrl. grantors/grantees/legalDescriptions must be arrays of strings. "
-        "Do not invent values."
-    )
+
     for batch in _chunk_records(records, max(1, batch_size)):
         user_payload = {
             "rows": [
@@ -1011,7 +1043,7 @@ def enrich_with_groq(records: list[ExtractedRecord], batch_size: int = 5, timeou
             ]
         }
         messages = [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": COCONINO_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ]
         last_error: Exception | None = None
@@ -1026,7 +1058,7 @@ def enrich_with_groq(records: list[ExtractedRecord], batch_size: int = 5, timeou
                 continue
         if last_error is not None and not content:
             raise RuntimeError(f"Groq extraction failed: {last_error}")
-        parsed = json.loads(content)
+        parsed = _parse_llm_json(content)
         rows = parsed.get("rows") if isinstance(parsed, dict) else None
         if not isinstance(rows, list):
             raise RuntimeError("Groq returned unexpected JSON shape")

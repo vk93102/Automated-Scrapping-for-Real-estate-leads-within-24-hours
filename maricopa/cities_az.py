@@ -2,95 +2,52 @@ from __future__ import annotations
 
 from typing import Optional
 
-
-# Cities and towns in Arizona (user-provided list)
-ARIZONA_CITIES: list[str] = [
+ARIZONA_CITIES = [
     "Apache Junction",
     "Avondale",
-    "Benson",
-    "Bisbee",
     "Buckeye",
-    "Bullhead City",
     "Casa Grande",
     "Chandler",
-    "Clarkdale",
-    "Clifton",
-    "Coolidge",
-    "Cottonwood",
-    "Douglas",
-    "Duncan",
-    "Eloy",
-    "Flagstaff",
-    "Florence",
+    "El Mirage",
     "Fountain Hills",
-    "Gila Bend",
     "Gilbert",
     "Glendale",
-    "Globe",
     "Goodyear",
-    "Guadalupe",
-    "Hayden",
-    "Holbrook",
-    "Jerome",
-    "Kearny",
-    "Kingman",
-    "Lake Havasu City",
+    "Laveen",
     "Litchfield Park",
-    "Mammoth",
-    "Marana",
     "Maricopa",
     "Mesa",
-    "Miami",
-    "Nogales",
-    "Oro Valley",
-    "Page",
     "Paradise Valley",
-    "Parker",
-    "Payson",
     "Peoria",
     "Phoenix",
-    "Pima",
-    "Pinetop–Lakeside",
-    "Prescott",
-    "Prescott Valley",
-    "Quartzsite",
     "Queen Creek",
-    "Sahuarita",
-    "Safford",
-    "San Luis",
     "Scottsdale",
-    "Sedona",
-    "Show Low",
-    "Sierra Vista",
-    "Snowflake",
-    "Somerton",
-    "South Tucson",
-    "Springerville",
-    "Star Valley",
-    "Superior",
+    "Sun City",
+    "Sun City West",
     "Surprise",
-    "Taylor",
     "Tempe",
-    "Thatcher",
     "Tolleson",
-    "Tombstone",
-    "Tusayan",
-    "Tucson",
-    "Wellton",
     "Wickenburg",
-    "Willcox",
-    "Williams",
-    "Winkelman",
-    "Winslow",
     "Youngtown",
-    "Yuma",
 ]
 
-_CANON = {c.casefold(): c for c in ARIZONA_CITIES}
+
+_CITY_LOOKUP = {c.upper(): c for c in ARIZONA_CITIES}
+_CITY_LOOKUP.update({
+    "SUN CITY GRAND": "Sun City",
+    "SUN CITY AZ": "Sun City",
+    "PHX": "Phoenix",
+})
 
 
 def canonicalize_city(city: Optional[str]) -> Optional[str]:
-    c = (city or "").strip()
+    if city is None:
+        return None
+    c = str(city).strip()
     if not c:
         return None
-    return _CANON.get(c.casefold(), c)
+    c = " ".join(c.split())
+    up = c.upper()
+    if up in _CITY_LOOKUP:
+        return _CITY_LOOKUP[up]
+    return c.title()

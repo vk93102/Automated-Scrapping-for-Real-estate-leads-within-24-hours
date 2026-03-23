@@ -18,7 +18,11 @@ COUNTY_DIR = Path(__file__).resolve().parent
 ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from greenlee.extractor import run_greenlee_pipeline  # noqa: E402
+from greenlee.extractor import (  # noqa: E402
+    run_greenlee_pipeline,
+    sanitize_borrower_name,
+    sanitize_property_address,
+)
 
 
 GREENLEE_TARGET_DOC_TYPES = [
@@ -168,6 +172,11 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             doc_id = str(r.get("documentId", "") or "").strip()
             if not doc_id:
                 continue
+            clean_address = sanitize_property_address(r.get("propertyAddress", ""))
+            clean_trustor = sanitize_borrower_name(r.get("trustor", ""))
+            r_clean = dict(r)
+            r_clean["propertyAddress"] = clean_address
+            r_clean["trustor"] = clean_trustor
             used_groq = bool(r.get("usedGroq", False))
             if used_groq:
                 llm_used += 1
@@ -179,11 +188,11 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "document_type": r.get("documentType", ""),
                 "grantors": r.get("grantors", ""),
                 "grantees": r.get("grantees", ""),
-                "trustor": r.get("trustor", ""),
+                "trustor": clean_trustor,
                 "trustee": r.get("trustee", ""),
                 "beneficiary": r.get("beneficiary", ""),
                 "principal_amount": r.get("principalAmount", ""),
-                "property_address": r.get("propertyAddress", ""),
+                "property_address": clean_address,
                 "detail_url": r.get("detailUrl", ""),
                 "image_urls": r.get("imageUrls", ""),
                 "ocr_method": r.get("ocrMethod", ""),
@@ -193,7 +202,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "groq_error": r.get("groqError", ""),
                 "analysis_error": r.get("analysisError", ""),
                 "run_date": run_date,
-                "raw_record": psycopg.types.json.Jsonb(r),
+                "raw_record": psycopg.types.json.Jsonb(r_clean),
             }
             cur.execute(
                 """
@@ -209,24 +218,24 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                   %(analysis_error)s, %(run_date)s, %(raw_record)s
                 )
                 on conflict (source_county, document_id) do update set
-                  recording_number = excluded.recording_number,
-                  recording_date   = excluded.recording_date,
-                  document_type    = excluded.document_type,
-                  grantors         = excluded.grantors,
-                  grantees         = excluded.grantees,
-                  trustor          = excluded.trustor,
-                  trustee          = excluded.trustee,
-                  beneficiary      = excluded.beneficiary,
-                  principal_amount = excluded.principal_amount,
-                  property_address = excluded.property_address,
-                  detail_url       = excluded.detail_url,
-                  image_urls       = excluded.image_urls,
-                  ocr_method       = excluded.ocr_method,
-                  ocr_chars        = excluded.ocr_chars,
+                                    recording_number = coalesce(nullif(excluded.recording_number, ''), greenlee_leads.recording_number),
+                                    recording_date   = coalesce(nullif(excluded.recording_date, ''), greenlee_leads.recording_date),
+                                    document_type    = coalesce(nullif(excluded.document_type, ''), greenlee_leads.document_type),
+                                    grantors         = coalesce(nullif(excluded.grantors, ''), greenlee_leads.grantors),
+                                    grantees         = coalesce(nullif(excluded.grantees, ''), greenlee_leads.grantees),
+                                    trustor          = coalesce(nullif(excluded.trustor, ''), greenlee_leads.trustor),
+                                    trustee          = coalesce(nullif(excluded.trustee, ''), greenlee_leads.trustee),
+                                    beneficiary      = coalesce(nullif(excluded.beneficiary, ''), greenlee_leads.beneficiary),
+                                    principal_amount = coalesce(nullif(excluded.principal_amount, ''), greenlee_leads.principal_amount),
+                                    property_address = coalesce(nullif(excluded.property_address, ''), greenlee_leads.property_address),
+                                    detail_url       = coalesce(nullif(excluded.detail_url, ''), greenlee_leads.detail_url),
+                                    image_urls       = coalesce(nullif(excluded.image_urls, ''), greenlee_leads.image_urls),
+                                    ocr_method       = coalesce(nullif(excluded.ocr_method, ''), greenlee_leads.ocr_method),
+                                    ocr_chars        = greatest(coalesce(excluded.ocr_chars, 0), coalesce(greenlee_leads.ocr_chars, 0)),
                   used_groq        = excluded.used_groq,
-                  groq_model       = excluded.groq_model,
-                  groq_error       = excluded.groq_error,
-                  analysis_error   = excluded.analysis_error,
+                                    groq_model       = coalesce(nullif(excluded.groq_model, ''), greenlee_leads.groq_model),
+                                    groq_error       = coalesce(nullif(excluded.groq_error, ''), greenlee_leads.groq_error),
+                                    analysis_error   = coalesce(nullif(excluded.analysis_error, ''), greenlee_leads.analysis_error),
                   run_date         = excluded.run_date,
                   raw_record       = excluded.raw_record,
                   updated_at       = now()
@@ -241,6 +250,77 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 updated += 1
     conn.commit()
     return inserted, updated, llm_used
+
+
+def _sanitize_existing_record_fields(conn: psycopg.Connection) -> int:
+    """Normalize and cleanup property_address/trustor for already stored rows."""
+    changed = 0
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            select id, trustor, property_address, raw_record
+            from greenlee_leads
+            where coalesce(trim(property_address), '') <> ''
+               or coalesce(trim(trustor), '') <> ''
+               or (raw_record ? 'propertyAddress')
+               or (raw_record ? 'trustor');
+            """
+        )
+        rows = cur.fetchall()
+
+        for row_id, trustor, property_address, raw_record in rows:
+            raw_obj = raw_record if isinstance(raw_record, dict) else {}
+            raw_addr = str(raw_obj.get("propertyAddress", "") or "")
+            raw_trustor = str(raw_obj.get("trustor", "") or "")
+            clean_prop = sanitize_property_address(str(property_address or ""))
+            clean_raw = sanitize_property_address(raw_addr)
+            prev_prop = str(property_address or "")
+            best_addr = clean_prop or clean_raw or prev_prop
+
+            clean_trustor = sanitize_borrower_name(str(trustor or ""))
+            clean_raw_trustor = sanitize_borrower_name(raw_trustor)
+            prev_trustor = str(trustor or "")
+            best_trustor = clean_trustor or clean_raw_trustor or prev_trustor
+
+            next_raw = dict(raw_obj)
+            prev_raw = raw_addr
+            prev_raw_trustor = raw_trustor
+            next_raw["propertyAddress"] = best_addr
+            next_raw["trustor"] = best_trustor
+
+            if (
+                best_addr != prev_prop
+                or best_addr != prev_raw
+                or best_trustor != prev_trustor
+                or best_trustor != prev_raw_trustor
+            ):
+                cur.execute(
+                    """
+                    update greenlee_leads
+                    set trustor = %s,
+                        property_address = %s,
+                        raw_record = %s,
+                        updated_at = now()
+                    where id = %s;
+                    """,
+                    (best_trustor, best_addr, psycopg.types.json.Jsonb(next_raw), row_id),
+                )
+                changed += 1
+    conn.commit()
+    return changed
+
+
+def _doc_type_matches_target(found_doc_type: str, target_doc_types: list[str]) -> bool:
+    f = str(found_doc_type or "").strip().upper()
+    if not f:
+        return False
+    for t in target_doc_types:
+        tt = str(t or "").strip().upper()
+        if not tt:
+            continue
+        if f == tt or tt in f or f in tt:
+            return True
+    return False
 
 
 def _fetch_db_snapshot(conn: psycopg.Connection) -> tuple[int, tuple | None]:
@@ -307,24 +387,30 @@ def _run_once(
     _log(f"collection stage finished in {time.time() - t0:.1f}s")
 
     records = res.get("records", [])
-    before_filter = len(records)
-    target_upper = {d.upper() for d in doc_types}
-    records = [
-        r
-        for r in records
-        if (str(r.get("documentType", "") or "").strip().upper() in target_upper)
+    # IMPORTANT: do not drop fetched records before DB upsert.
+    # We keep all collected rows to avoid accidental skips.
+    mismatched = [
+        r for r in records
+        if not _doc_type_matches_target(r.get("documentType", ""), doc_types)
     ]
-    filtered_out = before_filter - len(records)
-    if filtered_out:
-        _log(f"filtered {filtered_out} out-of-scope records by document type before DB upsert")
+    if mismatched:
+        sample = [f"{str(x.get('documentId',''))}:{str(x.get('documentType',''))}" for x in mismatched[:10]]
+        _log(
+            f"note: {len(mismatched)} records have non-target document_type labels; "
+            f"keeping all records (no pre-upsert skip). sample={sample}"
+        )
     _log(f"processed {len(records)} documents; checking extraction quality...")
     
     # Validate data extraction
     records_with_trustor = len([r for r in records if (r.get("trustor") or "").strip()])
     records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
     records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
+    records_with_addr = len([r for r in records if (r.get("propertyAddress") or "").strip()])
     
-    _log(f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, {records_with_trustor} have trustor")
+    _log(
+        f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, "
+        f"{records_with_trustor} have trustor, {records_with_addr} have address"
+    )
     
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
@@ -333,6 +419,9 @@ def _run_once(
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
+        sanitized_existing = _sanitize_existing_record_fields(conn)
+        if sanitized_existing:
+            _log(f"sanitized borrower/address on {sanitized_existing} existing rows")
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -353,49 +442,42 @@ def main() -> None:
     if not (os.environ.get("GROQ_API_KEY") or "").strip():
         _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
 
-    p = argparse.ArgumentParser(description="Run Greenlee pipeline on interval and upsert into DB")
-    p.add_argument("--interval-minutes", type=float, default=720.0)
+    p = argparse.ArgumentParser(description="Run Greenlee pipeline once and upsert into DB")
+    p.add_argument("--interval-minutes", type=float, default=0.0, help="Deprecated: ignored (runner always executes once)")
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records, -1 skip OCR")
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Run one cycle and exit (default)")
-    mode.add_argument("--loop", action="store_true", help="Run continuously on interval")
+    mode.add_argument("--loop", action="store_true", help="Deprecated: ignored (runner always executes once)")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=GREENLEE_TARGET_DOC_TYPES)
     args = p.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
-    run_once = not args.loop
+    run_once = True
+    if args.loop:
+        _log("warning: --loop requested but ignored; runner is forced to single-run mode")
+    if args.interval_minutes:
+        _log("warning: --interval-minutes is deprecated and ignored; runner is forced to single-run mode")
     _log(
-        f"starting greenlee interval runner interval_minutes={args.interval_minutes} "
+        f"starting greenlee single-run runner "
         f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} "
         f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
-
-    while True:
-        started = datetime.now()
-        try:
-            total, ins, upd, llm_used, leads_total = _run_once(
-                args.doc_types,
-                args.workers,
-                args.lookback_days,
-                args.strict_llm,
-                args.ocr_limit,
-                args.verbose,
-            )
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
-        except Exception as exc:
-            _log(f"run failed: {exc}")
-
-        if run_once:
-            break
-
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+    try:
+        total, ins, upd, llm_used, leads_total = _run_once(
+            args.doc_types,
+            args.workers,
+            args.lookback_days,
+            args.strict_llm,
+            args.ocr_limit,
+            args.verbose,
+        )
+        _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
+    except Exception as exc:
+        _log(f"run failed: {exc}")
+        raise
 
 
 if __name__ == "__main__":

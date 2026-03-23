@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import io
 import json
 import os
@@ -89,6 +90,42 @@ CSV_FIELDS = [
     "sourceCounty",
     "analysisError",
 ]
+
+COUNTY_LLM_SYSTEM_PROMPT = """
+You extract real-estate foreclosure/distress fields from OCR/detail text.
+
+Return STRICT JSON object with keys exactly:
+- trustor (string)
+- trustee (string)
+- beneficiary (string)
+- principalAmount (string)
+- propertyAddress (string)
+- grantors (array of strings)
+- grantees (array of strings)
+- confidenceNote (string)
+
+CRITICAL NAME RULES (NOT VAGUE):
+1) Return only ONE primary name/entity for trustor/trustee/beneficiary.
+2) If multiple names/entities are present, keep the first primary one only.
+3) Remove extra clauses and descriptors after name: "as trustee", "dba", "fka", "et al", "a/an <state> LLC", role text, mailing labels.
+4) Keep business suffix only when part of true legal name (LLC, INC, CORP, COMPANY, LTD, TRUST, BANK, ASSOCIATION).
+5) Do not return generic words (Borrower, Trustor, Trustee, Beneficiary) as values.
+
+CRITICAL ADDRESS RULES (US PROPERTY ADDRESS ONLY):
+1) propertyAddress must be the actual US property street address: number + street + optional city/state/zip.
+2) Exclude legal description text, parcel/APN-only text, lot/block-only text, subdivision-only text, recording boilerplate, mailing addresses.
+3) If multiple addresses appear, return only the property/situs address.
+
+AMOUNT RULES:
+1) principalAmount must be a dollar string like "$123,456.78".
+2) Return principalAmount only for meaningful loan/principal values (>= $1,000).
+
+NOT_FOUND RULE:
+If a field cannot be confidently extracted, use "NOT_FOUND" for string fields and [] for array fields.
+Set confidenceNote to "NOT_FOUND:<comma-separated-field-names>" for missing fields.
+
+DO NOT GUESS. DO NOT INVENT. RETURN JSON ONLY.
+""".strip()
 
 
 def _normalise_date(date_str: str) -> str:
@@ -1024,6 +1061,118 @@ def _regex_principal(text: str) -> str:
     return ""
 
 
+_ADDRESS_NOISE_PATTERNS = [
+    r"\bREQUESTED\s+BY\b",
+    r"\bWHEN\s+RECORDED\s+MAIL\s+TO\b",
+    r"\bRETURN\s+TO\b",
+    r"\bATTN\b",
+    r"\bNAME\s+AND\s+ADDRESS\b",
+    r"\bRECORDING\s+FEE\b",
+    r"\bTHIS\s+SECURITY\s+INSTRUMENT\b",
+    r"\bTHE\s+ABOVE\s+DESCRIBED\b",
+    r"\bSITUATED\s+IN\s+THE\s+COUNTY\b",
+    r"\bCOUNTY\s+SELECTION\s+MISSING\b",
+    r"\bSKIP\s+NAVIGATION\s+LINKS\b",
+    r"\b0\s+ITEMS\s+IN\s+CART\b",
+    r"\bPO\s*BOX\b",
+]
+
+_ADDRESS_STREET_SUFFIX_RE = re.compile(
+    r"\b(ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|BLVD|BOULEVARD|CT|COURT|PL|PLACE|WAY|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE|TRL|TRAIL)\b",
+    re.I,
+)
+
+
+def _extract_relevant_address_fragment(value: str) -> str:
+    """Extract the most address-like fragment from noisy OCR/LLM text."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip(" ,;:-")
+    if not text:
+        return ""
+
+    m_parcel = re.search(r"\bPARCEL\s+ID\s*[:#-]?\s*([A-Z0-9\-]{3,})\b", text, re.I)
+    if m_parcel:
+        return f"Parcel ID {m_parcel.group(1).strip()}"
+
+    # Prefer explicit street address fragments (with optional city/state/zip tail).
+    m_street = re.search(
+        r"\b\d{1,6}\s+(?:[NSEW]\.?(?:\s+|$))?[A-Z0-9][A-Za-z0-9\s.#\-']{2,95}?\b"
+        r"(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|BLVD|BOULEVARD|CT|COURT|PL|PLACE|WAY|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE|TRL|TRAIL)\b"
+        r"(?:,\s*[A-Z][A-Za-z .'-]+(?:,\s*[A-Z]{2}(?:\s+\d{5}(?:-\d{4})?)?)?)?",
+        text,
+        re.I,
+    )
+    if m_street:
+        return m_street.group(0).strip(" ,;:-")
+
+    # Fallback for legal-only location strings.
+    m_legal = re.search(
+        r"\b(?:LOT\s+\w+[\w\-]*)(?:\s+BLOCK\s+\w+[\w\-]*)?(?:\s+SUBDIVISION\s+[A-Za-z0-9\s\-']+)?\b",
+        text,
+        re.I,
+    )
+    if m_legal:
+        return m_legal.group(0).strip(" ,;:-")
+
+    return text
+
+
+def sanitize_property_address(value: str) -> str:
+    v = _extract_relevant_address_fragment(value)
+    if not v:
+        return ""
+
+    # Remove common leading labels but keep the actual value.
+    v = re.sub(
+        r"^(?:property\s+address|situs\s+address|premises\s+address|commonly\s+known\s+as|property\s+located\s+at|located\s+at)\s*[:\-]\s*",
+        "",
+        v,
+        flags=re.I,
+    ).strip(" ,;:-")
+
+    # Truncate at known non-address sections when OCR joins multiple clauses.
+    v = re.split(
+        r"\b(?:APN|ASSESSOR(?:'S)?\s+PARCEL|REQUESTED\s+BY|WHEN\s+RECORDED|TOGETHER\s+WITH|THIS\s+SECURITY\s+INSTRUMENT|LEGAL\s+DESCRIPTION|RECORDING\s+FEE)\b",
+        v,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" ,;:-")
+
+    if len(v) < 6 or len(v) > 180:
+        return ""
+
+    return re.sub(r"\s+", " ", v).strip(" ,;:-")
+
+
+def _address_quality_score(value: str) -> int:
+    v = str(value or "")
+    if not v:
+        return -1
+    score = 0
+    if re.search(r"^PARCEL\s+ID\s+", v, re.I):
+        score += 2
+    if re.search(r"\b\d{1,6}\b", v):
+        score += 3
+    if _ADDRESS_STREET_SUFFIX_RE.search(v):
+        score += 4
+    if re.search(r",\s*[A-Z][A-Za-z .'-]+(?:,\s*AZ\b)?", v):
+        score += 1
+    return score
+
+
+def _choose_best_property_address(*candidates: str) -> str:
+    best = ""
+    best_score = -1
+    for raw in candidates:
+        cleaned = sanitize_property_address(raw)
+        if not cleaned:
+            continue
+        score = _address_quality_score(cleaned)
+        if score > best_score:
+            best = cleaned
+            best_score = score
+    return best
+
+
 def _regex_address(text: str) -> str:
     exclude = [
         r"\bDEED OF TRUST\b",
@@ -1040,8 +1189,8 @@ def _regex_address(text: str) -> str:
     ]
 
     def _clean_candidate(val: str) -> str:
-        v = re.sub(r"\s+", " ", (val or "")).strip(" ,;:-")
-        if len(v) < 8:
+        v = sanitize_property_address(val)
+        if not v:
             return ""
         if any(re.search(e, v, re.I) for e in exclude):
             return ""
@@ -1249,6 +1398,149 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
     raise RuntimeError(last_err or "Groq request failed")
 
 
+def _resolve_hosted_document_endpoint_url() -> str:
+    direct = (
+        os.getenv("GREENLEE_LLM_DOCUMENT_ENDPOINT_URL", "")
+        or os.getenv("GROQ_LLM_DOCUMENT_ENDPOINT_URL", "")
+    ).strip()
+    if direct:
+        return direct
+    base = (
+        os.getenv("GREENLEE_LLM_ENDPOINT_URL", "")
+        or os.getenv("GROQ_LLM_ENDPOINT_URL", "")
+    ).strip()
+    if base:
+        # Use configured endpoint as-is. Supports both:
+        #  - /api/v1/llm/extract-document (PDF payload)
+        #  - /api/v1/llm/extract (OCR text payload)
+        if "/api/v1/llm/extract" in base:
+            return base
+        # Fallback if only host/base URL is provided.
+        return base.rstrip("/") + "/api/v1/llm/extract"
+    return ""
+
+
+def _build_pdf_base64_from_images(
+    image_urls: list[str],
+    session: requests.Session,
+    max_pages: int = 6,
+    timeout_s: int = 30,
+) -> tuple[str, int]:
+    pages: list[Image.Image] = []
+    for u in (image_urls or [])[:max_pages]:
+        try:
+            rr = session.get(u, timeout=timeout_s)
+            rr.raise_for_status()
+            ctype = (rr.headers.get("Content-Type") or "").lower()
+            if "image" not in ctype:
+                continue
+            im = Image.open(io.BytesIO(rr.content))
+            im.load()
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            pages.append(im)
+        except Exception:
+            continue
+    if not pages:
+        return "", 0
+    buf = io.BytesIO()
+    first = pages[0]
+    rest = pages[1:]
+    first.save(buf, format="PDF", save_all=True, append_images=rest)
+    pdf_bytes = buf.getvalue()
+    if not pdf_bytes:
+        return "", 0
+    return base64.b64encode(pdf_bytes).decode("ascii"), len(pages)
+
+
+def _hosted_extract_fields_from_document(
+    *,
+    endpoint_url: str,
+    image_urls: list[str],
+    session: requests.Session,
+    recording_number: str,
+    timeout_s: int = 90,
+) -> tuple[dict, str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_token = (os.getenv("GREENLEE_API_TOKEN", "") or os.getenv("API_TOKEN", "")).strip()
+    if api_token:
+        headers["X-API-Token"] = api_token
+
+    timeout_env = (
+        os.getenv("GREENLEE_LLM_ENDPOINT_TIMEOUT_S", "")
+        or os.getenv("GROQ_LLM_ENDPOINT_TIMEOUT_S", "")
+    ).strip()
+    if timeout_env:
+        try:
+            timeout_s = max(10, int(float(timeout_env)))
+        except Exception:
+            pass
+
+    def _map_response(data: dict, pages_used: int, ocr_text: str) -> tuple[dict, str, str]:
+        fields = data.get("fields", data) if isinstance(data, dict) else {}
+        if not isinstance(fields, dict):
+            raise RuntimeError("hosted LLM endpoint returned invalid fields payload")
+
+        trustor = str(fields.get("trustor") or fields.get("trustor_1_full_name") or "").strip()
+        trustee = str(fields.get("trustee") or "").strip()
+        beneficiary = str(fields.get("beneficiary") or "").strip()
+        property_address = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
+        principal_amount = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
+        if principal_amount and principal_amount[0].isdigit():
+            principal_amount = f"${principal_amount}"
+
+        mapped = {
+            "trustor": trustor,
+            "trustee": trustee,
+            "beneficiary": beneficiary,
+            "propertyAddress": property_address,
+            "principalAmount": principal_amount,
+        }
+        model = str(data.get("model") or "hosted-llm-endpoint").strip() if isinstance(data, dict) else "hosted-llm-endpoint"
+        if pages_used > 0:
+            model = f"{model} pages={pages_used}"
+        return mapped, model, ocr_text
+
+    # Mode A: document endpoint accepts PDF payload.
+    if "/extract-document" in endpoint_url:
+        pdf_base64, pages_used = _build_pdf_base64_from_images(image_urls=image_urls, session=session)
+        if not pdf_base64:
+            raise RuntimeError("hosted LLM endpoint: unable to build PDF payload from image URLs")
+        payload = {
+            "pdf_base64": pdf_base64,
+            "fallback_to_rule_based": True,
+            "recording_number": str(recording_number or ""),
+        }
+        rr = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout_s)
+        if rr.status_code < 400:
+            data = rr.json() if rr.content else {}
+            ocr_text = str(data.get("ocr_text") or "") if isinstance(data, dict) else ""
+            return _map_response(data, pages_used, ocr_text)
+
+        # Auto-fallback to OCR-text endpoint style when document route is unavailable.
+        endpoint_url = endpoint_url.replace("/extract-document", "/extract")
+
+    # Mode B: text endpoint accepts OCR text payload.
+    ocr_text, _ = ocr_document_images(image_urls, session, max_pages=6)
+    if not ocr_text.strip():
+        raise RuntimeError("hosted LLM endpoint fallback: OCR text unavailable")
+    payload = {
+        "ocr_text": ocr_text,
+        "recording_number": str(recording_number or ""),
+    }
+    rr = requests.post(endpoint_url, json=payload, headers=headers, timeout=timeout_s)
+    if rr.status_code >= 400:
+        body = ""
+        try:
+            body = (rr.text or "")[:260]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"hosted LLM endpoint HTTP {rr.status_code}; response={body}")
+
+    data = rr.json() if rr.content else {}
+    return _map_response(data, 0, ocr_text)
+
+
 def _normalise_party(v: str) -> str:
     return re.sub(r"\s+", " ", (v or "")).strip(" |:;,-")
 
@@ -1276,6 +1568,127 @@ def _looks_bad_party(v: str) -> bool:
     return any(b in u for b in bad)
 
 
+_BORROWER_NOISE_PATTERNS = [
+    r"\bSHOW\s+NAME\s+INDEXING\b",
+    r"\bHIDE\s+NAME\s+INDEXING\b",
+    r"\bUNDER\s+THIS\s+SECURITY\s+INSTRUMENT\b",
+    r"\bTO\s+THE\s+EXTENT\s+OF\b",
+    r"\bNAME\s+AND\s+ADDRESS\b",
+    r"\bREQUESTED\s+BY\b",
+    r"\bWHEN\s+RECORDED\s+MAIL\s+TO\b",
+    r"\bCOUNTY\s+SELECTION\s+MISSING\b",
+    r"\bSKIP\s+NAVIGATION\s+LINKS\b",
+]
+
+
+_BORROWER_SPLIT_RE = re.compile(
+    r"\s*(?:,\s*and\s+|\band\s+|\bas\b|;|\||/|\baka\b|\bdba\b|\bfka\b|\bet\s+al\b)\s*",
+    re.I,
+)
+
+
+_BUSINESS_SUFFIX_RE = re.compile(
+    r"\b(LLC|L\.L\.C\.|INC|INC\.|CORP|CORPORATION|CO\.|COMPANY|LIMITED|LTD|PLC|LP|LLP|BANK|ASSOCIATION|TRUST)\b",
+    re.I,
+)
+
+
+def sanitize_borrower_name(value: str) -> str:
+    v = re.sub(r"\s+", " ", str(value or "")).strip(" |:;,-")
+    if not v:
+        return ""
+
+    # Remove role labels if OCR/LLM returned them inline.
+    v = re.sub(r"^(?:trustor|borrower|mortgagor)\s*[:\-]\s*", "", v, flags=re.I).strip(" |:;,-")
+    # If OCR concatenated multiple labels, keep first segment.
+    v = re.split(r"\b(?:trustee|beneficiary|requested\s+by|when\s+recorded\s+mail\s+to)\b", v, maxsplit=1, flags=re.I)[0].strip(" |:;,-")
+    # Drop leading legal-descriptor boilerplate and keep the actual name/entity.
+    v = re.sub(
+        r"^A\s+[A-Za-z]+(?:\s+[A-Za-z]+){0,4}\s+LIMITED\s+LIABILITY\s+COMPANY\b\s*(?:AS)?\s*,?\s*",
+        "",
+        v,
+        flags=re.I,
+    ).strip(" |:;,-")
+    v = re.sub(r"^AN?\s+[A-Za-z]+(?:\s+[A-Za-z]+){0,4}\s+CORPORATION\b\s*(?:AS)?\s*,?\s*", "", v, flags=re.I).strip(" |:;,-")
+    v = re.sub(r"^(?:AND|,)\s*", "", v, flags=re.I).strip(" |:;,-")
+    # Strip trailing embedded address fragments from party names.
+    v = re.split(
+        r"\b\d{1,6}\s+(?:[NSEW]\.?(?:\s+|$))?[A-Z0-9][A-Za-z0-9\s.#\-']{2,80}\b"
+        r"(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|BLVD|BOULEVARD|CT|COURT|PL|PLACE|WAY|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE|TRL|TRAIL)\b",
+        v,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip(" |:;,-")
+
+    # Keep only the first relevant entity if multiple names/entities are concatenated.
+    parts = [p.strip(" ,;:-") for p in _BORROWER_SPLIT_RE.split(v) if p and p.strip(" ,;:-")]
+    if parts:
+        v = parts[0]
+
+    # If legal descriptor is appended, cut at descriptor start.
+    v = re.split(r"\bA\s+(?:AN\s+)?[A-Z][A-Za-z]+\s+LIMITED\s+LIABILITY\s+COMPANY\b", v, maxsplit=1, flags=re.I)[0].strip(" ,;:-")
+
+    # Keep up to business suffix when present.
+    m_suffix = _BUSINESS_SUFFIX_RE.search(v)
+    if m_suffix:
+        v = v[: m_suffix.end()].strip(" ,;:-")
+    else:
+        # Person/other names: keep compact first 4 words.
+        words = [w for w in re.split(r"\s+", v) if w]
+        if len(words) > 4:
+            v = " ".join(words[:4])
+
+    v = re.sub(r"\s*,\s*", " ", v)
+    v = re.sub(r"\s+", " ", v).strip(" |:;,-")
+
+    if not v or len(v) < 2 or len(v) > 140:
+        return ""
+    vu = v.upper()
+    if vu in {"UNKNOWN", "N/A", "NA", "NULL", "-", "THIS DEED OF TRUST", "DEED OF TRUST", "THIS INSTRUMENT"}:
+        return ""
+    if re.search(r"\bTHIS\s+DEED\s+OF\s+TRUST\b", vu):
+        return ""
+    if not re.search(r"[A-Za-z]", v):
+        return ""
+
+    return v
+
+
+def _borrower_quality_score(value: str) -> int:
+    v = str(value or "")
+    if not v:
+        return -1
+    score = 0
+    words = [w for w in re.split(r"\s+", v) if w]
+    score += min(len(words), 5)
+    if re.search(r"\b(LLC|INC|BANK|CORP|TRUST|ASSOCIATION|TOWN|CITY|COUNTY)\b", v, re.I):
+        score += 1
+    if re.search(r"\b(TRUSTEE|BENEFICIARY)\b", v, re.I):
+        score -= 2
+    return score
+
+
+def _choose_best_borrower_name(*candidates: str) -> str:
+    best = ""
+    best_score = -1
+    for raw in candidates:
+        cleaned = sanitize_borrower_name(raw)
+        if not cleaned:
+            continue
+        score = _borrower_quality_score(cleaned)
+        if score > best_score:
+            best = cleaned
+            best_score = score
+    return best
+
+
+def _safe_filtered_party(value: str) -> str:
+    """Return filtered party name when valid, otherwise keep trimmed original."""
+    raw = _normalise_party(value)
+    clean = sanitize_borrower_name(raw)
+    return clean or raw
+
+
 def _groq_extract_fields(
     *,
     document_id: str,
@@ -1291,12 +1704,7 @@ def _groq_extract_fields(
     ocr_text = (ocr_text or "")[:max_ocr_chars]
     detail_text = (detail_text or "")[:max_detail_chars]
 
-    system_prompt = (
-        "Extract recorder document fields from OCR text. Return STRICT JSON with keys: "
-        "trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees, confidenceNote. "
-        "grantors and grantees must be arrays of names. Do not invent values. "
-        "If unknown, return empty string/empty array. principalAmount must be a dollar string like $123,456.78 when present."
-    )
+    system_prompt = COUNTY_LLM_SYSTEM_PROMPT
     user_payload = {
         "documentId": document_id,
         "recordingNumber": recording_number,
@@ -1327,6 +1735,14 @@ def enrich_record(
     except Exception as e:
         record["analysisError"] = f"detail fetch failed: {e}"
         return record
+
+    detail_address = sanitize_property_address(detail.get("propertyAddress", ""))
+    if detail_address:
+        detail["propertyAddress"] = detail_address
+    detail_trustor = sanitize_borrower_name(detail.get("trustor", ""))
+    if detail_trustor:
+        detail["trustor"] = detail_trustor
+
     for key in [
         "detailUrl",
         "recordingNumber",
@@ -1344,7 +1760,135 @@ def enrich_record(
             record[key] = detail[key]
     image_urls = discover_image_urls(dk, session, detail.get("imageUrls", []), max_probe_pages=max_image_pages)
     record["imageUrls"] = " | ".join(image_urls)
-    ocr_text, ocr_method = ocr_document_images(image_urls, session, max_pages=max_image_pages)
+    hosted_endpoint_url = _resolve_hosted_document_endpoint_url()
+    disable_local_ocr = str(os.getenv("GREENLEE_DISABLE_LOCAL_OCR", "0")).strip() == "1"
+
+    # If hosted endpoint is configured, bypass local OCR and send document pages directly.
+    if use_groq and hosted_endpoint_url and image_urls and not detail.get("imageAccessNote"):
+        try:
+            llm, model, hosted_ocr_text = _hosted_extract_fields_from_document(
+                endpoint_url=hosted_endpoint_url,
+                image_urls=image_urls,
+                session=session,
+                recording_number=record.get("recordingNumber", ""),
+            )
+            record["usedGroq"] = True
+            record["groqModel"] = model
+            record["ocrMethod"] = "hosted-document-endpoint"
+            record["ocrChars"] = len(hosted_ocr_text or "")
+
+            for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
+                llm_val = (llm.get(key) or "").strip()
+                if key == "trustor":
+                    llm_val = sanitize_borrower_name(llm_val)
+                if key == "propertyAddress":
+                    llm_val = sanitize_property_address(llm_val)
+                if llm_val:
+                    record[key] = llm_val
+
+            merged = ((hosted_ocr_text or "") + "\n" + detail.get("rawText", "")).strip()
+            if not record.get("principalAmount"):
+                record["principalAmount"] = _regex_principal(merged)
+            if not record.get("propertyAddress"):
+                record["propertyAddress"] = _regex_address(merged)
+            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
+                if not record.get(key):
+                    record[key] = _extract_party_block(merged, label)
+                if not record.get(key):
+                    record[key] = _regex_party(merged, label)
+
+            if not record.get("trustor"):
+                record["trustor"] = _first_party(record.get("grantors", ""))
+            if not record.get("beneficiary"):
+                record["beneficiary"] = _first_party(record.get("grantees", ""))
+            if not record.get("trustee"):
+                gr_first = _first_party(record.get("grantees", ""))
+                if re.search(r"TRUST|TRUSTEE", gr_first or "", re.I):
+                    record["trustee"] = gr_first
+            record["trustor"] = _choose_best_borrower_name(
+                detail_trustor,
+                record.get("trustor", ""),
+                _first_party(record.get("grantors", "")),
+                _extract_party_block(merged, "trustor"),
+                _regex_party(merged, "trustor"),
+            )
+            record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
+            record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
+            record["propertyAddress"] = _choose_best_property_address(
+                detail_address,
+                record.get("propertyAddress", ""),
+                _regex_address(merged),
+            )
+            return record
+        except Exception as e:
+            record.setdefault("groqError", "")
+            record["groqError"] = str(e)
+            if disable_local_ocr:
+                ocr_text = ""
+                ocr_method = "skipped-local-ocr"
+                blocked_no_image = False
+                record["ocrMethod"] = ocr_method
+                record["ocrChars"] = 0
+                record.setdefault("usedGroq", False)
+                record.setdefault("groqModel", "")
+                merged = (ocr_text + "\n" + detail.get("rawText", "")).strip()
+
+                if use_groq and groq_api_key and (ocr_text.strip() or detail.get("rawText", "").strip()):
+                    try:
+                        llm, model = _groq_extract_fields(
+                            document_id=dk,
+                            recording_number=record.get("recordingNumber", ""),
+                            document_type=record.get("documentType", ""),
+                            ocr_text=ocr_text,
+                            detail_text=detail.get("rawText", ""),
+                            api_key=groq_api_key,
+                        )
+                        record["usedGroq"] = True
+                        record["groqModel"] = model
+                        for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
+                            llm_val = (llm.get(key) or "").strip()
+                            if key == "trustor":
+                                llm_val = sanitize_borrower_name(llm_val)
+                            if key == "propertyAddress":
+                                llm_val = sanitize_property_address(llm_val)
+                            if llm_val:
+                                record[key] = llm_val
+                    except Exception as inner_e:
+                        record["groqError"] = str(inner_e)
+
+                if not record.get("principalAmount"):
+                    record["principalAmount"] = _regex_principal(merged)
+                if not record.get("propertyAddress"):
+                    record["propertyAddress"] = _regex_address(merged)
+                for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
+                    if not record.get(key):
+                        record[key] = _extract_party_block(merged, label)
+                    if not record.get(key):
+                        record[key] = _regex_party(merged, label)
+                if not record.get("trustor"):
+                    record["trustor"] = _first_party(record.get("grantors", ""))
+                if not record.get("beneficiary"):
+                    record["beneficiary"] = _first_party(record.get("grantees", ""))
+                record["trustor"] = _choose_best_borrower_name(
+                    detail_trustor,
+                    record.get("trustor", ""),
+                    _first_party(record.get("grantors", "")),
+                    _extract_party_block(merged, "trustor"),
+                    _regex_party(merged, "trustor"),
+                )
+                record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
+                record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
+                record["propertyAddress"] = _choose_best_property_address(
+                    detail_address,
+                    record.get("propertyAddress", ""),
+                    _regex_address(merged),
+                )
+                return record
+
+    if disable_local_ocr:
+        ocr_text, ocr_method = "", "skipped-local-ocr"
+    else:
+        ocr_text, ocr_method = ocr_document_images(image_urls, session, max_pages=max_image_pages)
     blocked_no_image = False
     if not image_urls and detail.get("imageAccessNote"):
         note = detail.get("imageAccessNote", "")
@@ -1380,6 +1924,10 @@ def enrich_record(
             # LLM-first mapping (no regex dependency when LLM is enabled).
             for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                 llm_val = (llm.get(key) or "").strip()
+                if key == "propertyAddress":
+                    llm_val = sanitize_property_address(llm_val)
+                if key == "trustor":
+                    llm_val = sanitize_borrower_name(llm_val)
                 if llm_val:
                     record[key] = llm_val
 
@@ -1448,6 +1996,21 @@ def enrich_record(
         if not record.get("beneficiary"):
             record["beneficiary"] = _first_party(record.get("grantees", ""))
 
+    record["trustor"] = _choose_best_borrower_name(
+        detail_trustor,
+        record.get("trustor", ""),
+        _first_party(record.get("grantors", "")),
+        _extract_party_block(merged, "trustor"),
+        _regex_party(merged, "trustor"),
+    )
+    record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
+    record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
+    record["propertyAddress"] = _choose_best_property_address(
+        detail_address,
+        record.get("propertyAddress", ""),
+        _regex_address(merged),
+    )
+
     if blocked_no_image and not record.get("principalAmount") and not record.get("propertyAddress"):
         record["analysisError"] = (
             f"{detail.get('imageAccessNote', 'Image unavailable')}; "
@@ -1499,7 +2062,8 @@ def run_greenlee_pipeline(
     _load_local_env()
     session = _make_session(cookie_header)
     groq_key = os.getenv("GROQ_API_KEY", "")
-    use_groq = bool(use_groq and groq_key)
+    hosted_endpoint_url = _resolve_hosted_document_endpoint_url()
+    use_groq = bool(use_groq and (groq_key or hosted_endpoint_url))
     if ocr_limit < 0:
         enrich_count = 0
     elif ocr_limit == 0:
