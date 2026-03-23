@@ -555,7 +555,11 @@ def main() -> None:
                         try:
                             from .llm_extract import _MODEL as _LLM_MODEL
                             llm_model_name = f"{_LLM_MODEL}-tesseract-ocr" if ocr_done else f"{_LLM_MODEL}-metadata"
-                            upsert_properties(local_conn, doc_id, fields, llm_model=llm_model_name)
+                            doc_type = meta.document_codes[0] if meta.document_codes else None
+                            upsert_properties(
+                                local_conn, doc_id, fields, 
+                                llm_model=llm_model_name
+                            )
                             logger.info(f"Stored properties for {rec} (model={llm_model_name})")
                         except Exception as db_err:
                             logger.error(f"Failed to store properties for {rec}: {db_err}")

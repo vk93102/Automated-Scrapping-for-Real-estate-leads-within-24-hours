@@ -62,6 +62,9 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             create table if not exists properties (
               id                         bigserial primary key,
               document_id                bigint references documents(id) on delete cascade,
+              recording_number           text,
+              recording_date             text,
+              document_type              text,
               trustor_1_full_name        text,
               trustor_1_first_name       text,
               trustor_1_last_name        text,
@@ -80,6 +83,16 @@ def ensure_schema(conn: psycopg.Connection) -> None:
               updated_at                 timestamptz not null default now(),
               unique (document_id)
             );
+            """
+        )
+
+        # Add new columns if they don't exist (for existing tables)
+        cur.execute(
+            """
+            alter table properties
+            add column if not exists recording_number text,
+            add column if not exists recording_date text,
+            add column if not exists document_type text;
             """
         )
 
@@ -334,7 +347,8 @@ def upsert_properties(
         cur.execute(
             """
             insert into properties (
-              document_id, trustor_1_full_name, trustor_1_first_name, trustor_1_last_name,
+              document_id,
+              trustor_1_full_name, trustor_1_first_name, trustor_1_last_name,
               trustor_2_full_name, trustor_2_first_name, trustor_2_last_name,
               address_city, address_state, address_zip, property_address,
               sale_date, original_principal_balance, address_unit, llm_model
