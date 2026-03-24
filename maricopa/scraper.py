@@ -398,11 +398,13 @@ def main() -> None:
             meta = fetch_metadata(pre_session, rec, proxies=proxies, retry=retry)
 
             if not _is_valid_metadata(meta):
-                logger.warning("Skipping %s — API returned no document type (broken record)", rec)
+                logger.warning("Broken metadata for %s — API returned no document type", rec)
                 if conn is not None:
                     try:
+                        # Still persist a document row for auditing/backfill.
+                        # Mark as failed so it is visible in the DB, but skip OCR/LLM.
+                        upsert_document(conn, meta)
                         record_failure(conn, rec, stage="metadata", error="API returned no document type (broken/invalid record)")
-                        mark_resolved(conn, rec)
                     except Exception:
                         pass
                 n_skipped += 1

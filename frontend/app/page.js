@@ -85,7 +85,18 @@ export default function HomePage() {
 
   const hasAddress = (row) => {
     const v = (row?.property_address || "").trim();
-    return v !== "" && v !== "NOT_FOUND";
+    if (!v || v === "" || v === "NOT_FOUND") return false;
+    // For Santa Cruz: treat addresses starting with "Parcel ID" as invalid
+    if (isSantaCruzView && v.toUpperCase().startsWith("PARCEL ID")) return false;
+    return true;
+  };
+
+  const getDisplayAddress = (row) => {
+    const v = (row?.property_address || "").trim();
+    if (!v || v === "" || v === "NOT_FOUND") return "-";
+    // For Santa Cruz: show "-" if address starts with "Parcel ID"
+    if (isSantaCruzView && v.toUpperCase().startsWith("PARCEL ID")) return "-";
+    return v;
   };
 
   const esc = (value) => {
@@ -125,14 +136,14 @@ export default function HomePage() {
           "Address State",
           "Recording Number",
           "Recording Date",
-          "Principal Amount"
+          "Principal Amount",
+          "Document URL"
         ]
       : isSantaCruzView
       ? [
           "Document ID",
           "Recording Number",
           "Document Type",
-          "Parcel ID",
           "Grantors",
           "Grantees",
           "Trustor",
@@ -171,19 +182,20 @@ export default function HomePage() {
           `"${(row.recording_number || doc.recording_number || "").replace(/\"/g, '""')}"`,
           `"${(row.recording_date || doc.recording_date || "").replace(/\"/g, '""')}"`,
           `"${(row.original_principal_balance || row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
+          `"${(row.document_url || "").replace(/\"/g, '""')}"`,
         ].join(",");
       }
       if (isSantaCruzView) {
+        const cleanedAddress = (row.property_address || "").trim().toUpperCase().startsWith("PARCEL ID") ? "" : (row.property_address || "");
         return [
           `"${(row.document_id || "").replace(/\"/g, '""')}"`,
           `"${(row.recording_number || "").replace(/\"/g, '""')}"`,
           `"${(row.document_type || "").replace(/\"/g, '""')}"`,
-          `"${(row.parcel_id || "").replace(/\"/g, '""')}"`,
           `"${(row.grantors || "").replace(/\"/g, '""')}"`,
           `"${(row.grantees || "").replace(/\"/g, '""')}"`,
           `"${(row.trustor || "").replace(/\"/g, '""')}"`,
           `"${(row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
-          `"${(row.property_address || "").replace(/\"/g, '""')}"`,
+          `"${cleanedAddress.replace(/\"/g, '""')}"`,
         ].join(",");
       }
       return [
@@ -230,13 +242,13 @@ export default function HomePage() {
           "Recording Number",
           "Recording Date",
           "Principal Amount",
+          "Document URL",
         ]
       : isSantaCruzView
       ? [
           "Document ID",
           "Recording Number",
           "Document Type",
-          "Parcel ID",
           "Grantors",
           "Grantees",
           "Trustor",
@@ -270,19 +282,20 @@ export default function HomePage() {
             <td>${esc(row.recording_number || doc.recording_number || "-")}</td>
             <td>${esc(row.recording_date || doc.recording_date || "-")}</td>
             <td>${esc(row.original_principal_balance || row.principal_amount || "-")}</td>
+            <td><a href="${esc(row.document_url || "")}" target="_blank">Link</a></td>
           </tr>`;
         }
         if (isSantaCruzView) {
+          const cleanedAddress = (row.property_address || "").trim().toUpperCase().startsWith("PARCEL ID") ? "-" : (row.property_address || "-");
           return `<tr>
             <td>${esc(row.document_id || "-")}</td>
             <td>${esc(row.recording_number || "-")}</td>
             <td>${esc(row.document_type || "-")}</td>
-            <td>${esc(row.parcel_id || "-")}</td>
             <td>${esc(row.grantors || "-")}</td>
             <td>${esc(row.grantees || "-")}</td>
             <td>${esc(row.trustor || "-")}</td>
             <td>${esc(row.principal_amount || "-")}</td>
-            <td>${esc(row.property_address || "-")}</td>
+            <td>${esc(cleanedAddress)}</td>
           </tr>`;
         }
         return `<tr>
@@ -447,6 +460,7 @@ export default function HomePage() {
                   className={`nav-item ${active ? "active" : ""} ${county.status !== "Live" ? "disabled" : ""}`}
                   onClick={() => {
                     setActiveCounty(county.key);
+                    setAddressFilter("all");
                     setMobileMenuOpen(false);
                   }}
                 >
@@ -620,13 +634,13 @@ export default function HomePage() {
                               <th>Recording Number</th>
                               <th>Recording Date</th>
                               <th>Principal Amount</th>
+                              <th>Document URL</th>
                             </>
                           ) : isSantaCruzView ? (
                             <>
                               <th>Document ID</th>
                               <th>Recording Number</th>
                               <th>Document Type</th>
-                              <th>Parcel ID</th>
                               <th>Grantors</th>
                               <th>Grantees</th>
                               <th>Trustor</th>
@@ -688,18 +702,18 @@ export default function HomePage() {
                                       <td className="fw-medium">{doc.recording_number || "-"}</td>
                                       <td>{doc.recording_date || "-"}</td>
                                       <td className="fw-medium">{row.original_principal_balance || "-"}</td>
+                                      <td><a href={row.document_url} target="_blank" rel="noopener noreferrer" style={{color: '#0066cc', textDecoration: 'none'}}>{row.document_url ? 'Link' : '-'}</a></td>
                                     </>
                                   ) : isSantaCruzView ? (
                                     <>
                                       <td>{row.document_id || "-"}</td>
                                       <td>{row.recording_number || "-"}</td>
                                       <td>{row.document_type || "-"}</td>
-                                      <td>{row.parcel_id || "-"}</td>
                                       <td>{row.grantors || "-"}</td>
                                       <td>{row.grantees || "-"}</td>
                                       <td>{row.trustor || "-"}</td>
                                       <td>{row.principal_amount || "-"}</td>
-                                      <td>{row.property_address || "-"}</td>
+                                      <td>{getDisplayAddress(row)}</td>
                                     </>
                                   ) : (
                                     <>

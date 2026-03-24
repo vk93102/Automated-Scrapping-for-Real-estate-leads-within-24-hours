@@ -851,10 +851,30 @@ def run_lapaz_pipeline(
 # Shared implementation override (keeps backward-compatible module API)
 from greenlee import extractor as _base  # noqa: E402
 
+LAPAZ_LLM_SYSTEM_PROMPT_LENIENT = """
+You are an expert data-extraction assistant for recorded real estate documents in La Paz County, AZ.
+
+Goal: extract key lead fields from OCR/detail text and return a single valid JSON object.
+
+Output requirements:
+- Return ONLY a JSON object (no prose, no markdown).
+- Always include EXACTLY these keys:
+    trustor, trustee, beneficiary, principalAmount, propertyAddress, grantors, grantees, confidenceNote
+
+Guidance (LENIENT):
+- Do NOT enforce minimum principal amount thresholds (do not discard small values).
+- If a value is present but messy/partial, return the best-effort raw value (do not over-sanitize).
+- If a street address is not present, you may return a parcel/APN/lot/legal-location string as propertyAddress.
+- Use NOT_FOUND only when the value truly does not appear.
+- grantors/grantees must be arrays of strings (use [] if none).
+- confidenceNote should be machine-parsable: list all string fields set to NOT_FOUND as "NOT_FOUND:<field1>,<field2>"; otherwise "".
+""".strip()
+
 _base.COUNTY_LABEL = "LA PAZ"
 _base.COUNTY_DISPLAY = "La Paz"
 _base.OUTPUT_DIR = OUTPUT_DIR
 _base.STORAGE_STATE_PATH = STORAGE_STATE_PATH
+_base.COUNTY_LLM_SYSTEM_PROMPT = LAPAZ_LLM_SYSTEM_PROMPT_LENIENT
 
 DEFAULT_DOCUMENT_TYPES = _base.DEFAULT_DOCUMENT_TYPES
 CSV_FIELDS = _base.CSV_FIELDS

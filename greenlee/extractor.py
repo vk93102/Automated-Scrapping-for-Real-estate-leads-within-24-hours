@@ -612,20 +612,42 @@ SECTION 5 — ABSOLUTE OUTPUT REQUIREMENTS
 _NUMERIC_AMOUNT_RE = re.compile(r"^\d+(?:\.\d{1,2})?$")
 
 
+def _strict_valuation_disabled() -> bool:
+    env_key = _county_env_key()
+    candidates = [
+        "DISABLE_STRICT_VALUATION",
+        f"{env_key}_DISABLE_STRICT_VALUATION",
+        f"{env_key.replace('_', '')}_DISABLE_STRICT_VALUATION",
+    ]
+    for k in candidates:
+        if str(os.getenv(k, "")).strip() == "1":
+            return True
+    return False
+
+
 def _normalize_principal_amount_numeric(value: str) -> str:
     """Return numeric-only principal amount string or empty string if invalid."""
     s = str(value or "").strip()
     if not s or s.upper() == "NOT_FOUND" or s == "NOT_FOUND":
         return ""
     s = re.sub(r"[,$\s]", "", s)
-    if not s or not _NUMERIC_AMOUNT_RE.match(s):
+    if not s:
         return ""
+
+    if not _NUMERIC_AMOUNT_RE.match(s):
+        # Lenient mode: keep non-numeric raw values (e.g., 'No monetary consideration')
+        # instead of forcing NOT_FOUND.
+        return "" if not _strict_valuation_disabled() else str(value or "").strip()
+
     try:
         val = float(s)
     except Exception:
+        return "" if not _strict_valuation_disabled() else str(value or "").strip()
+
+    # Strict mode previously dropped values < 1000.00; lenient mode keeps them.
+    if (not _strict_valuation_disabled()) and val < 1000:
         return ""
-    if val < 1000:
-        return ""
+
     return f"{val:.2f}".rstrip("0").rstrip(".")
 
 
@@ -1637,6 +1659,71 @@ def sanitize_property_address(value: str) -> str:
     return v
 
 
+def _county_env_key() -> str:
+    return re.sub(r"[^A-Z0-9]+", "_", str(COUNTY_LABEL or "").upper()).strip("_") or "COUNTY"
+
+
+def _sanitization_disabled() -> bool:
+    """Whether to bypass borrower/address sanitization.
+
+    Useful for counties where you prefer raw extraction without aggressive cleanup.
+    """
+    env_key = _county_env_key()
+    candidates = [
+        "DISABLE_SANITIZATION",
+        f"{env_key}_DISABLE_SANITIZATION",
+        # Friendly aliases used by some runners.
+        f"{env_key.replace('_', '')}_DISABLE_SANITIZATION",
+    ]
+    for k in candidates:
+        if str(os.getenv(k, "")).strip() == "1":
+            return True
+    return False
+
+
+def _llm_regex_fallback_enabled() -> bool:
+    """Whether to allow regex fallback even when LLM is enabled.
+
+    Some counties benefit from hybrid extraction for property addresses when
+    the LLM returns only parcel/APN or misses the street address.
+    """
+    env_key = _county_env_key()
+    candidates = [
+        "LLM_REGEX_FALLBACK",
+        f"{env_key}_LLM_REGEX_FALLBACK",
+        f"{env_key.replace('_', '')}_LLM_REGEX_FALLBACK",
+    ]
+    for k in candidates:
+        if str(os.getenv(k, "")).strip() == "1":
+            return True
+    return False
+
+
+def _maybe_sanitize_property_address(value: str) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not raw or raw.upper() == "NOT_FOUND":
+        return ""
+
+    if _sanitization_disabled():
+        # Lenient cleanup: keep the address fragment, but do not apply strict
+        # word/length caps that may blank valid rural addresses.
+        frag = _extract_relevant_address_fragment(raw) or raw
+        frag = re.sub(
+            r"^(?:property\s+address|situs\s+address|premises\s+address|commonly\s+known\s+as|property\s+located\s+at|located\s+at)\s*[:\-]\s*",
+            "",
+            frag,
+            flags=re.I,
+        ).strip(" ,;:-")
+        frag = re.split(
+            r"\b(?:APN|ASSESSOR(?:'S)?\s+PARCEL|REQUESTED\s+BY|WHEN\s+RECORDED|TOGETHER\s+WITH|THIS\s+SECURITY\s+INSTRUMENT|LEGAL\s+DESCRIPTION|RECORDING\s+FEE)\b",
+            frag,
+            maxsplit=1,
+            flags=re.I,
+        )[0].strip(" ,;:-")
+        return re.sub(r"\s+", " ", frag).strip(" ,;:-")
+    return sanitize_property_address(value)
+
+
 def _address_quality_score(value: str) -> int:
     v = str(value or "")
     if not v:
@@ -1657,7 +1744,7 @@ def _choose_best_property_address(*candidates: str) -> str:
     best = ""
     best_score = -1
     for raw in candidates:
-        cleaned = sanitize_property_address(raw)
+        cleaned = _maybe_sanitize_property_address(raw)
         if not cleaned:
             continue
         score = _address_quality_score(cleaned)
@@ -1683,7 +1770,7 @@ def _regex_address(text: str) -> str:
     ]
 
     def _clean_candidate(val: str) -> str:
-        v = sanitize_property_address(val)
+        v = _maybe_sanitize_property_address(val)
         if not v:
             return ""
         if any(re.search(e, v, re.I) for e in exclude):
@@ -1959,7 +2046,7 @@ def _hosted_extract_fields_from_document(
         trustee = str(fields.get("trustee") or "").strip()
         beneficiary = str(fields.get("beneficiary") or "").strip()
         property_address_raw = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
-        property_address = sanitize_property_address(property_address_raw) or ""
+        property_address = _maybe_sanitize_property_address(property_address_raw) or ""
         principal_amount_raw = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
         principal_amount = _normalize_principal_amount_numeric(principal_amount_raw) or ""
 
@@ -2078,7 +2165,7 @@ def _hosted_extract_fields_from_text(
     trustee = str(fields.get("trustee") or "").strip()
     beneficiary = str(fields.get("beneficiary") or "").strip()
     property_address_raw = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
-    property_address = sanitize_property_address(property_address_raw) or ""
+    property_address = _maybe_sanitize_property_address(property_address_raw) or ""
     principal_amount_raw = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
     principal_amount = _normalize_principal_amount_numeric(principal_amount_raw) or ""
 
@@ -2206,6 +2293,17 @@ def sanitize_borrower_name(value: str) -> str:
     return v
 
 
+def _maybe_sanitize_borrower_name(value: str) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "")).strip(" |:;,-")
+    if not raw or raw.upper() == "NOT_FOUND":
+        return ""
+    if _sanitization_disabled():
+        # Lenient cleanup: avoid truncation/splitting, but remove obvious role labels.
+        raw = re.sub(r"^(?:trustor|borrower|mortgagor)\s*[:\-]\s*", "", raw, flags=re.I).strip(" |:;,-")
+        return raw
+    return sanitize_borrower_name(value)
+
+
 def _borrower_quality_score(value: str) -> int:
     v = str(value or "")
     if not v:
@@ -2224,7 +2322,7 @@ def _choose_best_borrower_name(*candidates: str) -> str:
     best = ""
     best_score = -1
     for raw in candidates:
-        cleaned = sanitize_borrower_name(raw)
+        cleaned = _maybe_sanitize_borrower_name(raw)
         if not cleaned:
             continue
         score = _borrower_quality_score(cleaned)
@@ -2237,7 +2335,7 @@ def _choose_best_borrower_name(*candidates: str) -> str:
 def _safe_filtered_party(value: str) -> str:
     """Return filtered party name when valid, otherwise keep trimmed original."""
     raw = _normalise_party(value)
-    clean = sanitize_borrower_name(raw)
+    clean = _maybe_sanitize_borrower_name(raw)
     return clean or raw
 
 
@@ -2288,10 +2386,10 @@ def enrich_record(
         record["analysisError"] = f"detail fetch failed: {e}"
         return record
 
-    detail_address = sanitize_property_address(detail.get("propertyAddress", ""))
+    detail_address = _maybe_sanitize_property_address(detail.get("propertyAddress", ""))
     if detail_address:
         detail["propertyAddress"] = detail_address
-    detail_trustor = sanitize_borrower_name(detail.get("trustor", ""))
+    detail_trustor = _maybe_sanitize_borrower_name(detail.get("trustor", ""))
     if detail_trustor:
         detail["trustor"] = detail_trustor
 
@@ -2354,9 +2452,9 @@ def enrich_record(
             for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                 llm_val = (llm.get(key) or "").strip()
                 if key == "trustor":
-                    llm_val = sanitize_borrower_name(llm_val)
+                    llm_val = _maybe_sanitize_borrower_name(llm_val)
                 if key == "propertyAddress":
-                    llm_val = sanitize_property_address(llm_val)
+                    llm_val = _maybe_sanitize_property_address(llm_val)
                 if llm_val:
                     record[key] = llm_val
 
@@ -2375,9 +2473,14 @@ def enrich_record(
             )
             record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
             record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
+            regex_addr = ""
+            if _llm_regex_fallback_enabled():
+                merged_for_addr = (str(hosted_ocr_text or "") + "\n" + str(detail.get("rawText", "") or "")).strip()
+                regex_addr = _regex_address(merged_for_addr)
             record["propertyAddress"] = _choose_best_property_address(
                 detail_address,
                 record.get("propertyAddress", ""),
+                regex_addr,
             )
 
             manual, reasons, summary, context = _compute_manual_review(record, merged_text=detail.get("rawText", ""))
@@ -2414,9 +2517,9 @@ def enrich_record(
                         for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                             llm_val = (llm.get(key) or "").strip()
                             if key == "trustor":
-                                llm_val = sanitize_borrower_name(llm_val)
+                                llm_val = _maybe_sanitize_borrower_name(llm_val)
                             if key == "propertyAddress":
-                                llm_val = sanitize_property_address(llm_val)
+                                llm_val = _maybe_sanitize_property_address(llm_val)
                             if llm_val:
                                 record[key] = llm_val
                     except Exception as inner_e:
@@ -2496,9 +2599,9 @@ def enrich_record(
             for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                 llm_val = (llm.get(key) or "").strip()
                 if key == "trustor":
-                    llm_val = sanitize_borrower_name(llm_val)
+                    llm_val = _maybe_sanitize_borrower_name(llm_val)
                 if key == "propertyAddress":
-                    llm_val = sanitize_property_address(llm_val)
+                    llm_val = _maybe_sanitize_property_address(llm_val)
                 if llm_val:
                     record[key] = llm_val
         except Exception as e:
@@ -2521,9 +2624,9 @@ def enrich_record(
             for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                 llm_val = (llm.get(key) or "").strip()
                 if key == "propertyAddress":
-                    llm_val = sanitize_property_address(llm_val)
+                    llm_val = _maybe_sanitize_property_address(llm_val)
                 if key == "trustor":
-                    llm_val = sanitize_borrower_name(llm_val)
+                    llm_val = _maybe_sanitize_borrower_name(llm_val)
                 if llm_val:
                     record[key] = llm_val
 
@@ -2533,6 +2636,11 @@ def enrich_record(
                 record["grantors"] = " | ".join(_normalise_party(x) for x in llm_grantors if str(x).strip())
             if isinstance(llm_grantees, list) and llm_grantees:
                 record["grantees"] = " | ".join(_normalise_party(x) for x in llm_grantees if str(x).strip())
+
+            # Optional hybrid fallback for address when LLM misses street address.
+            if _llm_regex_fallback_enabled():
+                if not str(record.get("propertyAddress", "") or "").strip() or str(record.get("propertyAddress", "")).strip().upper() == "NOT_FOUND":
+                    record["propertyAddress"] = _regex_address(merged) or record.get("propertyAddress", "")
         except Exception as e:
             record["groqError"] = str(e)
 
@@ -2584,8 +2692,19 @@ def enrich_record(
             _regex_address(merged),
         )
 
+    # Optional hybrid fallback: include regex address even when LLM is enabled.
+    if llm_enabled and _llm_regex_fallback_enabled():
+        record["propertyAddress"] = _choose_best_property_address(
+            detail_address,
+            record.get("propertyAddress", ""),
+            _regex_address(merged),
+        )
+
     # Enforce final output constraints.
-    record["principalAmount"] = _normalize_principal_amount_numeric(record.get("principalAmount", "")) or "NOT_FOUND"
+    if _strict_valuation_disabled():
+        record["principalAmount"] = str(record.get("principalAmount", "") or "").strip() or "NOT_FOUND"
+    else:
+        record["principalAmount"] = _normalize_principal_amount_numeric(record.get("principalAmount", "")) or "NOT_FOUND"
 
     # Santa Cruz: parcel-id-only "addresses" are not usable as property addresses.
     if str(COUNTY_LABEL or "").strip().upper() == "SANTA CRUZ":
@@ -2593,7 +2712,10 @@ def enrich_record(
         if re.match(r"^\s*parcel\s*id\b", pa, flags=re.I):
             record["propertyAddress"] = ""
 
-    record["propertyAddress"] = sanitize_property_address(record.get("propertyAddress", "")) or "NOT_FOUND"
+    if _sanitization_disabled():
+        record["propertyAddress"] = re.sub(r"\s+", " ", str(record.get("propertyAddress", "") or "")).strip() or "NOT_FOUND"
+    else:
+        record["propertyAddress"] = sanitize_property_address(record.get("propertyAddress", "")) or "NOT_FOUND"
     for key in ["trustor", "trustee", "beneficiary"]:
         v = str(record.get(key, "") or "").strip()
         record[key] = v if v else "NOT_FOUND"

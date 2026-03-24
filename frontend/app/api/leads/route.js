@@ -23,11 +23,18 @@ function getSinceIso(range) {
   return d.toISOString();
 }
 
+function parseLimit(raw) {
+  const n = Number.parseInt(String(raw ?? ""), 10);
+  if (!Number.isFinite(n) || n <= 0) return 10000;
+  return Math.min(n, 10000);
+}
+
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
-    const range = searchParams.get("range") || "all";
     const county = searchParams.get("county") || "maricopa";
+    const range = searchParams.get("range") || (county === "maricopa" ? "day" : "all");
+    const limit = parseLimit(searchParams.get("limit"));
     const sinceIso = getSinceIso(range);
 
     let query = "";
@@ -94,7 +101,7 @@ export async function GET(request) {
         FROM ${tableName}
         WHERE ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
         ORDER BY created_at DESC
-        LIMIT 10000;
+        LIMIT $2;
       `;
     } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(county)) {
       const tableMap = {
@@ -174,7 +181,7 @@ export async function GET(request) {
         FROM ${tableName}
         WHERE ${whereClause}
         ORDER BY created_at DESC
-        LIMIT 10000;
+        LIMIT $2;
       `;
     } else {
       query = `
@@ -190,6 +197,10 @@ export async function GET(request) {
           NULL as trustor,
           NULL as trustee,
           NULL as beneficiary,
+          NULL as manual_review,
+          NULL as manual_review_reasons,
+          NULL as manual_review_summary,
+          NULL as manual_review_context,
           d.created_at,
           d.updated_at,
           p.trustor_1_full_name,
@@ -201,21 +212,22 @@ export async function GET(request) {
           p.sale_date,
           p.original_principal_balance,
           p.original_principal_balance as principal_amount,
-          NULL as detail_url,
+          p.document_url as detail_url,
+          p.document_url,
           NULL as image_urls,
           NULL as ocr_method,
           NULL::integer as ocr_chars,
           NULL::boolean as used_groq,
           p.llm_model
-        FROM documents d
-        LEFT JOIN properties p ON p.document_id = d.id
+        FROM maricopa.documents d
+        LEFT JOIN maricopa.properties p ON p.document_id = d.id
         WHERE ($1::timestamptz IS NULL OR d.created_at >= $1::timestamptz)
         ORDER BY d.created_at DESC
-        LIMIT 10000;
+        LIMIT $2;
       `;
     }
 
-    const { rows } = await pool.query(query, [sinceIso]);
+    const { rows } = await pool.query(query, [sinceIso, limit]);
 
     const formattedRows = rows.map(r => {
       // Extract parcel_id from manual_review_context if present
@@ -236,39 +248,40 @@ export async function GET(request) {
         document_type: r.document_type || null,
         parcel_id: parcel_id || "NOT_FOUND",
         manual_review: r.manual_review ?? null,
-      manual_review_reasons: r.manual_review_reasons ?? null,
-      manual_review_summary: r.manual_review_summary ?? null,
-      manual_review_context: r.manual_review_context ?? null,
-      trustor_1_full_name: r.trustor_1_full_name || null,
-      trustor_2_full_name: r.trustor_2_full_name || null,
-      grantors: r.grantors || null,
-      grantees: r.grantees || null,
-      trustor: r.trustor || null,
-      trustee: r.trustee || null,
-      beneficiary: r.beneficiary || null,
-      property_address: r.property_address_display || r.property_address || null,
-      address_city: r.address_city || null,
-      address_state: r.address_state || null,
-      address_zip: r.address_zip || null,
-      sale_date: r.sale_date || null,
-      original_principal_balance: r.original_principal_balance || null,
-      principal_amount: r.principal_amount || null,
-      detail_url: r.detail_url || null,
-      image_urls: r.image_urls || null,
-      ocr_method: r.ocr_method || null,
-      ocr_chars: r.ocr_chars ?? null,
-      used_groq: r.used_groq ?? null,
-      llm_model: r.llm_model || null,
-      created_at: r.created_at,
-      updated_at: r.updated_at,
-      documents: {
-        recording_number: r.recording_number,
-        recording_date: r.recording_date,
-        document_type: r.document_type,
+        manual_review_reasons: r.manual_review_reasons ?? null,
+        manual_review_summary: r.manual_review_summary ?? null,
+        manual_review_context: r.manual_review_context ?? null,
+        trustor_1_full_name: r.trustor_1_full_name || null,
+        trustor_2_full_name: r.trustor_2_full_name || null,
         grantors: r.grantors || null,
         grantees: r.grantees || null,
+        trustor: r.trustor || null,
+        trustee: r.trustee || null,
+        beneficiary: r.beneficiary || null,
+        property_address: r.property_address_display || r.property_address || null,
+        address_city: r.address_city || null,
+        address_state: r.address_state || null,
+        address_zip: r.address_zip || null,
+        sale_date: r.sale_date || null,
+        original_principal_balance: r.original_principal_balance || null,
+        principal_amount: r.principal_amount || null,
+        detail_url: r.detail_url || null,
+        document_url: r.document_url || null,
+        image_urls: r.image_urls || null,
+        ocr_method: r.ocr_method || null,
+        ocr_chars: r.ocr_chars ?? null,
+        used_groq: r.used_groq ?? null,
+        llm_model: r.llm_model || null,
         created_at: r.created_at,
-      },
+        updated_at: r.updated_at,
+        documents: {
+          recording_number: r.recording_number,
+          recording_date: r.recording_date,
+          document_type: r.document_type,
+          grantors: r.grantors || null,
+          grantees: r.grantees || null,
+          created_at: r.created_at,
+        },
       };
     });
 
