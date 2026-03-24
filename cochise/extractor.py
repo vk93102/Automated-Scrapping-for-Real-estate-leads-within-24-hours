@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from greenlee import extractor as _base
@@ -483,6 +484,35 @@ SECTION 5 — ABSOLUTE OUTPUT REQUIREMENTS
 
 """
 
+
+_COCHISE_UNSANITIZED_PROMPT = """
+You are an expert AI assistant specializing in structured data extraction from real estate legal documents recorded in Cochise County, AZ.
+
+Return exactly ONE JSON object (no markdown, no prose) with this schema:
+{
+  \"trustor\": <string>,
+  \"trustee\": <string>,
+  \"beneficiary\": <string>,
+  \"principalAmount\": <string>,
+  \"propertyAddress\": <string>,
+  \"grantors\": <array of strings>,
+  \"grantees\": <array of strings>,
+  \"confidenceNote\": <string>
+}
+
+Rules:
+- Do NOT sanitize/normalize/truncate values. Preserve the text as it appears in the document (aside from trimming leading/trailing whitespace).
+- If a string field is missing, set it to \"NOT_FOUND\".
+- For array fields (grantors, grantees), use [] when none found.
+- confidenceNote MUST be either "" (when all string fields found) or "NOT_FOUND:<field1>,<field2>" listing every missing string field.
+- Never hallucinate; do not infer values not explicitly present.
+"""
+
+
+def _use_unsanitized_prompt() -> bool:
+    raw = str(os.environ.get("COCHISE_NO_SANITIZATION", "") or os.environ.get("COCHISE_UNSANITIZED", "")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _base.OUTPUT_DIR = OUTPUT_DIR
@@ -493,6 +523,10 @@ CSV_FIELDS = _base.CSV_FIELDS
 
 
 def run_cochise_pipeline(*args, **kwargs):
+  # Allow a relaxed extraction mode with no post-style sanitization/truncation.
+  # This is controlled at runtime so callers can toggle via env vars.
+  if _use_unsanitized_prompt():
+    _base.COUNTY_LLM_SYSTEM_PROMPT = _COCHISE_UNSANITIZED_PROMPT
     res = _base.run_greenlee_pipeline(*args, **kwargs)
 
     csv_path = Path(res.get("csv_path", ""))

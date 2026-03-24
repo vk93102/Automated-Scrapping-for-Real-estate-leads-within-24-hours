@@ -282,10 +282,12 @@ def main() -> None:
     elif llm_endpoint and not llm_key:
         _log("info: using hosted LLM endpoint (GROQ_LLM_ENDPOINT_URL); GROQ_API_KEY not required")
 
-    p = argparse.ArgumentParser(description="Run Cochise pipeline on interval and upsert into DB")
-    p.add_argument("--lookback-days", type=int, default=7)
+    p = argparse.ArgumentParser(description="Run Cochise pipeline once and upsert into DB")
+    p.add_argument("--lookback-days", type=int, default=14)
     p.add_argument("--workers", type=int, default=3)
-    p.add_argument("--once", action="store_true")
+    # Backwards compat: script used to loop forever unless --once.
+    # We now always run once for faster, predictable execution.
+    p.add_argument("--once", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     p.add_argument("--write-files", action="store_true", help="Write CSV/JSON artifacts under cochise/output")
     p.add_argument("--db-url", default="", help="Override DATABASE_URL (avoid editing .env)")
@@ -293,6 +295,11 @@ def main() -> None:
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     p.add_argument("--ocr-limit", type=int, default=0, help="Max records to OCR (0=all)")
+    p.add_argument(
+        "--no-sanitization",
+        action="store_true",
+        help="Disable LLM prompt sanitization/truncation rules (preserve extracted text as-is)",
+    )
     args = p.parse_args()
 
     doc_types: list[str] = sorted({str(x).strip() for x in (args.doc_types or []) if str(x).strip()})
@@ -306,25 +313,26 @@ def main() -> None:
         os.environ["COCHISE_DB_URL"] = str(args.db_url).strip()
     if args.skip_db:
         os.environ["COCHISE_SKIP_DB"] = "1"
+    if args.no_sanitization:
+        os.environ["COCHISE_NO_SANITIZATION"] = "1"
 
     _log(
-        f"starting cochise interval runner "
-        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
+        f"starting cochise runner "
+        f"lookback_days={args.lookback_days} workers={args.workers}"
     )
 
-    while True:
-        started = datetime.now()
-        try:
-            total, ins, upd, llm_used = _run_once(doc_types, args.workers, args.lookback_days, args.strict_llm, args.ocr_limit)
-            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
-        except Exception as exc:
-            _log(f"run failed: {exc}")
-
-        if args.once:
-            break
-
-        _log(f"sleeping before next run")
-        time.sleep(60)
+    try:
+        total, ins, upd, llm_used = _run_once(
+            doc_types,
+            args.workers,
+            args.lookback_days,
+            args.strict_llm,
+            args.ocr_limit,
+        )
+        _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+    except Exception as exc:
+        _log(f"run failed: {exc}")
+        raise
 
 
 if __name__ == "__main__":
