@@ -18,41 +18,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _base.OUTPUT_DIR = OUTPUT_DIR
 _base.STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
 
-# Santa Cruz-specific detailed LLM extraction prompt (applies via shared Greenlee base extractor).
-_base.COUNTY_LLM_SYSTEM_PROMPT = """
-Extract Santa Cruz recorder document fields from OCR/detail text.
-
-Return STRICT JSON object with keys exactly:
-- trustor (string)
-- trustee (string)
-- beneficiary (string)
-- principalAmount (string)
-- propertyAddress (string)
-- grantors (array of strings)
-- grantees (array of strings)
-- confidenceNote (string)
-
-NAME RULES:
-1) Return only ONE primary real name/entity for trustor/trustee/beneficiary.
-2) If multiple names/entities appear, keep first primary one only.
-3) Strip descriptors: "as trustee", "dba", "fka", "et al", role boilerplate, mailing text.
-4) Keep valid business suffixes only when part of legal name: LLC, INC, CORP, COMPANY, LTD, TRUST, BANK, ASSOCIATION.
-
-ADDRESS RULES:
-1) propertyAddress must be the actual US property street address (number + street + optional city/state/zip).
-2) Exclude APN/parcel-only, lot/block-only, subdivision-only, legal description, and recording boilerplate.
-3) If multiple addresses are present, choose property/situs address only.
-
-AMOUNT RULES:
-1) principalAmount format must be "$123,456.78".
-2) Only return principalAmount when >= $1,000.
-
-NOT_FOUND RULE:
-If not confidently found, use "NOT_FOUND" for string fields and [] for arrays.
-Set confidenceNote to "NOT_FOUND:<comma-separated-field-names>".
-
-Do not guess. Do not invent. Return JSON only.
-""".strip()
+# Inherit the unified LLM extraction prompt and checks from the shared Greenlee base.
 
 DEFAULT_DOCUMENT_TYPES = _base.DEFAULT_DOCUMENT_TYPES
 CSV_FIELDS = _base.CSV_FIELDS
@@ -62,18 +28,31 @@ def run_santacruz_pipeline(*args, **kwargs):
     """Run the recorder pipeline for Santa Cruz County, AZ."""
     res = _base.run_greenlee_pipeline(*args, **kwargs)
 
-    # Rename output artifacts from greenlee_* to santacruz_* in this county folder.
-    csv_path = Path(res.get("csv_path", ""))
-    json_path = Path(res.get("json_path", ""))
+    # Interval runners call with write_output_files=False; the shared pipeline returns empty paths.
+    # In that case, skip any filesystem renames/rewrites (runner only needs `records`).
+    csv_path_s = str(res.get("csv_path", "") or "").strip()
+    json_path_s = str(res.get("json_path", "") or "").strip()
+    if not csv_path_s and not json_path_s:
+        if isinstance(res.get("summary"), dict):
+            res["summary"]["county"] = "Santa Cruz County, AZ"
+        return res
 
-    ts = Path(csv_path).stem.replace("greenlee_leads_", "") if csv_path else ""
+    # Rename output artifacts from greenlee_* to santacruz_* in this county folder.
+    csv_path = Path(csv_path_s) if csv_path_s else None
+    json_path = Path(json_path_s) if json_path_s else None
+
+    ts = ""
+    if csv_path and csv_path.name:
+        ts = csv_path.stem.replace("greenlee_leads_", "")
+    elif json_path and json_path.name:
+        ts = json_path.stem.replace("greenlee_leads_", "")
     if ts:
         new_csv = OUTPUT_DIR / f"santacruz_leads_{ts}.csv"
         new_json = OUTPUT_DIR / f"santacruz_leads_{ts}.json"
-        if csv_path.exists():
+        if csv_path and csv_path.is_file():
             csv_path.rename(new_csv)
             res["csv_path"] = str(new_csv)
-        if json_path.exists():
+        if json_path and json_path.is_file():
             json_path.rename(new_json)
             res["json_path"] = str(new_json)
 
@@ -82,8 +61,11 @@ def run_santacruz_pipeline(*args, **kwargs):
         res["summary"]["county"] = "Santa Cruz County, AZ"
 
     # Keep written JSON metadata aligned with Santa Cruz naming/metadata.
-    json_out = Path(res.get("json_path", ""))
-    if json_out.exists():
+    json_out_s = str(res.get("json_path", "") or "").strip()
+    if json_out_s:
+        json_out = Path(json_out_s)
+        if not json_out.is_file():
+            return res
         try:
             payload = json.loads(json_out.read_text(encoding="utf-8"))
             if isinstance(payload.get("meta"), dict):

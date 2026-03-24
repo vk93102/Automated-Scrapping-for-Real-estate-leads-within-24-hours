@@ -878,14 +878,14 @@ def api_v1_job_results(job_id: str, cities: Optional[str] = None) -> Response:
 )
 def api_v1_health() -> dict:
     """Returns server health and Supabase DB connectivity status."""
-    import psycopg  # local import to avoid startup cost
+    from .db_postgres import connect as db_connect  # local import to avoid startup cost
 
     db_ok = False
     db_error: Optional[str] = None
     db_url = os.environ.get("DATABASE_URL", "").strip()
     if db_url:
         try:
-            conn = psycopg.connect(db_url, connect_timeout=5)
+            conn = db_connect(db_url)
             conn.close()
             db_ok = True
         except Exception as exc:
@@ -925,10 +925,12 @@ def api_v1_llm_extract(
         req.ocr_text,
         fallback_to_rule_based=req.fallback_to_rule_based,
     )
+
+    from .llm_extract import _MODEL as _LLM_MODEL
     return {
         "ok": True,
         "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "model": _LLM_MODEL,
         "fields": asdict(fields),
     }
 
@@ -965,10 +967,12 @@ def api_v1_llm_extract_document(
         ocr_text,
         fallback_to_rule_based=req.fallback_to_rule_based,
     )
+
+    from .llm_extract import _MODEL as _LLM_MODEL
     return {
         "ok": True,
         "provider": "groq",
-        "model": "llama-3.1-8b-instant",
+        "model": _LLM_MODEL,
         "recording_number": req.recording_number,
         "ocr_chars": len(ocr_text),
         "ocr_text": ocr_text,

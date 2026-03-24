@@ -116,6 +116,15 @@ def build_report(records, start_date, end_date):
     
     # Build report
     all_records = list(docs_map.values())
+
+    from collections import Counter
+
+    model_counts = Counter(
+        (p.get("llm_model") or "")
+        for v in all_records
+        for p in (v.get("properties") or [])
+        if isinstance(p, dict)
+    )
     
     report = {
         "execution": {
@@ -132,10 +141,7 @@ def build_report(records, start_date, end_date):
             "documents_with_properties": sum(1 for v in all_records if v['properties']),
             "documents_without_properties": sum(1 for v in all_records if not v['properties']),
             "failed_documents": sum(1 for v in all_records if v['document']['failed']),
-            "llm_models": {
-                "llama-3.1-8b-instant": sum(1 for v in all_records for p in v['properties'] if p['llm_model'] == 'llama-3.1-8b-instant'),
-                "llama-3.1-8b-instant-metadata-fallback": sum(1 for v in all_records for p in v['properties'] if p['llm_model'] == 'llama-3.1-8b-instant-metadata-fallback')
-            }
+            "llm_models": dict(model_counts.most_common())
         },
         "storage_status": {
             "database": "postgresql-supabase",

@@ -270,16 +270,14 @@ def main() -> None:
         _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
 
     p = argparse.ArgumentParser(description="Run Gila pipeline on interval and upsert into DB")
-    p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
-        f"starting gila interval runner interval_minutes={args.interval_minutes} "
+        f"starting gila interval runner "
         f"lookback_days={args.lookback_days} once={args.once}"
     )
 
@@ -294,10 +292,8 @@ def main() -> None:
         if args.once:
             break
 
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+        _log(f"sleeping before next run")
+        time.sleep(60)
 
 
 if __name__ == "__main__":

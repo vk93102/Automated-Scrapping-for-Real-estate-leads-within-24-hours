@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 from typing import Optional, Any, Dict, Iterable
+import os
+import re
 
 import psycopg
 
@@ -10,8 +12,38 @@ from .maricopa_api import DocumentMetadata
 import json
 
 
-def ensure_schema(conn: psycopg.Connection) -> None:
+def _schema_name() -> str:
+    raw = (os.environ.get("MARICOPA_DB_SCHEMA") or "maricopa").strip()
+    if not raw:
+        return "maricopa"
+    # Basic hardening: only allow simple identifiers.
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", raw):
+        raise ValueError(f"Invalid MARICOPA_DB_SCHEMA: {raw!r}")
+    return raw
+
+
+def _apply_search_path(conn: psycopg.Connection) -> None:
+    schema = _schema_name()
     with conn.cursor() as cur:
+        cur.execute(f"create schema if not exists {schema};")
+        cur.execute(f"set search_path to {schema}, public;")
+    conn.commit()
+
+
+def ensure_schema(conn: psycopg.Connection) -> None:
+    schema = _schema_name()
+    # Ensure schema exists and that unqualified table names resolve there.
+    with conn.cursor() as cur:
+        cur.execute(f"create schema if not exists {schema};")
+        cur.execute(f"set search_path to {schema}, public;")
+    conn.commit()
+
+    with conn.cursor() as cur:
+        # Some managed Postgres setups enforce a low `statement_timeout` which can
+        # cancel DDL (especially ALTER TABLE) even on healthy databases.
+        # Keep this scoped to the current transaction.
+        cur.execute("set local statement_timeout = '5min';")
+
         # Minimal schema: `documents` and `cron_jobs`.
         cur.execute(
             """
@@ -65,6 +97,7 @@ def ensure_schema(conn: psycopg.Connection) -> None:
               recording_number           text,
               recording_date             text,
               document_type              text,
+                            document_url               text,
               trustor_1_full_name        text,
               trustor_1_first_name       text,
               trustor_1_last_name        text,
@@ -86,15 +119,29 @@ def ensure_schema(conn: psycopg.Connection) -> None:
             """
         )
 
-        # Add new columns if they don't exist (for existing tables)
+        # Backward-compat: add columns only if missing.
+        # Avoid running ALTER TABLE unconditionally since it requires stronger
+        # locks and is the most common source of timeouts.
         cur.execute(
             """
-            alter table properties
-            add column if not exists recording_number text,
-            add column if not exists recording_date text,
-            add column if not exists document_type text;
+            select column_name
+            from information_schema.columns
+                        where table_schema = %s
+              and table_name = 'properties'
+              and column_name in ('recording_number', 'recording_date', 'document_type', 'document_url');
             """
+                        ,
+                        (schema,),
         )
+        existing_cols = {str(r[0]) for r in (cur.fetchall() or [])}
+        missing_cols = [
+            c
+            for c in ("recording_number", "recording_date", "document_type", "document_url")
+            if c not in existing_cols
+        ]
+        if missing_cols:
+            alter_parts = ",\n".join([f"add column if not exists {c} text" for c in missing_cols])
+            cur.execute(f"alter table properties\n{alter_parts};")
 
         # Store discovered recording numbers (raw discovery) for auditing/backfill
         cur.execute(
@@ -322,12 +369,14 @@ def upsert_properties(
     document_id: int,
     fields: ExtractedFields,
     llm_model: Optional[str] = None,
+    document_url: Optional[str] = None,
 ) -> int:
     """Insert or update extracted properties row (idempotent — safe to call on retries)."""
     d = asdict(fields)
     # Map fields to the explicit properties table columns.
     vals = (
         document_id,
+        document_url,
         d.get("trustor_1_full_name"),
         d.get("trustor_1_first_name"),
         d.get("trustor_1_last_name"),
@@ -348,26 +397,28 @@ def upsert_properties(
             """
             insert into properties (
               document_id,
+                            document_url,
               trustor_1_full_name, trustor_1_first_name, trustor_1_last_name,
               trustor_2_full_name, trustor_2_first_name, trustor_2_last_name,
               address_city, address_state, address_zip, property_address,
               sale_date, original_principal_balance, address_unit, llm_model
-            ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ) values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             on conflict (document_id) do update set
-              trustor_1_full_name = excluded.trustor_1_full_name,
-              trustor_1_first_name = excluded.trustor_1_first_name,
-              trustor_1_last_name = excluded.trustor_1_last_name,
-              trustor_2_full_name = excluded.trustor_2_full_name,
-              trustor_2_first_name = excluded.trustor_2_first_name,
-              trustor_2_last_name = excluded.trustor_2_last_name,
-              address_city = excluded.address_city,
-              address_state = excluded.address_state,
-              address_zip = excluded.address_zip,
-              property_address = excluded.property_address,
-              sale_date = excluded.sale_date,
-              original_principal_balance = excluded.original_principal_balance,
-              address_unit = excluded.address_unit,
-              llm_model = excluded.llm_model,
+                                                        document_url = coalesce(excluded.document_url, properties.document_url),
+                            trustor_1_full_name = coalesce(excluded.trustor_1_full_name, properties.trustor_1_full_name),
+                            trustor_1_first_name = coalesce(excluded.trustor_1_first_name, properties.trustor_1_first_name),
+                            trustor_1_last_name = coalesce(excluded.trustor_1_last_name, properties.trustor_1_last_name),
+                            trustor_2_full_name = coalesce(excluded.trustor_2_full_name, properties.trustor_2_full_name),
+                            trustor_2_first_name = coalesce(excluded.trustor_2_first_name, properties.trustor_2_first_name),
+                            trustor_2_last_name = coalesce(excluded.trustor_2_last_name, properties.trustor_2_last_name),
+                            address_city = coalesce(excluded.address_city, properties.address_city),
+                            address_state = coalesce(excluded.address_state, properties.address_state),
+                            address_zip = coalesce(excluded.address_zip, properties.address_zip),
+                            property_address = coalesce(excluded.property_address, properties.property_address),
+                            sale_date = coalesce(excluded.sale_date, properties.sale_date),
+                            original_principal_balance = coalesce(excluded.original_principal_balance, properties.original_principal_balance),
+                            address_unit = coalesce(excluded.address_unit, properties.address_unit),
+                            llm_model = coalesce(excluded.llm_model, properties.llm_model),
               updated_at = now()
             returning id;
             """,
@@ -456,4 +507,13 @@ def finish_pipeline_run(
 # ---------------------------------------------------------------------------
 
 def connect(database_url: str) -> psycopg.Connection:
-    return psycopg.connect(database_url)
+    conn = psycopg.connect(database_url)
+    try:
+        _apply_search_path(conn)
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+    return conn

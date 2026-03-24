@@ -59,6 +59,7 @@ WORKERS="${WORKERS:-4}"
 SLEEP_BETWEEN_DOCS="${SLEEP_BETWEEN_DOCS:-0.3}"
 PDF_MODE="${PDF_MODE:-memory}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
+DB_ONLY="${DB_ONLY:-0}"
 TZ="${TZ:-America/Phoenix}"
 export TZ
 
@@ -87,6 +88,11 @@ fi
 echo "[$(date '+%F %T')] maricopa one-shot started | days=${DAYS_WINDOW} doc_code=${DOC_CODE} workers=${WORKERS}" | tee -a "$LOG_FILE"
 echo "[$(date '+%F %T')] run start" | tee -a "$LOG_FILE"
 
+DB_ONLY_ARGS=()
+if [[ "$DB_ONLY" == "1" || "$DB_ONLY" == "true" || "$DB_ONLY" == "TRUE" ]]; then
+  DB_ONLY_ARGS+=(--db-only)
+fi
+
 EXIT_CODE=0
 "$PYTHON_BIN" -m maricopa.scraper \
   --document-code "$DOC_CODE" \
@@ -96,6 +102,7 @@ EXIT_CODE=0
   --sleep "$SLEEP_BETWEEN_DOCS" \
   --workers "$WORKERS" \
   --only-new \
+  "${DB_ONLY_ARGS[@]}" \
   --db-url "$DATABASE_URL" \
   --log-level "$LOG_LEVEL" \
   --out-json output/pipeline_latest.json \

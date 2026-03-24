@@ -31,7 +31,7 @@ def _load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ[k.strip()] = v.strip().strip('"').strip("'")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def _log(msg: str) -> None:
@@ -46,6 +46,9 @@ def _log(msg: str) -> None:
 def _db_url_with_ssl(url: str) -> str:
     u = (url or "").strip()
     if not u:
+        return u
+    host = (urlparse(u).hostname or "").strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
         return u
     if "sslmode=" in u.lower():
         return u
@@ -217,30 +220,31 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm: bool, ocr_limit: int) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
     start_date = start_day.strftime("%-m/%-d/%Y")
     end_date = today.strftime("%-m/%-d/%Y")
 
-    db_url = (os.environ.get("DATABASE_URL") or "").strip()
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is missing")
-    with _connect_db(db_url) as conn:
-        _ensure_schema(conn)
+    db_url = (os.environ.get("COCHISE_DB_URL") or os.environ.get("DATABASE_URL") or "").strip()
+    if not os.environ.get("COCHISE_SKIP_DB"):
+        if not db_url:
+            raise RuntimeError("DATABASE_URL is missing (or pass --db-url)")
+        with _connect_db(db_url) as conn:
+            _ensure_schema(conn)
 
     res = run_cochise_pipeline(
         start_date=start_date,
         end_date=end_date,
         doc_types=doc_types,
         max_pages=0,
-        ocr_limit=args.ocr_limit,
+        ocr_limit=ocr_limit,
         workers=max(1, workers),
         use_groq=True,
         headless=True,
-        verbose=False,
-        write_output_files=False,
+        verbose=bool(os.environ.get("COCHISE_VERBOSE", "")),
+        write_output_files=bool(os.environ.get("COCHISE_WRITE_FILES", "")),
     )
 
     records = res.get("records", [])
@@ -249,6 +253,10 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
         if missing:
             sample = ", ".join(x for x in missing[:10] if x)
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+    if os.environ.get("COCHISE_SKIP_DB"):
+        llm_used = sum(1 for r in records if bool(r.get("usedGroq", False)))
+        return len(records), 0, 0, llm_used
+
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
         with conn.cursor() as cur:
@@ -267,28 +275,47 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
 
 def main() -> None:
     _load_env()
-    if not (os.environ.get("GROQ_API_KEY") or "").strip():
-        _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
+    llm_endpoint = (os.environ.get("GROQ_LLM_ENDPOINT_URL") or os.environ.get("GREENLEE_LLM_ENDPOINT_URL") or "").strip()
+    llm_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not (llm_key or llm_endpoint):
+        _log("warning: neither GROQ_API_KEY nor GROQ_LLM_ENDPOINT_URL is set; LLM extraction will be disabled")
+    elif llm_endpoint and not llm_key:
+        _log("info: using hosted LLM endpoint (GROQ_LLM_ENDPOINT_URL); GROQ_API_KEY not required")
 
     p = argparse.ArgumentParser(description="Run Cochise pipeline on interval and upsert into DB")
-    p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--once", action="store_true")
+    p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
+    p.add_argument("--write-files", action="store_true", help="Write CSV/JSON artifacts under cochise/output")
+    p.add_argument("--db-url", default="", help="Override DATABASE_URL (avoid editing .env)")
+    p.add_argument("--skip-db", action="store_true", help="Skip DB upsert (still runs scraper + writes files)")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
+    p.add_argument("--ocr-limit", type=int, default=0, help="Max records to OCR (0=all)")
     args = p.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
+    doc_types: list[str] = sorted({str(x).strip() for x in (args.doc_types or []) if str(x).strip()})
+
+    # Plumb through to shared extractor without changing its signature.
+    if args.verbose:
+        os.environ["COCHISE_VERBOSE"] = "1"
+    if args.write_files:
+        os.environ["COCHISE_WRITE_FILES"] = "1"
+    if str(args.db_url or "").strip():
+        os.environ["COCHISE_DB_URL"] = str(args.db_url).strip()
+    if args.skip_db:
+        os.environ["COCHISE_SKIP_DB"] = "1"
+
     _log(
-        f"starting cochise interval runner interval_minutes={args.interval_minutes} "
+        f"starting cochise interval runner "
         f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
     )
 
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.workers, args.lookback_days, args.strict_llm)
+            total, ins, upd, llm_used = _run_once(doc_types, args.workers, args.lookback_days, args.strict_llm, args.ocr_limit)
             _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")
@@ -296,10 +323,8 @@ def main() -> None:
         if args.once:
             break
 
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+        _log(f"sleeping before next run")
+        time.sleep(60)
 
 
 if __name__ == "__main__":

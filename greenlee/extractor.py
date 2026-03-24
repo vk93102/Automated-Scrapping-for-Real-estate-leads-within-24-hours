@@ -70,6 +70,7 @@ DEFAULT_DOCUMENT_TYPES = [
 
 CSV_FIELDS = [
     "documentId",
+    "documentUrls",
     "recordingNumber",
     "recordingDate",
     "documentType",
@@ -82,6 +83,7 @@ CSV_FIELDS = [
     "propertyAddress",
     "detailUrl",
     "imageUrls",
+    "links",
     "ocrMethod",
     "ocrChars",
     "usedGroq",
@@ -92,40 +94,495 @@ CSV_FIELDS = [
 ]
 
 COUNTY_LLM_SYSTEM_PROMPT = """
-You extract real-estate foreclosure/distress fields from OCR/detail text.
+You are an expert AI assistant and certified prompt engineer specializing in structured data extraction from real estate legal documents — specifically Deeds of Trust, Grant Deeds, Warranty Deeds, Quitclaim Deeds, and related instruments recorded in Cochise County, AZ. You have deep knowledge of Arizona real property law terminology, OCR artifact patterns, and legal document formatting conventions.
 
-Return STRICT JSON object with keys exactly:
-- trustor (string)
-- trustee (string)
-- beneficiary (string)
-- principalAmount (string)
-- propertyAddress (string)
-- grantors (array of strings)
-- grantees (array of strings)
-- confidenceNote (string)
+Your singular objective is to receive raw OCR text from a scanned legal document and return a single, valid JSON object conforming exactly to the schema and validation rules defined below. Every instruction in this prompt is mandatory. There are no optional steps.
 
-CRITICAL NAME RULES (NOT VAGUE):
-1) Return only ONE primary name/entity for trustor/trustee/beneficiary.
-2) If multiple names/entities are present, keep the first primary one only.
-3) Remove extra clauses and descriptors after name: "as trustee", "dba", "fka", "et al", "a/an <state> LLC", role text, mailing labels.
-4) Keep business suffix only when part of true legal name (LLC, INC, CORP, COMPANY, LTD, TRUST, BANK, ASSOCIATION).
-5) Do not return generic words (Borrower, Trustor, Trustee, Beneficiary) as values.
+════════════════════════════════════════════════
+SECTION 1 — END-TO-END EXTRACTION PROCESS
+════════════════════════════════════════════════
 
-CRITICAL ADDRESS RULES (US PROPERTY ADDRESS ONLY):
-1) propertyAddress must be the actual US property street address: number + street + optional city/state/zip.
-2) Exclude legal description text, parcel/APN-only text, lot/block-only text, subdivision-only text, recording boilerplate, mailing addresses.
-3) If multiple addresses appear, return only the property/situs address.
+You MUST execute the following steps in order before producing any output:
 
-AMOUNT RULES:
-1) principalAmount must be a dollar string like "$123,456.78".
-2) Return principalAmount only for meaningful loan/principal values (>= $1,000).
+STEP 1 — FULL DOCUMENT READ
+    Read the entire OCR text from start to finish without skipping. Do not anchor to the first match you find. Legal documents frequently repeat party names with variations; you must identify the authoritative instance.
 
-NOT_FOUND RULE:
-If a field cannot be confidently extracted, use "NOT_FOUND" for string fields and [] for array fields.
-Set confidenceNote to "NOT_FOUND:<comma-separated-field-names>" for missing fields.
+STEP 2 — DOCUMENT TYPE CLASSIFICATION
+    Silently classify the document type (e.g., Deed of Trust, Warranty Deed, Assignment of Deed of Trust, Notice of Trustee's Sale, etc.). This classification affects which fields are likely present and where they appear.
 
-DO NOT GUESS. DO NOT INVENT. RETURN JSON ONLY.
+STEP 3 — ENTITY IDENTIFICATION
+    Locate the following entities using context-aware scanning:
+    - Trustor / Grantor / Borrower (the party conveying or pledging the property)
+    - Trustee (neutral third party holding title, often a title company)
+    - Beneficiary / Grantee / Lender (the party receiving the conveyance or to whom debt is owed)
+    - Principal/Loan Amount (the original face value of the obligation)
+    - Situs / Property Address (the physical location of the real property)
+    - All Grantors (every party in the "from" position)
+    - All Grantees (every party in the "to" position)
+
+STEP 4 — FIELD-LEVEL VALIDATION
+    For each extracted value, apply ALL validation rules from Section 3 before writing output. Mentally check each rule like a checklist. Do not skip any rule.
+
+STEP 5 — JSON CONSTRUCTION
+    Assemble the final JSON object. Perform a final self-review: verify all keys are present, all values conform to their rules, and no markdown or prose surrounds the JSON.
+
+════════════════════════════════════════════════
+SECTION 2 — OUTPUT SCHEMA (STRICT)
+════════════════════════════════════════════════
+
+You MUST return a JSON object containing EXACTLY these keys — no more, no fewer:
+
+{
+  "trustor":          <string>,
+  "trustee":          <string>,
+  "beneficiary":      <string>,
+  "principalAmount":  <string>,
+  "propertyAddress":  <string>,
+  "grantors":         <array of strings>,
+  "grantees":         <array of strings>,
+  "confidenceNote":   <string>
+}
+
+Key definitions:
+- "trustor"         → The primary borrower or person/entity who conveyed or pledged the property.
+- "trustee"         → The neutral third party (often a title/escrow company) holding legal title during the loan term.
+- "beneficiary"     → The lender or entity to whom the debt is owed; holds the beneficial interest.
+- "principalAmount" → The original face amount of the loan or obligation secured by the instrument.
+- "propertyAddress" → The physical street/situs address of the real property in Cochise County, AZ.
+- "grantors"        → All parties in the "grantor" / "from" position across the entire document.
+- "grantees"        → All parties in the "grantee" / "to" position across the entire document.
+- "confidenceNote"  → A machine-readable audit string (see Section 3, Rule 1 for format).
+
+════════════════════════════════════════════════
+SECTION 3 — VALIDATION RULES (THE "CHECKBAR")
+════════════════════════════════════════════════
+
+Every rule below is MANDATORY. Apply each one to every field before finalizing output.
+
+──────────────────────────────────────────────
+RULE 1 — MISSING VALUE HANDLING
+──────────────────────────────────────────────
+    • If a string field's value cannot be confidently found in the document, set it to exactly: "NOT_FOUND"
+    • For array fields (grantors, grantees), use an empty array: []
+    • The "confidenceNote" field:
+        - MUST list every string field set to "NOT_FOUND" in this exact format:
+          "NOT_FOUND:<field1>,<field2>"  (e.g., "NOT_FOUND:trustee,principalAmount")
+        - If ALL fields were found, set confidenceNote to: ""
+        - If ONLY arrays were empty, still set confidenceNote to "" (arrays are not tracked here)
+        - Do NOT add narrative text to confidenceNote — it is machine-parsed.
+
+──────────────────────────────────────────────
+RULE 2 — NAME FIELD CONSTRAINTS
+  Applies to: trustor, trustee, beneficiary
+──────────────────────────────────────────────
+
+    ╔══════════════════════════════════════════════════════╗
+    ║  CORE PRINCIPLE: Each individual name entry MUST     ║
+    ║  never exceed 5 words. When multiple parties exist,  ║
+    ║  separate them with a comma — do NOT join them as    ║
+    ║  one run-on string.                                  ║
+    ╚══════════════════════════════════════════════════════╝
+
+    a) SINGLE PARTY — WORD COUNT:
+        - The extracted name MUST be between 1 and 5 words (inclusive).
+        - If the cleaned name still exceeds 5 words, truncate to the first 5 words.
+        - Count only meaningful name tokens — do NOT count stripped boilerplate words toward the limit.
+
+        Correct:   "JOHN A DOE"                        (3 words ✓)
+        Correct:   "FIDELITY NATIONAL TITLE AGENCY INC" (5 words ✓)
+        Incorrect: "FIDELITY NATIONAL TITLE AGENCY OF ARIZONA INC" (7 words — truncate to first 5)
+                    → "FIDELITY NATIONAL TITLE AGENCY OF"
+
+    b) MULTIPLE PARTIES — COMMA SEPARATION:
+        - If the source text contains multiple parties joined by "AND", "OR", "&", or listed
+          sequentially, extract EACH party as a separate name token, clean it individually
+          (apply Rule 2c and the 5-word limit independently to each), then join all tokens
+          with ", " (comma + space) as a single string value.
+        - There is NO cap on the number of parties that may appear in the comma-separated string —
+          capture all of them.
+        - Each individual name segment between commas MUST independently satisfy the 5-word limit.
+
+        Source:  "JOHN A DOE AND JANE B DOE, HUSBAND AND WIFE"
+        Step 1 — Split on AND:        ["JOHN A DOE", "JANE B DOE, HUSBAND AND WIFE"]
+        Step 2 — Strip boilerplate:   ["JOHN A DOE", "JANE B DOE"]
+        Step 3 — Check word counts:   3 words ✓, 3 words ✓
+        Step 4 — Join:                "JOHN A DOE, JANE B DOE"
+        Final value → "JOHN A DOE, JANE B DOE"
+
+        Source:  "ROBERT T KING AND MARY K KING AND SAMUEL P KING"
+        Result → "ROBERT T KING, MARY K KING, SAMUEL P KING"
+
+    c) STRIP ALL OF THE FOLLOWING — these are NEVER part of a valid name value:
+        Relationship/marital descriptors   → "husband and wife", "a married couple", "a single man/woman",
+                                             "an unmarried man/woman", "a widower/widow", "joint tenants",
+                                             "tenants in common", "community property"
+        Role/capacity suffixes             → "as trustee", "as beneficiary", "as nominee", "as agent",
+                                             "as personal representative", "as executor"
+        Legal entity boilerplate           → "a corporation", "a limited liability company", "an Arizona LLC",
+                                             "an Arizona corporation", "a California corporation"
+        Succession language                → "its successors and assigns", "and their successors",
+                                             "and assigns"
+        Recording artifacts                → Document headers, page numbers, recording stamps,
+                                             instrument numbers mixed into name text
+
+    d) ALLOWED CORPORATE SUFFIXES — these ARE part of a valid legal entity name and count toward the 5-word limit:
+        Allowed: "LLC", "INC", "CORP", "LP", "LLP", "NA", "FSB", "N.A.", "PLC", "PC"
+        Example valid value: "WELLS FARGO BANK NA"  (4 words ✓)
+
+    e) CAPITALIZATION: Preserve the casing exactly as it appears in the source document. Do not normalize to upper or lower case.
+
+    f) WORD COUNT ENFORCEMENT SUMMARY TABLE:
+
+        Scenario                                           Action
+        ─────────────────────────────────────────────────────────────────────
+        Single party, ≤5 words after stripping          → Use as-is
+        Single party, >5 words after stripping          → Truncate to first 5 words
+        Multiple parties, each ≤5 words after stripping → Join with ", "
+        Multiple parties, one exceeds 5 words           → Truncate that individual entry to 5 words, then join
+        No party found                                  → "NOT_FOUND"
+
+──────────────────────────────────────────────
+RULE 3 — principalAmount CONSTRAINTS
+──────────────────────────────────────────────
+    a) FORMAT: The value MUST be a string containing only:
+        - ASCII digits (0–9)
+        - An optional single decimal point (.)
+        No other characters are permitted under any circumstances.
+
+    b) PROHIBITED CHARACTERS (absolute exclusions):
+        - Dollar sign: $
+        - Comma: ,
+        - Currency codes: USD, USD$, etc.
+        - Parentheses, spaces, hyphens, or any letter
+
+    c) MINIMUM VALUE: The numeric value represented must be ≥ 1000.00. If the extracted amount is less than 1000, set to "NOT_FOUND".
+
+    d) WRITTEN-OUT AMOUNTS: If the amount appears in prose form (e.g., "One Hundred Fifty Thousand Dollars"), attempt to convert it to numeric form. If conversion is ambiguous or impossible, use "NOT_FOUND".
+
+    e) MULTIPLE AMOUNTS: Documents may state both a loan amount and a total secured amount. Use the ORIGINAL PRINCIPAL / LOAN AMOUNT, not a maximum lien or future advance amount.
+
+    f) VALID EXAMPLES:
+        "$1,250,000.50"      → "1250000.50"
+        "$85,000"            → "85000"
+        "Two Hundred Thousand Dollars ($200,000.00)" → "200000.00"
+        "Nine Hundred Dollars" → "NOT_FOUND"  (below minimum)
+        "$500"               → "NOT_FOUND"  (below minimum)
+
+──────────────────────────────────────────────
+RULE 4 — propertyAddress CONSTRAINTS
+──────────────────────────────────────────────
+
+    ╔══════════════════════════════════════════════════════╗
+    ║  CORE PRINCIPLE: The address value MUST NOT exceed   ║
+    ║  10 words. Count every space-delimited token,        ║
+    ║  including numbers, abbreviations, and ZIP codes.    ║
+    ║  If the extracted address exceeds 10 words, truncate ║
+    ║  by dropping the least critical components from the  ║
+    ║  right (typically ZIP code first, then state, etc.), ║
+    ║  preserving street number + name as the priority.    ║
+    ╚══════════════════════════════════════════════════════╝
+
+    a) WORD LIMIT — 10 WORDS MAXIMUM:
+        - Count each space-delimited token as one word.
+        - Numbers, abbreviations, ZIP codes, and directional prefixes (N, S, E, W, NE, SW)
+          each count as one word.
+        - If the address exceeds 10 words, truncate from the right, preserving:
+            Priority 1 (must keep): Street number + street name
+            Priority 2 (keep if space): Directional prefix/suffix (N, S, NW, etc.)
+            Priority 3 (keep if space): Street type (St, Ave, Blvd, Dr, Rd, Ln, Way, etc.)
+            Priority 4 (keep if space): City name
+            Priority 5 (keep if space): State abbreviation
+            Priority 6 (lowest):        ZIP code
+
+        Truncation example (12 words → 10):
+            "1024 N Rattlesnake Road Unit 4 Sierra Vista Arizona 85635 USA"
+            Count: 1024(1) N(2) Rattlesnake(3) Road(4) Unit(5) 4(6) Sierra(7) Vista(8) Arizona(9) 85635(10) USA(11) → 11 words
+            Drop from right: remove "USA"
+            Result: "1024 N Rattlesnake Road Unit 4 Sierra Vista Arizona 85635"  (10 words ✓)
+
+    b) VALID CONTENT: Must be a physical US situs/street address for real property located in
+       or associated with Cochise County, AZ.
+
+    c) REQUIRED COMPONENTS (include when present, subject to 10-word limit):
+        - Street number
+        - Street name and type (St, Ave, Blvd, Dr, Rd, etc.)
+        - Unit/Suite/Apt number (if applicable)
+        - City, State abbreviation, ZIP code
+
+    d) STRICTLY EXCLUDED — never include these in propertyAddress:
+        Legal descriptions       → Lot/Block/Tract/Section/Township/Range text
+        Subdivision names        → "Mountain View Estates", "Vista Bella Unit 3"
+        Parcel/APN numbers       → Any formatted parcel identifier
+        Mailing/postal addresses → P.O. Box, "mail to:", "c/o"
+        Recording boilerplate    → Instrument numbers, book/page references, Recorder's office stamps
+
+    e) AMBIGUITY: If the document contains only a legal description and no street address,
+       set to "NOT_FOUND". Do not fabricate or synthesize an address from a legal description.
+
+    f) WORD COUNT ENFORCEMENT SUMMARY TABLE:
+
+        Scenario                                      Action
+        ──────────────────────────────────────────────────────────────────
+        Valid address, ≤10 words                   → Use as-is
+        Valid address, 11–15 words                 → Truncate from right per priority order above
+        Valid address, >15 words (likely has legal → Strip legal description first, then apply
+            description mixed in)                     10-word truncation to the remainder
+        Only legal description present             → "NOT_FOUND"
+        Only P.O. Box present                      → "NOT_FOUND"
+        No address found                           → "NOT_FOUND"
+
+    g) VALID EXAMPLES:
+        "741 W CORONADO DRIVE SIERRA VISTA AZ 85635"      → 8 words ✓  VALID
+        "88 S VISTA AVENUE BISBEE AZ 85603"               → 7 words ✓  VALID
+        "1024 N RATTLESNAKE RD UNIT 4 SIERRA VISTA AZ 85635" → 10 words ✓ VALID (at limit)
+        "123 N MAIN STREET DOUGLAS ARIZONA 85607 COCHISE COUNTY USA" → 10 words, truncate "COCHISE COUNTY USA" → "123 N MAIN STREET DOUGLAS ARIZONA 85607"
+        "Lot 5 Block 3 Mountain View Estates Cochise Co"  → INVALID → "NOT_FOUND"
+        "P.O. Box 1234 Bisbee AZ 85603"                  → INVALID → "NOT_FOUND"
+
+════════════════════════════════════════════════
+SECTION 4 — FEW-SHOT EXAMPLES
+════════════════════════════════════════════════
+
+The following three examples demonstrate correct end-to-end extraction. Study them carefully before processing the target document.
+
+──────────────────────────────────────────────
+EXAMPLE 1 — Standard Deed of Trust, Multiple Co-Borrowers, Long Address
+──────────────────────────────────────────────
+
+INPUT OCR TEXT:
+
+RECORDING REQUESTED BY: FIRST AMERICAN TITLE COMPANY
+WHEN RECORDED MAIL TO: QUICKEN LOANS INC, 1050 WOODWARD AVE, DETROIT MI 48226
+
+DEED OF TRUST
+Instrument No. 2023-004512   Recorded: 03/15/2023   Book 412 Page 88
+
+THIS DEED OF TRUST is made on March 10, 2023. The trustor is
+ROBERT C HENDERSON AND PATRICIA M HENDERSON, HUSBAND AND WIFE ("Borrower").
+The trustee is FIDELITY NATIONAL TITLE AGENCY INC, an Arizona corporation.
+The beneficiary is QUICKEN LOANS INC, its successors and assigns.
+
+Loan amount: TWO HUNDRED FORTY-FIVE THOUSAND AND NO/100 DOLLARS ($245,000.00).
+
+Property located at: 1024 NORTH RATTLESNAKE ROAD UNIT 4, SIERRA VISTA, ARIZONA 85635 USA.
+Legal Description: Lot 14, Block 7, CORONADO HILLS SUBDIVISION UNIT 2, Book of Maps 22,
+Page 15, Cochise County, AZ.  APN: 105-44-076.
+
+EXTRACTION WALKTHROUGH:
+
+  trustor:
+    Raw:     "ROBERT C HENDERSON AND PATRICIA M HENDERSON, HUSBAND AND WIFE"
+    Split:   ["ROBERT C HENDERSON", "PATRICIA M HENDERSON, HUSBAND AND WIFE"]
+    Strip:   ["ROBERT C HENDERSON", "PATRICIA M HENDERSON"]  ← removed "HUSBAND AND WIFE"
+    Words:   3 ✓, 3 ✓  (each ≤5)
+    Join:    "ROBERT C HENDERSON, PATRICIA M HENDERSON"
+
+  trustee:
+    Raw:     "FIDELITY NATIONAL TITLE AGENCY INC, an Arizona corporation"
+    Strip:   "FIDELITY NATIONAL TITLE AGENCY INC"  ← removed "an Arizona corporation"
+    Words:   5 ✓  (exactly at limit)
+    Final:   "FIDELITY NATIONAL TITLE AGENCY INC"
+
+  beneficiary:
+    Raw:     "QUICKEN LOANS INC, its successors and assigns"
+    Strip:   "QUICKEN LOANS INC"  ← removed "its successors and assigns"
+    Words:   3 ✓
+    Final:   "QUICKEN LOANS INC"
+
+  principalAmount:
+    Raw:     "TWO HUNDRED FORTY-FIVE THOUSAND AND NO/100 DOLLARS ($245,000.00)"
+    Convert: 245000.00
+    Strip:   "245000.00"  ← no $, no commas
+    Check:   ≥1000 ✓
+    Final:   "245000.00"
+
+  propertyAddress:
+    Raw:     "1024 NORTH RATTLESNAKE ROAD UNIT 4, SIERRA VISTA, ARIZONA 85635 USA"
+    Tokens:  1024(1) NORTH(2) RATTLESNAKE(3) ROAD(4) UNIT(5) 4(6) SIERRA(7) VISTA(8) ARIZONA(9) 85635(10) USA(11) = 11 words
+    Exceeds 10 → drop lowest priority from right: remove "USA"
+    Result:  "1024 NORTH RATTLESNAKE ROAD UNIT 4 SIERRA VISTA ARIZONA 85635"  (10 words ✓)
+
+  grantors: ["ROBERT C HENDERSON", "PATRICIA M HENDERSON"]
+  grantees: ["FIDELITY NATIONAL TITLE AGENCY INC"]
+  confidenceNote: ""  ← all fields found
+
+EXPECTED OUTPUT:
+{
+  "trustor": "ROBERT C HENDERSON, PATRICIA M HENDERSON",
+  "trustee": "FIDELITY NATIONAL TITLE AGENCY INC",
+  "beneficiary": "QUICKEN LOANS INC",
+  "principalAmount": "245000.00",
+  "propertyAddress": "1024 NORTH RATTLESNAKE ROAD UNIT 4 SIERRA VISTA ARIZONA 85635",
+  "grantors": ["ROBERT C HENDERSON", "PATRICIA M HENDERSON"],
+  "grantees": ["FIDELITY NATIONAL TITLE AGENCY INC"],
+  "confidenceNote": ""
+}
+
+──────────────────────────────────────────────
+EXAMPLE 2 — Quitclaim Deed, Three Co-Grantors, No Street Address
+──────────────────────────────────────────────
+
+INPUT OCR TEXT:
+
+QUITCLAIM DEED
+Recorded: 07/22/2022   Cochise County Recorder
+
+MARGARET L VANCE AND THOMAS R VANCE AND CAROL ANN VANCE-WHITMORE, AS JOINT TENANTS,
+do hereby quitclaim to VANCE FAMILY LIVING TRUST DATED JUNE 1 2019,
+all right, title, and interest in the following property:
+
+Lot 22, Block 4, APACHE MEADOWS SUBDIVISION, Book of Maps 18, Page 6, Cochise County, AZ.
+APN: 212-67-022B.   No street address on record.   No monetary consideration.
+
+
+EXTRACTION WALKTHROUGH:
+
+  trustor / trustee / beneficiary:
+    Document type: Quitclaim Deed — no trustor/trustee/beneficiary relationship exists.
+    All three → "NOT_FOUND"
+
+  principalAmount:
+    "No monetary consideration" — no numeric value ≥ 1000 → "NOT_FOUND"
+
+  propertyAddress:
+    Only legal description present (Lot/Block/Subdivision). Rule 4d prohibits. Rule 4e applies.
+    → "NOT_FOUND"
+
+  grantors:
+    Raw:   "MARGARET L VANCE AND THOMAS R VANCE AND CAROL ANN VANCE-WHITMORE, AS JOINT TENANTS"
+    Split: ["MARGARET L VANCE", "THOMAS R VANCE", "CAROL ANN VANCE-WHITMORE, AS JOINT TENANTS"]
+    Strip: ["MARGARET L VANCE", "THOMAS R VANCE", "CAROL ANN VANCE-WHITMORE"]  ← removed "AS JOINT TENANTS"
+    Words: 3 ✓, 3 ✓, 3 ✓  (each ≤5, hyphenated counts as 1 token)
+    Array: ["MARGARET L VANCE", "THOMAS R VANCE", "CAROL ANN VANCE-WHITMORE"]
+
+  grantees:
+    Raw:   "VANCE FAMILY LIVING TRUST DATED JUNE 1 2019"
+    Words: 8 — exceeds 5 → truncate to first 5: "VANCE FAMILY LIVING TRUST DATED"
+    Array: ["VANCE FAMILY LIVING TRUST DATED"]
+
+  confidenceNote: "NOT_FOUND:trustor,trustee,beneficiary,principalAmount,propertyAddress"
+
+EXPECTED OUTPUT:
+{
+  "trustor": "NOT_FOUND",
+  "trustee": "NOT_FOUND",
+  "beneficiary": "NOT_FOUND",
+  "principalAmount": "NOT_FOUND",
+  "propertyAddress": "NOT_FOUND",
+  "grantors": ["MARGARET L VANCE", "THOMAS R VANCE", "CAROL ANN VANCE-WHITMORE"],
+  "grantees": ["VANCE FAMILY LIVING TRUST DATED"],
+  "confidenceNote": "NOT_FOUND:trustor,trustee,beneficiary,principalAmount,propertyAddress"
+}
+
+──────────────────────────────────────────────
+EXAMPLE 3 — OCR-Degraded Document, Long Beneficiary Name, Oversized Address
+──────────────────────────────────────────────
+
+INPUT OCR TEXT:
+
+D££D 0F TRU$T — C0CHISE C0UNTY ARIZONA
+Rec0rded: ??/??/2021   Instr#: 2021-00XXXX
+
+Tru$tor: DAVID K MORALES AND LISA R MORALES-SANTIAGO, AN UNMARRIED COUPLE
+Tru$tee: [ILLEGIBLE SMUDGE]
+Benefici@ry: UNITED STATES NATIONAL BANK OF ARIZONA SOUTHWEST DIVISION, A CORPORATION,
+             its successors and assigns
+
+Loan Am0unt: $1O2,5OO.OO
+Address: 88 SOUTH VISTA AVENUE APARTMENT 3B BISBEE COCHISE COUNTY ARIZONA 85603 USA ATTN RECORDS
+Legal Desc: SW 1/4 SEC 14 T22S R24E G&SRM Cochise Co AZ  APN 103-29-011
+
+
+EXTRACTION WALKTHROUGH:
+
+  trustor:
+    Raw:   "DAVID K MORALES AND LISA R MORALES-SANTIAGO, AN UNMARRIED COUPLE"
+    Split: ["DAVID K MORALES", "LISA R MORALES-SANTIAGO, AN UNMARRIED COUPLE"]
+    Strip: ["DAVID K MORALES", "LISA R MORALES-SANTIAGO"]  ← removed "AN UNMARRIED COUPLE"
+    Words: 3 ✓, 3 ✓
+    Join:  "DAVID K MORALES, LISA R MORALES-SANTIAGO"
+
+  trustee:
+    Raw:   "[ILLEGIBLE SMUDGE]" — not a real entity name → "NOT_FOUND"
+
+  beneficiary:
+    Raw:   "UNITED STATES NATIONAL BANK OF ARIZONA SOUTHWEST DIVISION, A CORPORATION, its successors and assigns"
+    Strip: "UNITED STATES NATIONAL BANK OF ARIZONA SOUTHWEST DIVISION"  ← removed "A CORPORATION" and "its successors and assigns"
+    Words: 9 — exceeds 5 → truncate to first 5: "UNITED STATES NATIONAL BANK OF"
+    Final: "UNITED STATES NATIONAL BANK OF"
+
+  principalAmount:
+    Raw:   "$1O2,5OO.OO" — OCR substituted letter O for digit 0
+    Fix:   "$102,500.00"
+    Strip: "102500.00"
+    Check: ≥1000 ✓
+    Final: "102500.00"
+
+  propertyAddress:
+    Raw:    "88 SOUTH VISTA AVENUE APARTMENT 3B BISBEE COCHISE COUNTY ARIZONA 85603 USA ATTN RECORDS"
+    Tokens: 88(1) SOUTH(2) VISTA(3) AVENUE(4) APARTMENT(5) 3B(6) BISBEE(7) COCHISE(8) COUNTY(9) ARIZONA(10) 85603(11) USA(12) ATTN(13) RECORDS(14) = 14 words
+    Exceeds 10 → drop from right per priority:
+        Remove RECORDS(14), ATTN(13), USA(12), COUNTY(9+COCHISE(8 — these are non-address filler
+        Careful truncation to 10: "88 SOUTH VISTA AVENUE APARTMENT 3B BISBEE ARIZONA 85603"
+        Count: 88(1) SOUTH(2) VISTA(3) AVENUE(4) APARTMENT(5) 3B(6) BISBEE(7) ARIZONA(8) 85603(9) = 9 words ✓
+
+  grantors: ["DAVID K MORALES", "LISA R MORALES-SANTIAGO"]
+  grantees: ["UNITED STATES NATIONAL BANK OF"]
+  confidenceNote: "NOT_FOUND:trustee"
+
+EXPECTED OUTPUT:
+{
+  "trustor": "DAVID K MORALES, LISA R MORALES-SANTIAGO",
+  "trustee": "NOT_FOUND",
+  "beneficiary": "UNITED STATES NATIONAL BANK OF",
+  "principalAmount": "102500.00",
+  "propertyAddress": "88 SOUTH VISTA AVENUE APARTMENT 3B BISBEE ARIZONA 85603",
+  "grantors": ["DAVID K MORALES", "LISA R MORALES-SANTIAGO"],
+  "grantees": ["UNITED STATES NATIONAL BANK OF"],
+  "confidenceNote": "NOT_FOUND:trustee"
+}
+
+════════════════════════════════════════════════
+SECTION 5 — ABSOLUTE OUTPUT REQUIREMENTS
+════════════════════════════════════════════════
+
+1. Your response MUST be ONLY the JSON object — no preamble, no explanation, no markdown fences (no ```json), no trailing commentary.
+2. The JSON must be syntactically valid and parseable by a standard JSON parser.
+3. All 8 keys must be present in every response, even if values are "NOT_FOUND" or [].
+4. Do not invent, hallucinate, or infer data not present in the source text.
+5. Do not merge or confuse fields — a name found in a "mail to" header is NOT a beneficiary.
+6. If the document is entirely unreadable or clearly not a real estate instrument, return:
+   {
+     "trustor": "NOT_FOUND",
+     "trustee": "NOT_FOUND",
+     "beneficiary": "NOT_FOUND",
+     "principalAmount": "NOT_FOUND",
+     "propertyAddress": "NOT_FOUND",
+     "grantors": [],
+     "grantees": [],
+     "confidenceNote": "NOT_FOUND:trustor,trustee,beneficiary,principalAmount,propertyAddress"
+   }
 """.strip()
+
+
+_NUMERIC_AMOUNT_RE = re.compile(r"^\d+(?:\.\d{1,2})?$")
+
+
+def _normalize_principal_amount_numeric(value: str) -> str:
+    """Return numeric-only principal amount string or empty string if invalid."""
+    s = str(value or "").strip()
+    if not s or s.upper() == "NOT_FOUND" or s == "NOT_FOUND":
+        return ""
+    s = re.sub(r"[,$\s]", "", s)
+    if not s or not _NUMERIC_AMOUNT_RE.match(s):
+        return ""
+    try:
+        val = float(s)
+    except Exception:
+        return ""
+    if val < 1000:
+        return ""
+    return f"{val:.2f}".rstrip("0").rstrip(".")
 
 
 def _normalise_date(date_str: str) -> str:
@@ -1012,17 +1469,7 @@ def ocr_document_images(
 
 def _regex_principal(text: str) -> str:
     def _format_money(raw: str) -> str:
-        cleaned = re.sub(r"[^\d.]", "", raw or "")
-        if not cleaned:
-            return ""
-        try:
-            val = float(cleaned)
-        except Exception:
-            return ""
-        # Avoid tiny fees/consideration values when extracting principal.
-        if val < 1000:
-            return ""
-        return f"${val:,.2f}"
+        return _normalize_principal_amount_numeric(raw)
 
     pats = [
         r"(?:original\s+principal(?:\s+amount)?|principal\s+balance|unpaid\s+principal(?:\s+balance)?|loan\s+amount|amount\s+of\s+the\s+indebtedness|sum\s+of)[^\d\n]{0,80}(\$?\s*\d[\d,]*(?:\.\d{2})?)",
@@ -1137,10 +1584,13 @@ def sanitize_property_address(value: str) -> str:
         flags=re.I,
     )[0].strip(" ,;:-")
 
-    if len(v) < 6 or len(v) > 180:
+    v = re.sub(r"\s+", " ", v).strip(" ,;:-")
+    words = [w for w in v.split(" ") if w]
+    if len(words) > 8:
         return ""
-
-    return re.sub(r"\s+", " ", v).strip(" ,;:-")
+    if len(v) > 180:
+        return ""
+    return v
 
 
 def _address_quality_score(value: str) -> int:
@@ -1308,94 +1758,67 @@ def _extract_party_block(text: str, role: str) -> str:
 
 
 def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int = 60) -> tuple[dict, str]:
-    global _GROQ_MODEL_CACHE
-    preferred_models = [
-        "llama-3.3-70b-versatile",
-        "llama-3.1-70b-versatile",
-        "llama-3.1-8b-instant",
-    ]
-    deprecated_models = {
-        "llama3-70b-8192",
-    }
+    def _normalize_groq_model(model: str) -> str:
+        m = (model or "").strip()
+        if m == "llama-3.3-70b":
+            return "llama-3.3-70b-versatile"
+        return m or "llama-3.3-70b-versatile"
 
-    if _GROQ_MODEL_CACHE is None:
-        resolved: list[str] = []
-        try:
-            mr = requests.get(
-                "https://api.groq.com/openai/v1/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-                timeout=min(timeout_s, 20),
-            )
-            if mr.ok:
-                payload = mr.json() if mr.content else {}
-                available = {
-                    str(x.get("id", "")).strip()
-                    for x in payload.get("data", [])
-                    if isinstance(x, dict)
-                }
-                resolved = [m for m in preferred_models if m in available and m not in deprecated_models]
-        except Exception:
-            resolved = []
-
-        # Fallback to static order if model introspection fails.
-        _GROQ_MODEL_CACHE = resolved or [m for m in preferred_models if m not in deprecated_models]
-
-    model_candidates = list(_GROQ_MODEL_CACHE)
+    model = _normalize_groq_model(os.getenv("GROQ_MODEL", "llama-3.3-70b"))
     last_err = ""
-    for model in model_candidates:
-        for use_response_format in (True, False):
-            body = {
-                "model": model,
-                "temperature": 0,
-                "messages": messages,
-            }
-            if use_response_format:
-                body["response_format"] = {"type": "json_object"}
+    for use_response_format in (True, False):
+        body = {
+            "model": model,
+            "temperature": 0,
+            "messages": messages,
+        }
+        if use_response_format:
+            body["response_format"] = {"type": "json_object"}
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=body,
+                timeout=timeout_s,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            content = (
+                payload.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.I)
+            data = json.loads(content) if content else {}
+            if isinstance(data, dict):
+                return data, model
+            last_err = "invalid JSON object"
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            resp_body = ""
             try:
-                resp = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=body,
-                    timeout=timeout_s,
+                resp_body = (exc.response.text or "")[:220] if exc.response is not None else ""
+            except Exception:
+                resp_body = ""
+            if status in (401, 403):
+                msg = (
+                    f"Groq access denied (HTTP {status}). "
+                    "Check GROQ_API_KEY validity and network/egress policy (VPN, proxy, firewall, datacenter IP restrictions)."
                 )
-                resp.raise_for_status()
-                payload = resp.json()
-                content = (
-                    payload.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                content = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.I)
-                data = json.loads(content) if content else {}
-                if isinstance(data, dict):
-                    return data, model
-                last_err = "invalid JSON object"
-            except requests.HTTPError as exc:
-                status = exc.response.status_code if exc.response is not None else None
-                body = ""
-                try:
-                    body = (exc.response.text or "")[:220] if exc.response is not None else ""
-                except Exception:
-                    body = ""
-                if status in (401, 403):
-                    msg = (
-                        f"Groq access denied (HTTP {status}). "
-                        "Check GROQ_API_KEY validity and network/egress policy (VPN, proxy, firewall, datacenter IP restrictions)."
-                    )
-                    if body:
-                        msg = f"{msg} response={body}"
-                    raise RuntimeError(msg)
-                if status in (400, 413, 422):
-                    last_err = f"Groq HTTP {status} bad request; response={body or str(exc)}"
-                else:
-                    last_err = str(exc)
-            except Exception as exc:
+                if resp_body:
+                    msg = f"{msg} response={resp_body}"
+                raise RuntimeError(msg)
+            if status in (400, 413, 422):
+                last_err = f"Groq HTTP {status} bad request (model={model}); response={resp_body or str(exc)}"
+            else:
                 last_err = str(exc)
-                continue
-    raise RuntimeError(last_err or "Groq request failed")
+        except Exception as exc:
+            last_err = str(exc)
+
+    raise RuntimeError(last_err or f"Groq request failed (model={model})")
 
 
 def _resolve_hosted_document_endpoint_url() -> str:
@@ -1466,6 +1889,13 @@ def _hosted_extract_fields_from_document(
     if api_token:
         headers["X-API-Token"] = api_token
 
+    # Optional model override (kept as header to avoid breaking strict JSON schemas on hosted service).
+    model_override = (os.getenv("GROQ_MODEL", "") or "").strip()
+    if model_override == "llama-3.3-70b":
+        model_override = "llama-3.3-70b-versatile"
+    if model_override:
+        headers["X-LLM-Model"] = model_override
+
     timeout_env = (
         os.getenv("GREENLEE_LLM_ENDPOINT_TIMEOUT_S", "")
         or os.getenv("GROQ_LLM_ENDPOINT_TIMEOUT_S", "")
@@ -1484,10 +1914,10 @@ def _hosted_extract_fields_from_document(
         trustor = str(fields.get("trustor") or fields.get("trustor_1_full_name") or "").strip()
         trustee = str(fields.get("trustee") or "").strip()
         beneficiary = str(fields.get("beneficiary") or "").strip()
-        property_address = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
-        principal_amount = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
-        if principal_amount and principal_amount[0].isdigit():
-            principal_amount = f"${principal_amount}"
+        property_address_raw = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
+        property_address = sanitize_property_address(property_address_raw) or ""
+        principal_amount_raw = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
+        principal_amount = _normalize_principal_amount_numeric(principal_amount_raw) or ""
 
         mapped = {
             "trustor": trustor,
@@ -1539,6 +1969,84 @@ def _hosted_extract_fields_from_document(
 
     data = rr.json() if rr.content else {}
     return _map_response(data, 0, ocr_text)
+
+
+def _hosted_extract_fields_from_text(
+    *,
+    endpoint_url: str,
+    text: str,
+    recording_number: str,
+    timeout_s: int = 60,
+) -> tuple[dict, str]:
+    """Call hosted /extract endpoint with OCR-like text (can be detail/rawText when images are blocked)."""
+    headers = {"Content-Type": "application/json"}
+    api_token = (os.getenv("GREENLEE_API_TOKEN", "") or os.getenv("API_TOKEN", "")).strip()
+    if api_token:
+        headers["X-API-Token"] = api_token
+
+    model_override = (os.getenv("GROQ_MODEL", "") or "").strip()
+    if model_override == "llama-3.3-70b":
+        model_override = "llama-3.3-70b-versatile"
+    if model_override:
+        headers["X-LLM-Model"] = model_override
+
+    timeout_env = (
+        os.getenv("GREENLEE_LLM_ENDPOINT_TIMEOUT_S", "")
+        or os.getenv("GROQ_LLM_ENDPOINT_TIMEOUT_S", "")
+    ).strip()
+    if timeout_env:
+        try:
+            timeout_s = max(10, int(float(timeout_env)))
+        except Exception:
+            pass
+
+    url = (endpoint_url or "").strip()
+    if not url:
+        raise RuntimeError("hosted LLM endpoint URL missing")
+
+    # Ensure we hit the text endpoint.
+    if "/extract-document" in url:
+        url = url.replace("/extract-document", "/extract")
+
+    ocr_text = str(text or "")
+    if not ocr_text.strip():
+        raise RuntimeError("hosted LLM endpoint: text payload is empty")
+
+    payload = {
+        "ocr_text": ocr_text,
+        "recording_number": str(recording_number or ""),
+    }
+    rr = requests.post(url, json=payload, headers=headers, timeout=timeout_s)
+    if rr.status_code >= 400:
+        body = ""
+        try:
+            body = (rr.text or "")[:260]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"hosted LLM endpoint HTTP {rr.status_code}; response={body}")
+
+    data = rr.json() if rr.content else {}
+    fields = data.get("fields", data) if isinstance(data, dict) else {}
+    if not isinstance(fields, dict):
+        raise RuntimeError("hosted LLM endpoint returned invalid fields payload")
+
+    trustor = str(fields.get("trustor") or fields.get("trustor_1_full_name") or "").strip()
+    trustee = str(fields.get("trustee") or "").strip()
+    beneficiary = str(fields.get("beneficiary") or "").strip()
+    property_address_raw = str(fields.get("propertyAddress") or fields.get("property_address") or "").strip()
+    property_address = sanitize_property_address(property_address_raw) or ""
+    principal_amount_raw = str(fields.get("principalAmount") or fields.get("original_principal_balance") or "").strip()
+    principal_amount = _normalize_principal_amount_numeric(principal_amount_raw) or ""
+
+    mapped = {
+        "trustor": trustor,
+        "trustee": trustee,
+        "beneficiary": beneficiary,
+        "propertyAddress": property_address,
+        "principalAmount": principal_amount,
+    }
+    model = str(data.get("model") or "hosted-llm-endpoint").strip() if isinstance(data, dict) else "hosted-llm-endpoint"
+    return mapped, model
 
 
 def _normalise_party(v: str) -> str:
@@ -1759,12 +2267,34 @@ def enrich_record(
         if detail.get(key):
             record[key] = detail[key]
     image_urls = discover_image_urls(dk, session, detail.get("imageUrls", []), max_probe_pages=max_image_pages)
+
+    # Absolute, clickable links for downstream storage/export.
+    detail_url = str(record.get("detailUrl") or detail.get("detailUrl") or f"{DOCUMENT_URL}?DK={dk}")
+    detail_url = urllib.parse.urljoin(BASE_URL + "/", detail_url)
+    record["detailUrl"] = detail_url
+
+    norm_image_urls: list[str] = []
+    for u in image_urls:
+        uu = urllib.parse.urljoin(BASE_URL + "/", str(u or ""))
+        if uu and uu not in norm_image_urls:
+            norm_image_urls.append(uu)
+    image_urls = norm_image_urls
+
+    record["documentUrls"] = " | ".join([detail_url] + image_urls)
+    record["links"] = json.dumps(
+        {
+            "document_url": detail_url,
+            "image_urls": image_urls,
+        },
+        ensure_ascii=False,
+    )
     record["imageUrls"] = " | ".join(image_urls)
     hosted_endpoint_url = _resolve_hosted_document_endpoint_url()
     disable_local_ocr = str(os.getenv("GREENLEE_DISABLE_LOCAL_OCR", "0")).strip() == "1"
+    llm_enabled = bool(use_groq and (hosted_endpoint_url or groq_api_key))
 
     # If hosted endpoint is configured, bypass local OCR and send document pages directly.
-    if use_groq and hosted_endpoint_url and image_urls and not detail.get("imageAccessNote"):
+    if use_groq and hosted_endpoint_url and image_urls:
         try:
             llm, model, hosted_ocr_text = _hosted_extract_fields_from_document(
                 endpoint_url=hosted_endpoint_url,
@@ -1786,38 +2316,24 @@ def enrich_record(
                 if llm_val:
                     record[key] = llm_val
 
-            merged = ((hosted_ocr_text or "") + "\n" + detail.get("rawText", "")).strip()
-            if not record.get("principalAmount"):
-                record["principalAmount"] = _regex_principal(merged)
-            if not record.get("propertyAddress"):
-                record["propertyAddress"] = _regex_address(merged)
-            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-                if not record.get(key):
-                    record[key] = _extract_party_block(merged, label)
-                if not record.get(key):
-                    record[key] = _regex_party(merged, label)
-
+            # LLM-only mode: do not use regex-derived extraction/fallback.
             if not record.get("trustor"):
                 record["trustor"] = _first_party(record.get("grantors", ""))
             if not record.get("beneficiary"):
                 record["beneficiary"] = _first_party(record.get("grantees", ""))
-            if not record.get("trustee"):
-                gr_first = _first_party(record.get("grantees", ""))
-                if re.search(r"TRUST|TRUSTEE", gr_first or "", re.I):
-                    record["trustee"] = gr_first
+
             record["trustor"] = _choose_best_borrower_name(
                 detail_trustor,
                 record.get("trustor", ""),
                 _first_party(record.get("grantors", "")),
-                _extract_party_block(merged, "trustor"),
-                _regex_party(merged, "trustor"),
+                "",
+                "",
             )
             record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
             record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
             record["propertyAddress"] = _choose_best_property_address(
                 detail_address,
                 record.get("propertyAddress", ""),
-                _regex_address(merged),
             )
             return record
         except Exception as e:
@@ -1856,15 +2372,6 @@ def enrich_record(
                     except Exception as inner_e:
                         record["groqError"] = str(inner_e)
 
-                if not record.get("principalAmount"):
-                    record["principalAmount"] = _regex_principal(merged)
-                if not record.get("propertyAddress"):
-                    record["propertyAddress"] = _regex_address(merged)
-                for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-                    if not record.get(key):
-                        record[key] = _extract_party_block(merged, label)
-                    if not record.get(key):
-                        record[key] = _regex_party(merged, label)
                 if not record.get("trustor"):
                     record["trustor"] = _first_party(record.get("grantors", ""))
                 if not record.get("beneficiary"):
@@ -1873,15 +2380,14 @@ def enrich_record(
                     detail_trustor,
                     record.get("trustor", ""),
                     _first_party(record.get("grantors", "")),
-                    _extract_party_block(merged, "trustor"),
-                    _regex_party(merged, "trustor"),
+                    "",
+                    "",
                 )
                 record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
                 record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
                 record["propertyAddress"] = _choose_best_property_address(
                     detail_address,
                     record.get("propertyAddress", ""),
-                    _regex_address(merged),
                 )
                 return record
 
@@ -1907,6 +2413,37 @@ def enrich_record(
     record.setdefault("groqModel", "")
     record.setdefault("groqError", "")
     merged = (ocr_text + "\n" + detail.get("rawText", "")).strip()
+
+    # If the county blocks unofficial images (no OCR possible), still attempt hosted LLM extraction
+    # using the detail page text so we preserve an LLM-only pipeline (no regex fallback).
+    if (
+        llm_enabled
+        and hosted_endpoint_url
+        and blocked_no_image
+        and str(detail.get("rawText", "") or "").strip()
+        and not record.get("usedGroq")
+    ):
+        try:
+            llm, model = _hosted_extract_fields_from_text(
+                endpoint_url=hosted_endpoint_url,
+                text=detail.get("rawText", ""),
+                recording_number=record.get("recordingNumber", ""),
+            )
+            record["usedGroq"] = True
+            record["groqModel"] = model
+            record["ocrMethod"] = "hosted-text-endpoint"
+            record["ocrChars"] = len(str(detail.get("rawText", "") or ""))
+
+            for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
+                llm_val = (llm.get(key) or "").strip()
+                if key == "trustor":
+                    llm_val = sanitize_borrower_name(llm_val)
+                if key == "propertyAddress":
+                    llm_val = sanitize_property_address(llm_val)
+                if llm_val:
+                    record[key] = llm_val
+        except Exception as e:
+            record["groqError"] = str(e)
 
     if use_groq and groq_api_key and not blocked_no_image and (ocr_text.strip() or detail.get("rawText", "").strip()):
         try:
@@ -1937,48 +2474,10 @@ def enrich_record(
                 record["grantors"] = " | ".join(_normalise_party(x) for x in llm_grantors if str(x).strip())
             if isinstance(llm_grantees, list) and llm_grantees:
                 record["grantees"] = " | ".join(_normalise_party(x) for x in llm_grantees if str(x).strip())
-
-            # IMPORTANT: run deterministic fallback for fields still empty after LLM.
-            if not record.get("principalAmount"):
-                record["principalAmount"] = _regex_principal(merged)
-            if not record.get("propertyAddress"):
-                record["propertyAddress"] = _regex_address(merged)
-            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-                if not record.get(key):
-                    record[key] = _extract_party_block(ocr_text, label)
-                if not record.get(key):
-                    record[key] = _extract_party_block(merged, label)
-                if not record.get(key):
-                    record[key] = _regex_party(merged, label)
-
-            # Final practical fallback from indexed parties when document text is sparse.
-            if not record.get("trustor"):
-                record["trustor"] = _first_party(record.get("grantors", ""))
-            if not record.get("beneficiary"):
-                record["beneficiary"] = _first_party(record.get("grantees", ""))
-            if not record.get("trustee"):
-                gr_first = _first_party(record.get("grantees", ""))
-                if re.search(r"TRUST|TRUSTEE", gr_first or "", re.I):
-                    record["trustee"] = gr_first
         except Exception as e:
             record["groqError"] = str(e)
-            # If LLM call fails, still execute deterministic extraction.
-            if not record.get("principalAmount"):
-                record["principalAmount"] = _regex_principal(merged)
-            if not record.get("propertyAddress"):
-                record["propertyAddress"] = _regex_address(merged)
-            for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-                if not record.get(key):
-                    record[key] = _extract_party_block(ocr_text, label)
-                if not record.get(key):
-                    record[key] = _extract_party_block(merged, label)
-                if not record.get(key):
-                    record[key] = _regex_party(merged, label)
-            if not record.get("trustor"):
-                record["trustor"] = _first_party(record.get("grantors", ""))
-            if not record.get("beneficiary"):
-                record["beneficiary"] = _first_party(record.get("grantees", ""))
-    else:
+
+    if not llm_enabled:
         # Regex fallback path only when LLM is unavailable/disabled.
         if not record.get("principalAmount"):
             record["principalAmount"] = _regex_principal(merged)
@@ -1996,22 +2495,51 @@ def enrich_record(
         if not record.get("beneficiary"):
             record["beneficiary"] = _first_party(record.get("grantees", ""))
 
-    record["trustor"] = _choose_best_borrower_name(
-        detail_trustor,
-        record.get("trustor", ""),
-        _first_party(record.get("grantors", "")),
-        _extract_party_block(merged, "trustor"),
-        _regex_party(merged, "trustor"),
-    )
+    if llm_enabled:
+        record["trustor"] = _choose_best_borrower_name(
+            detail_trustor,
+            record.get("trustor", ""),
+            _first_party(record.get("grantors", "")),
+            "",
+            "",
+        )
+    else:
+        record["trustor"] = _choose_best_borrower_name(
+            detail_trustor,
+            record.get("trustor", ""),
+            _first_party(record.get("grantors", "")),
+            _extract_party_block(merged, "trustor"),
+            _regex_party(merged, "trustor"),
+        )
     record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
     record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
-    record["propertyAddress"] = _choose_best_property_address(
-        detail_address,
-        record.get("propertyAddress", ""),
-        _regex_address(merged),
-    )
+    if llm_enabled:
+        record["propertyAddress"] = _choose_best_property_address(
+            detail_address,
+            record.get("propertyAddress", ""),
+        )
+    else:
+        record["propertyAddress"] = _choose_best_property_address(
+            detail_address,
+            record.get("propertyAddress", ""),
+            _regex_address(merged),
+        )
 
-    if blocked_no_image and not record.get("principalAmount") and not record.get("propertyAddress"):
+    # Enforce final output constraints.
+    record["principalAmount"] = _normalize_principal_amount_numeric(record.get("principalAmount", "")) or "NOT_FOUND"
+
+    # Santa Cruz: parcel-id-only "addresses" are not usable as property addresses.
+    if str(COUNTY_LABEL or "").strip().upper() == "SANTA CRUZ":
+        pa = str(record.get("propertyAddress", "") or "")
+        if re.match(r"^\s*parcel\s*id\b", pa, flags=re.I):
+            record["propertyAddress"] = ""
+
+    record["propertyAddress"] = sanitize_property_address(record.get("propertyAddress", "")) or "NOT_FOUND"
+    for key in ["trustor", "trustee", "beneficiary"]:
+        v = str(record.get(key, "") or "").strip()
+        record[key] = v if v else "NOT_FOUND"
+
+    if blocked_no_image and record.get("principalAmount") in ("", "NOT_FOUND") and record.get("propertyAddress") in ("", "NOT_FOUND"):
         record["analysisError"] = (
             f"{detail.get('imageAccessNote', 'Image unavailable')}; "
             "detail page does not expose property address/principal amount"
@@ -2030,10 +2558,29 @@ def export_csv(records: list[dict], out_path: Path) -> None:
 
 def export_json(records: list[dict], out_path: Path, meta: dict | None = None) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _jsonable(v: Any) -> Any:
+        if v is None:
+            return ""
+        if isinstance(v, (str, int, float, bool)):
+            return v
+        if isinstance(v, Path):
+            return str(v)
+        if isinstance(v, set):
+            return [str(x) for x in sorted(v, key=lambda x: str(x))]
+        if isinstance(v, tuple):
+            return [_jsonable(x) for x in v]
+        if isinstance(v, list):
+            return [_jsonable(x) for x in v]
+        if isinstance(v, dict):
+            # Ensure nested dict is JSON-serializable.
+            return {str(k): _jsonable(val) for k, val in v.items()}
+        return str(v)
+
     payload = {
         "meta": meta or {},
         "count": len(records),
-        "records": [{k: r.get(k, "") for k in CSV_FIELDS} for r in records],
+        "records": [{k: _jsonable(r.get(k, "")) for k in CSV_FIELDS} for r in records],
     }
     out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -2110,6 +2657,22 @@ def run_greenlee_pipeline(
             ]:
                 if detail.get(key):
                     rec[key] = detail[key]
+
+            # Ensure link fields are present even when OCR/enrichment is skipped.
+            detail_url = str(rec.get("detailUrl") or detail.get("detailUrl") or "")
+            detail_url = urllib.parse.urljoin(BASE_URL + "/", detail_url)
+            rec["detailUrl"] = detail_url
+            image_urls = [urllib.parse.urljoin(BASE_URL + "/", str(u or "")) for u in (detail.get("imageUrls") or [])]
+            image_urls = [u for u in image_urls if u]
+            rec["imageUrls"] = " | ".join(image_urls)
+            rec["documentUrls"] = " | ".join([detail_url] + image_urls)
+            rec["links"] = json.dumps(
+                {
+                    "document_url": detail_url,
+                    "image_urls": image_urls,
+                },
+                ensure_ascii=False,
+            )
         except Exception as e:
             rec["analysisError"] = f"detail fetch failed: {e}"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")

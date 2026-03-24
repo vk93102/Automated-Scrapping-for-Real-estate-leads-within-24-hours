@@ -10,7 +10,7 @@ fastapi
 uvicorn[standard]
 gunicorn
 
-# LLM extraction (Groq — llama-3.1-8b-instant)
+# LLM extraction (Groq — llama-3.3-70b-versatile)
 # Falls back to rule-based extraction automatically when GROQ_API_KEY is not set.
 groq
 

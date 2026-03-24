@@ -349,11 +349,14 @@ def _run_once(
 
 def main() -> None:
     _load_env()
-    if not (os.environ.get("GROQ_API_KEY") or "").strip():
-        _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
+    llm_endpoint = (os.environ.get("GROQ_LLM_ENDPOINT_URL") or os.environ.get("GREENLEE_LLM_ENDPOINT_URL") or "").strip()
+    llm_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not (llm_key or llm_endpoint):
+        _log("warning: neither GROQ_API_KEY nor GROQ_LLM_ENDPOINT_URL is set; LLM extraction will be disabled")
+    elif llm_endpoint and not llm_key:
+        _log("info: using hosted LLM endpoint (GROQ_LLM_ENDPOINT_URL); GROQ_API_KEY not required")
 
     p = argparse.ArgumentParser(description="Run La Paz pipeline on interval and upsert into DB")
-    p.add_argument("--interval-minutes", type=float, default=720.0)
     p.add_argument("--lookback-days", type=int, default=7)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 process all docs with OCR+LLM (recommended), N cap, -1 skip OCR/LLM")
@@ -365,10 +368,9 @@ def main() -> None:
     p.add_argument("--doc-types", nargs="+", default=DEFAULT_DOCUMENT_TYPES)
     args = p.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
     run_once = not args.loop
     _log(
-        f"starting lapaz interval runner interval_minutes={args.interval_minutes} "
+        f"starting lapaz interval runner "
         f"lookback_days={args.lookback_days} once={run_once} workers={args.workers} "
         f"ocr_limit={args.ocr_limit} doc_types={len(args.doc_types)} verbose={args.verbose}"
     )
@@ -391,10 +393,8 @@ def main() -> None:
         if run_once:
             break
 
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+        _log(f"sleeping before next run")
+        time.sleep(60)
 
 
 if __name__ == "__main__":

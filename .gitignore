@@ -15,6 +15,7 @@ venv/
 
 # Secrets — never commit
 .env
+.supabase_database_url
 proxy_list.txt
 proxyserver.txt
 storage_state.json

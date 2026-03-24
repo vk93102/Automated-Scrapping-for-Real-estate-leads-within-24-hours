@@ -337,7 +337,7 @@ This is transformed to the direct download URL:
 3. if use_groq and ocr_text is non-empty:
      analyze_document_text_with_groq():
        POST to https://api.groq.com/openai/v1/chat/completions
-       Model: llama-3.3-70b-versatile (fallback: llama-3.1-8b-instant)
+    Model: llama-3.3-70b-versatile
        System: "You analyze county recorder OCR text into strict JSON."
        Returns JSON: { summary, parties, property, financials, dates }
        property.address  → propertyAddress
@@ -497,8 +497,7 @@ Do not invent data. Use empty strings or empty arrays when unknown.
 ```
 
 **Model cascade:**
-1. `llama-3.3-70b-versatile` (primary — most accurate)
-2. `llama-3.1-8b-instant` (fallback — faster, used if primary fails)
+1. `llama-3.3-70b-versatile` (enforced)
 
 ### 6.4 Regex Patterns (Pure Fallback)
 

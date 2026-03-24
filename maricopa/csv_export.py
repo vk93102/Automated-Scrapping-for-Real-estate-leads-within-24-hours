@@ -8,6 +8,7 @@ from typing import Any, Iterable, Optional
 
 
 BASE_CSV_HEADERS: list[str] = [
+    "Document URL",
     "Trustor 1 Full Name",
     "Trustor 1 First Name",
     "Trustor 1 Last Name",
@@ -51,6 +52,7 @@ def to_csv_rows(rows: Iterable[dict[str, Any]], *, include_meta: bool) -> list[d
             doc_type = str(doc_codes[0])
 
         base: dict[str, Any] = {
+            "Document URL": _get(r, "document_url", "documentUrl"),
                 "Trustor 1 Full Name": _get(r, "trustor_1_full_name"),
                 "Trustor 1 First Name": _get(r, "trustor_1_first_name"),
                 "Trustor 1 Last Name": _get(r, "trustor_1_last_name"),

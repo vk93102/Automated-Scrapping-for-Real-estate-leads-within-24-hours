@@ -270,14 +270,16 @@ def _run_once(interval_doc_types: list[str], workers: int, lookback_days: int, o
 
 def main() -> None:
     _load_env()
-    groq_key = (os.environ.get("GROQ_API_KEY") or "").strip()
-    if not groq_key:
-        _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
+    llm_endpoint = (os.environ.get("GROQ_LLM_ENDPOINT_URL") or os.environ.get("GREENLEE_LLM_ENDPOINT_URL") or "").strip()
+    llm_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not (llm_key or llm_endpoint):
+        _log("warning: neither GROQ_API_KEY nor GROQ_LLM_ENDPOINT_URL is set; LLM extraction will be disabled")
+    elif llm_endpoint and not llm_key:
+        _log("info: using hosted LLM endpoint (GROQ_LLM_ENDPOINT_URL); GROQ_API_KEY not required")
 
     parser = argparse.ArgumentParser(
         description="Run Navajo pipeline on an interval, fetch last N days, upsert unique rows into DB."
     )
-    parser.add_argument("--interval-minutes", type=float, default=720.0, help="Sleep interval in minutes (default: 720 = 12 hours)")
     parser.add_argument("--lookback-days", type=int, default=7, help="Fetch this many days including today (default: 7)")
     parser.add_argument("--workers", type=int, default=3, help="Pipeline workers (default: 3)")
     parser.add_argument("--once", action="store_true", help="Run once and exit (no sleep loop)")
@@ -290,10 +292,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    interval_seconds = max(60, int(args.interval_minutes * 60))
     _log(
         "starting navajo interval runner "
-        f"interval_minutes={args.interval_minutes} lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
+        f"lookback_days={args.lookback_days} once={args.once} workers={args.workers}"
     )
 
     while True:
@@ -324,10 +325,8 @@ def main() -> None:
         if args.once:
             break
 
-        elapsed = int((datetime.now() - started).total_seconds())
-        sleep_for = max(60, interval_seconds - elapsed)
-        _log(f"sleeping {sleep_for}s before next run")
-        time.sleep(sleep_for)
+        _log(f"sleeping before next run")
+        time.sleep(60)
 
 
 if __name__ == "__main__":

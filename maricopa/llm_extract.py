@@ -26,10 +26,18 @@ from .cities_az import canonicalize_city
 logger = logging.getLogger(__name__)
 
 _GROQ_API_KEY = os.environ.get("GROQ_API_KEY") or os.environ.get("LLAMA_API_KEY")
-# Prefer a 70B variant for higher-quality extraction when available.
-# Change this if your Groq account exposes a different model name.
-# Default to the user-requested Llama 3 70B versatile model.
-_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+
+def _normalize_groq_model(model: str) -> str:
+    m = (model or "").strip()
+    # Users often shorten this; Groq expects the full model id.
+    if m == "llama-3.3-70b":
+        return "llama-3.3-70b-versatile"
+    return m or "llama-3.3-70b-versatile"
+
+
+# Enforce a single model everywhere. Allow override via GROQ_MODEL.
+_MODEL = _normalize_groq_model(os.environ.get("GROQ_MODEL", "llama-3.3-70b"))
 
 # ---------------------------------------------------------------------------
 # Prompt template

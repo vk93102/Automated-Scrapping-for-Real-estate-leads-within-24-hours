@@ -864,30 +864,45 @@ def run_lapaz_pipeline(*args, **kwargs):
     """Run La Paz pipeline via shared extractor with LLM-first enrichment."""
     res = _base.run_greenlee_pipeline(*args, **kwargs)
 
-    csv_path = Path(res.get("csv_path", ""))
-    json_path = Path(res.get("json_path", ""))
-    ts = Path(csv_path).stem.replace("greenlee_leads_", "") if csv_path else ""
-    if ts:
-        new_csv = OUTPUT_DIR / f"lapaz_leads_{ts}.csv"
-        new_json = OUTPUT_DIR / f"lapaz_leads_{ts}.json"
-        if csv_path.exists():
-            csv_path.rename(new_csv)
-            res["csv_path"] = str(new_csv)
-        if json_path.exists():
-            json_path.rename(new_json)
-            res["json_path"] = str(new_json)
-
     if isinstance(res.get("summary"), dict):
         res["summary"]["county"] = "La Paz County, AZ"
 
-    json_out = Path(res.get("json_path", ""))
-    if json_out.exists():
-        try:
-            payload = json.loads(json_out.read_text(encoding="utf-8"))
-            if isinstance(payload.get("meta"), dict):
-                payload["meta"]["county"] = "La Paz County, AZ"
-            json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except Exception:
-            pass
+    # When callers pass write_output_files=False, the shared pipeline returns empty paths.
+    # In that case, skip any filesystem renames/rewrites (interval runner only needs `records`).
+    csv_path_s = str(res.get("csv_path", "") or "").strip()
+    json_path_s = str(res.get("json_path", "") or "").strip()
+    if not csv_path_s and not json_path_s:
+        return res
+
+    csv_path = Path(csv_path_s) if csv_path_s else None
+    json_path = Path(json_path_s) if json_path_s else None
+
+    ts = ""
+    if csv_path and csv_path.name:
+        ts = csv_path.stem.replace("greenlee_leads_", "")
+    elif json_path and json_path.name:
+        ts = json_path.stem.replace("greenlee_leads_", "")
+
+    if ts:
+        new_csv = OUTPUT_DIR / f"lapaz_leads_{ts}.csv"
+        new_json = OUTPUT_DIR / f"lapaz_leads_{ts}.json"
+        if csv_path and csv_path.is_file():
+            csv_path.rename(new_csv)
+            res["csv_path"] = str(new_csv)
+        if json_path and json_path.is_file():
+            json_path.rename(new_json)
+            res["json_path"] = str(new_json)
+
+    json_out_s = str(res.get("json_path", "") or "").strip()
+    if json_out_s:
+        json_out = Path(json_out_s)
+        if json_out.is_file():
+            try:
+                payload = json.loads(json_out.read_text(encoding="utf-8"))
+                if isinstance(payload.get("meta"), dict):
+                    payload["meta"]["county"] = "La Paz County, AZ"
+                json_out.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     return res

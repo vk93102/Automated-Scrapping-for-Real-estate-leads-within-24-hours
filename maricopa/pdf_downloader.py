@@ -14,6 +14,17 @@ _LEGACY_URL = "https://legacy.recorder.maricopa.gov/UnOfficialDocs/pdf/{rn}.pdf"
 _PREVIEW_URL = "https://publicapi.recorder.maricopa.gov/preview/pdf?recordingNumber={rn}&suffix="
 
 
+def preview_pdf_url(recording_number: str) -> str:
+    """Return a stable, publicly accessible PDF URL for a recording number."""
+    rn = str(recording_number).strip()
+    return _PREVIEW_URL.format(rn=rn)
+
+
+def legacy_pdf_url(recording_number: str) -> str:
+    rn = str(recording_number).strip()
+    return _LEGACY_URL.format(rn=rn)
+
+
 def _try_get_pdf(
     session: requests.Session,
     url: str,

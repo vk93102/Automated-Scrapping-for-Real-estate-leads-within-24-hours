@@ -32,7 +32,7 @@ def _load_env() -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         k, v = line.split("=", 1)
-        os.environ[k.strip()] = v.strip().strip('"').strip("'")
+        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
 def _log(msg: str) -> None:
@@ -47,6 +47,9 @@ def _log(msg: str) -> None:
 def _db_url_with_ssl(url: str) -> str:
     u = (url or "").strip()
     if not u:
+        return u
+    host = (urlparse(u).hostname or "").strip().lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
         return u
     if "sslmode=" in u.lower():
         return u
@@ -100,6 +103,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
               property_address text,
               detail_url       text,
               image_urls       text,
+              document_urls    text,
               ocr_method       text,
               ocr_chars        integer,
               used_groq        boolean,
@@ -114,6 +118,7 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
+        cur.execute("alter table santacruz_leads add column if not exists document_urls text;")
         cur.execute(
             """
             create table if not exists santacruz_pipeline_runs (
@@ -146,6 +151,11 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
             used_groq = bool(r.get("usedGroq", False))
             if used_groq:
                 llm_used += 1
+
+            address = r.get("propertyAddress", "")
+            if (address or "").upper().strip().startswith("PARCEL ID"):
+                address = "NOT_FOUND"
+
             payload = {
                 "source_county": r.get("sourceCounty") or "Santa Cruz",
                 "document_id": doc_id,
@@ -158,9 +168,10 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "trustee": r.get("trustee", ""),
                 "beneficiary": r.get("beneficiary", ""),
                 "principal_amount": r.get("principalAmount", ""),
-                "property_address": r.get("propertyAddress", ""),
+                "property_address": address,
                 "detail_url": r.get("detailUrl", ""),
                 "image_urls": r.get("imageUrls", ""),
+                "document_urls": r.get("documentUrls", ""),
                 "ocr_method": r.get("ocrMethod", ""),
                 "ocr_chars": int(r.get("ocrChars") or 0),
                 "used_groq": used_groq,
@@ -175,12 +186,12 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 insert into santacruz_leads (
                   source_county, document_id, recording_number, recording_date, document_type,
                   grantors, grantees, trustor, trustee, beneficiary, principal_amount, property_address,
-                  detail_url, image_urls, ocr_method, ocr_chars, used_groq, groq_model, groq_error,
+                  detail_url, image_urls, document_urls, ocr_method, ocr_chars, used_groq, groq_model, groq_error,
                   analysis_error, run_date, raw_record
                 ) values (
                   %(source_county)s, %(document_id)s, %(recording_number)s, %(recording_date)s, %(document_type)s,
                   %(grantors)s, %(grantees)s, %(trustor)s, %(trustee)s, %(beneficiary)s, %(principal_amount)s, %(property_address)s,
-                  %(detail_url)s, %(image_urls)s, %(ocr_method)s, %(ocr_chars)s, %(used_groq)s, %(groq_model)s, %(groq_error)s,
+                  %(detail_url)s, %(image_urls)s, %(document_urls)s, %(ocr_method)s, %(ocr_chars)s, %(used_groq)s, %(groq_model)s, %(groq_error)s,
                   %(analysis_error)s, %(run_date)s, %(raw_record)s
                 )
                 on conflict (source_county, document_id) do update set
@@ -196,6 +207,7 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                   property_address = excluded.property_address,
                   detail_url       = excluded.detail_url,
                   image_urls       = excluded.image_urls,
+                  document_urls    = excluded.document_urls,
                   ocr_method       = excluded.ocr_method,
                   ocr_chars        = excluded.ocr_chars,
                   used_groq        = excluded.used_groq,
@@ -242,6 +254,9 @@ def _run_once(
     ocr_limit: int,
     strict_llm: bool,
     verbose: bool,
+    write_files: bool,
+    db_url_override: str,
+    skip_db: bool,
 ) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
@@ -249,11 +264,12 @@ def _run_once(
     start_date = start_day.strftime("%-m/%-d/%Y")
     end_date = today.strftime("%-m/%-d/%Y")
 
-    db_url = (os.environ.get("DATABASE_URL") or "").strip()
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is missing")
-    with _connect_db(db_url) as conn:
-        _ensure_schema(conn)
+    db_url = (db_url_override or os.environ.get("DATABASE_URL") or "").strip()
+    if not skip_db:
+        if not db_url:
+            raise RuntimeError("DATABASE_URL is missing (or pass --db-url)")
+        with _connect_db(db_url) as conn:
+            _ensure_schema(conn)
 
     _log("collecting Santa Cruz records (Playwright + OCR stage) ... this can take several minutes")
     t0 = time.time()
@@ -267,7 +283,7 @@ def _run_once(
         use_groq=True,
         headless=True,
         verbose=verbose,
-        write_output_files=False,
+        write_output_files=bool(write_files),
     )
     _log(f"collection stage finished in {time.time() - t0:.1f}s")
 
@@ -277,6 +293,10 @@ def _run_once(
         if missing:
             sample = ", ".join(x for x in missing[:10] if x)
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+
+    if skip_db:
+        llm_used = sum(1 for r in records if bool(r.get("usedGroq", False)))
+        return len(records), 0, 0, llm_used, -1
 
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
@@ -297,8 +317,12 @@ def _run_once(
 
 def main() -> None:
     _load_env()
-    if not (os.environ.get("GROQ_API_KEY") or "").strip():
-        _log("warning: GROQ_API_KEY missing; LLM extraction will be disabled")
+    llm_endpoint = (os.environ.get("GROQ_LLM_ENDPOINT_URL") or os.environ.get("GREENLEE_LLM_ENDPOINT_URL") or "").strip()
+    llm_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not (llm_key or llm_endpoint):
+        _log("warning: neither GROQ_API_KEY nor GROQ_LLM_ENDPOINT_URL is set; LLM extraction will be disabled")
+    elif llm_endpoint and not llm_key:
+        _log("info: using hosted LLM endpoint (GROQ_LLM_ENDPOINT_URL); GROQ_API_KEY not required")
 
     p = argparse.ArgumentParser(description="Run Santa Cruz pipeline once and upsert into DB")
     p.add_argument("--lookback-days", type=int, default=7)
@@ -306,8 +330,24 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
+    p.add_argument("--write-files", action="store_true", help="Write CSV/JSON artifacts under SANTA CRUZ/output")
+    p.add_argument("--db-url", default="", help="Override DATABASE_URL (avoid editing .env)")
+    p.add_argument("--db-url-file", default="", help="Read DATABASE_URL override from a file (preferred for secrets)")
+    p.add_argument("--skip-db", action="store_true", help="Skip DB upsert (still runs scraper + writes files)")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
     args = p.parse_args()
+
+    # `UNIFIED_LEAD_DOC_TYPES` is a set; normalise to a stable list for JSON meta.
+    doc_types: list[str] = sorted({str(x).strip() for x in (args.doc_types or []) if str(x).strip()})
+
+    db_url_override = (args.db_url or "").strip()
+    if not db_url_override:
+        pth = (args.db_url_file or "").strip()
+        if pth:
+            try:
+                db_url_override = Path(pth).read_text(encoding="utf-8").strip()
+            except Exception as exc:
+                raise RuntimeError(f"failed to read --db-url-file: {exc}")
 
     _log(
         f"starting santacruz one-shot runner lookback_days={args.lookback_days} "
@@ -316,14 +356,20 @@ def main() -> None:
 
     try:
         total, ins, upd, llm_used, leads_total = _run_once(
-            args.doc_types,
+            doc_types,
             args.workers,
             args.lookback_days,
             args.ocr_limit,
             args.strict_llm,
             args.verbose,
+            args.write_files,
+            db_url_override,
+            args.skip_db,
         )
-        _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
+        if args.skip_db:
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total=SKIPPED")
+        else:
+            _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
     except Exception as exc:
         _log(f"run failed: {exc}")
 

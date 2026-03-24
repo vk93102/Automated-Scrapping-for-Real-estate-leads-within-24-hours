@@ -33,7 +33,7 @@ from .llm_extract import extract_fields_llm
 from .http_client import RetryConfig, new_session
 from .logging_setup import setup_logging
 from .maricopa_api import fetch_metadata, search_recording_numbers
-from .pdf_downloader import fetch_pdf_bytes
+from .pdf_downloader import fetch_pdf_bytes, preview_pdf_url
 from .tesseract_ocr import ocr_pdf_pages_tesseract, validate_ocr_text
 from .proxies import ProxyProvider
 from .state import append_seen, load_seen
@@ -193,6 +193,11 @@ def _normalize_mmddyyyy(s: str) -> str:
 def main() -> None:
     args = _parse_args()
     load_dotenv_if_present(args.dotenv)
+
+    # Optional: force end-to-end processing even when properties already exist.
+    # This keeps existing CLI behavior unless MARICOPA_ALWAYS_FORCE=1 is set.
+    if _bool_env("MARICOPA_ALWAYS_FORCE", False):
+        args.force = True
     if args.db_only and args.no_db:
         raise SystemExit("--db-only cannot be used with --no-db")
 
@@ -219,6 +224,38 @@ def main() -> None:
     if any(c.upper() == "ALL" for c in requested_doc_codes):
         requested_doc_codes = []
     requested_doc_codes_set = {_canon_doc_code(c) for c in requested_doc_codes}
+
+    _bad_addr_re = re.compile(
+        r"location\s+of\s+the\s+real\s+property\s+described\s+above\s+is\s+purported\s+to\s+be"
+        r"|other\s+common\s+designation"
+        r"|purported\s+to\s+be",
+        re.I,
+    )
+
+    def _addr_looks_bad(addr: str | None) -> bool:
+        s = str(addr or "").strip()
+        if not s:
+            return True
+        if _bad_addr_re.search(s):
+            return True
+        if not re.match(r"^\d{1,6}\b", s):
+            return True
+        if len([w for w in re.split(r"\s+", s) if w]) > 8:
+            return True
+        return False
+
+    def _principal_looks_bad(val: str | None) -> bool:
+        s = str(val or "").strip()
+        if not s:
+            return True
+        s = re.sub(r"[,$\s]", "", s)
+        return not bool(re.match(r"^\d+(?:\.\d+)?$", s))
+
+    def _name_looks_bad(val: str | None) -> bool:
+        s = str(val or "").strip()
+        if not s:
+            return True
+        return len([w for w in re.split(r"\s+", s) if w]) > 4
 
     recs: list[str] = []
     if args.recording_numbers_file:
@@ -413,14 +450,20 @@ def main() -> None:
                     except Exception:
                         doc_id = None
 
-                # If properties already exist and no force flag, skip reprocessing.
+                # If properties already exist and no force flag, skip reprocessing
+                # UNLESS the existing properties look incomplete/bad.
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
                             """
                             select exists(select 1 from properties p where p.document_id = d.id) as has_properties,
-                                   d.failed
+                                   d.failed,
+                                   p.property_address,
+                                   p.original_principal_balance,
+                                   p.trustor_1_full_name,
+                                   p.document_url
                             from documents d
+                            left join properties p on p.document_id = d.id
                             where d.recording_number = %s
                             """,
                             (rec,),
@@ -428,9 +471,17 @@ def main() -> None:
                         row = cur.fetchone()
                         has_properties = bool(row[0]) if row and len(row) > 0 else False
                         has_unresolved_error = bool(row[1]) if row and len(row) > 1 else False
+                        existing_addr = row[2] if row and len(row) > 2 else None
+                        existing_principal = row[3] if row and len(row) > 3 else None
+                        existing_trustor = row[4] if row and len(row) > 4 else None
+                        existing_doc_url = row[5] if row and len(row) > 5 else None
                 except Exception:
                     has_properties = False
                     has_unresolved_error = False
+                    existing_addr = None
+                    existing_principal = None
+                    existing_trustor = None
+                    existing_doc_url = None
 
                 # If row was previously marked failed but now has complete data,
                 # clear stale failure state.
@@ -442,9 +493,44 @@ def main() -> None:
                         pass
 
                 if has_properties and not args.force:
-                    logger.info("Skipping LLM for %s — properties already present", rec)
-                    n_skipped += 1
-                    continue
+                    looks_bad = _addr_looks_bad(existing_addr) or _principal_looks_bad(existing_principal) or _name_looks_bad(existing_trustor)
+                    if looks_bad:
+                        logger.info("Reprocessing %s — existing properties look incomplete/bad", rec)
+                    else:
+                        # Fast backfill: ensure document_url is set even when we skip reprocessing.
+                        try:
+                            if not (existing_doc_url or "").strip():
+                                doc_url = preview_pdf_url(rec)
+                                doc_id_for_props = doc_id if doc_id is not None else get_document_id(conn, rec)
+                                if not doc_id_for_props:
+                                    raise RuntimeError("missing document_id for document_url backfill")
+                                upsert_properties(
+                                    conn,
+                                    int(doc_id_for_props),
+                                    ExtractedFields(
+                                        trustor_1_full_name=None,
+                                        trustor_1_first_name=None,
+                                        trustor_1_last_name=None,
+                                        trustor_2_full_name=None,
+                                        trustor_2_first_name=None,
+                                        trustor_2_last_name=None,
+                                        property_address=None,
+                                        address_city=None,
+                                        address_state=None,
+                                        address_zip=None,
+                                        address_unit=None,
+                                        sale_date=None,
+                                        original_principal_balance=None,
+                                    ),
+                                    llm_model=None,
+                                    document_url=doc_url,
+                                )
+                                logger.info("Backfilled document_url for %s", rec)
+                        except Exception:
+                            pass
+                        logger.info("Skipping LLM for %s — properties already present", rec)
+                        n_skipped += 1
+                        continue
 
             # Schedule for metadata->LLM processing
             tasks.append((rec, meta, doc_id, ""))
@@ -549,21 +635,54 @@ def main() -> None:
                 llm_done = bool(fields)
                 
                 # Step 6: Store in database (db-only mode)
-                if fields is not None:
-                    
-                    if local_conn is not None:
-                        try:
-                            from .llm_extract import _MODEL as _LLM_MODEL
-                            llm_model_name = f"{_LLM_MODEL}-tesseract-ocr" if ocr_done else f"{_LLM_MODEL}-metadata"
-                            doc_type = meta.document_codes[0] if meta.document_codes else None
-                            upsert_properties(
-                                local_conn, doc_id, fields, 
-                                llm_model=llm_model_name
+                if local_conn is not None:
+                    try:
+                        from .llm_extract import _MODEL as _LLM_MODEL
+                        llm_model_name = f"{_LLM_MODEL}-tesseract-ocr" if ocr_done else f"{_LLM_MODEL}-metadata"
+
+                        # Always store a direct document URL for every record so
+                        # exports are actionable even when extraction is incomplete.
+                        doc_url = preview_pdf_url(rec)
+
+                        # If extraction failed (fields is None), still create the properties row
+                        # with URL (other columns remain NULL). The DB upsert preserves any
+                        # existing non-null values.
+                        fields_to_store = fields
+                        llm_model_to_store = llm_model_name
+                        if fields_to_store is None:
+                            fields_to_store = ExtractedFields(
+                                trustor_1_full_name=None,
+                                trustor_1_first_name=None,
+                                trustor_1_last_name=None,
+                                trustor_2_full_name=None,
+                                trustor_2_first_name=None,
+                                trustor_2_last_name=None,
+                                property_address=None,
+                                address_city=None,
+                                address_state=None,
+                                address_zip=None,
+                                address_unit=None,
+                                sale_date=None,
+                                original_principal_balance=None,
                             )
-                            logger.info(f"Stored properties for {rec} (model={llm_model_name})")
-                        except Exception as db_err:
-                            logger.error(f"Failed to store properties for {rec}: {db_err}")
-                            error_msg = str(db_err)
+                            llm_model_to_store = None
+
+                        upsert_properties(
+                            local_conn,
+                            doc_id,
+                            fields_to_store,
+                            llm_model=llm_model_to_store,
+                            document_url=doc_url,
+                        )
+                        logger.info(
+                            "Stored properties for %s (model=%s, url=%s)",
+                            rec,
+                            llm_model_to_store,
+                            "yes" if (doc_url or "").strip() else "no",
+                        )
+                    except Exception as db_err:
+                        logger.error(f"Failed to store properties for {rec}: {db_err}")
+                        error_msg = str(db_err)
 
             if local_conn is not None and not error_msg:
                 try:
@@ -616,30 +735,112 @@ def main() -> None:
                     logger.warning("Worker exception: %s", e)
                     n_failed += 1
 
-    # After processing, refresh results from DB (if available) to include extracted fields
+    # After processing, refresh results from DB (if available) to include extracted fields.
+    # This is critical because the "discovery" results don't contain trustor/address/principal fields.
+    new_results_enriched = list(new_results)
     if conn is not None:
         try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "select d.recording_number, d.recording_date, d.metadata, d.ocr_text, p.trustor_1_full_name, p.trustor_2_full_name, p.property_address from documents d left join properties p on p.document_id = d.id where d.recording_number = any(%s)",
-                    (recs,),
-                )
-                rows = cur.fetchall()
-                results = []
+            def _coerce_json(v: Any) -> dict[str, Any]:
+                if v in (None, ""):
+                    return {}
+                if isinstance(v, dict):
+                    return v
+                if isinstance(v, (bytes, bytearray)):
+                    v = v.decode("utf-8", errors="replace")
+                if isinstance(v, str):
+                    try:
+                        return json.loads(v) if v.strip() else {}
+                    except Exception:
+                        return {}
+                return {}
+
+            def _fetch_enriched(recording_numbers: list[str]) -> dict[str, dict[str, Any]]:
+                rec_list = [str(r).strip() for r in (recording_numbers or []) if str(r).strip()]
+                if not rec_list:
+                    return {}
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        select
+                          d.recording_number,
+                          d.recording_date,
+                          d.document_type,
+                          d.page_amount,
+                          d.names,
+                          d.metadata,
+                          (d.ocr_text is not null and length(d.ocr_text) > 0) as ocr_text_present,
+                          p.document_url,
+                          p.trustor_1_full_name, p.trustor_1_first_name, p.trustor_1_last_name,
+                          p.trustor_2_full_name, p.trustor_2_first_name, p.trustor_2_last_name,
+                          p.address_city, p.address_state, p.address_zip,
+                          p.property_address, p.address_unit,
+                          p.sale_date,
+                          p.original_principal_balance,
+                          p.llm_model
+                        from documents d
+                        left join properties p on p.document_id = d.id
+                        where d.recording_number = any(%s)
+                        """,
+                        (rec_list,),
+                    )
+                    rows = cur.fetchall() or []
+
+                out: dict[str, dict[str, Any]] = {}
                 for r in rows:
-                    meta_json = r[2] or {}
-                    results.append({
-                        "recordingNumber": r[0],
+                    rec = r[0]
+                    meta_json = _coerce_json(r[5])
+                    doc_codes = meta_json.get("document_codes") or meta_json.get("documentCodes")
+                    if not doc_codes and r[2]:
+                        doc_codes = [r[2]]
+
+                    names_val = meta_json.get("names")
+                    if not names_val and r[4]:
+                        # DB column `names` is a comma-separated string.
+                        names_val = [x.strip() for x in str(r[4]).split(",") if x.strip()]
+
+                    out[str(rec)] = {
+                        "recordingNumber": rec,
                         "recordingDate": r[1],
+                        "documentCodes": doc_codes,
+                        "pageAmount": r[3],
+                        "names": names_val,
+                        "restricted": meta_json.get("restricted"),
                         "metadata": meta_json,
-                        "ocrTextPresent": bool(r[3]),
-                        "trustor_1_full_name": r[4],
-                        "trustor_2_full_name": r[5],
-                        "property_address": r[6],
-                    })
-        except Exception:
-            # Fall back to existing results
-            pass
+                        "ocrTextPresent": bool(r[6]),
+                        "document_url": r[7],
+                        "trustor_1_full_name": r[8],
+                        "trustor_1_first_name": r[9],
+                        "trustor_1_last_name": r[10],
+                        "trustor_2_full_name": r[11],
+                        "trustor_2_first_name": r[12],
+                        "trustor_2_last_name": r[13],
+                        "address_city": r[14],
+                        "address_state": r[15],
+                        "address_zip": r[16],
+                        "property_address": r[17],
+                        "address_unit": r[18],
+                        "sale_date": r[19],
+                        "original_principal_balance": r[20],
+                        "llm_model": r[21],
+                    }
+                return out
+
+            # Refresh full run output
+            enriched_by_rec = _fetch_enriched(list(recs))
+            if enriched_by_rec:
+                results = [enriched_by_rec.get(str(r), {"recordingNumber": str(r)}) for r in recs]
+
+            # Refresh NEW-records outputs (CSV + JSON used by the server)
+            new_rec_nums = [str(r.get("recordingNumber") or "").strip() for r in (new_results or [])]
+            new_rec_nums = [r for r in new_rec_nums if r]
+            enriched_new_by_rec = _fetch_enriched(new_rec_nums)
+            if enriched_new_by_rec:
+                new_results_enriched = [
+                    {**nr, **enriched_new_by_rec.get(str(nr.get("recordingNumber") or ""), {})}
+                    for nr in (new_results or [])
+                ]
+        except Exception as e:
+            logger.warning("Failed to refresh results from DB: %s", e)
 
     if not args.db_only:
         out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -647,16 +848,16 @@ def main() -> None:
 
         # NEW-records CSV + JSON (for filtering in the server endpoint)
         csv_path = Path(args.out_csv)
-        write_csv(str(csv_path), new_results, include_meta=bool(args.csv_include_meta))
+        write_csv(str(csv_path), new_results_enriched, include_meta=bool(args.csv_include_meta))
         csv_path.with_suffix(".json").write_text(
-            json.dumps(new_results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+            json.dumps(new_results_enriched, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
-        logger.info(f"Saved {len(new_results)} NEW records CSV to {csv_path}")
+        logger.info(f"Saved {len(new_results_enriched)} NEW records CSV to {csv_path}")
 
         if args.out_csv_dated:
-            p2 = write_dated_csv(str(csv_path.parent), new_results, include_meta=bool(args.csv_include_meta))
+            p2 = write_dated_csv(str(csv_path.parent), new_results_enriched, include_meta=bool(args.csv_include_meta))
             p2.with_suffix(".json").write_text(
-                json.dumps(new_results, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                json.dumps(new_results_enriched, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             logger.info(f"Saved dated NEW records CSV to {p2}")
     else:

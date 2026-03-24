@@ -8,7 +8,7 @@
 #   1. Fetch today's recording numbers from Maricopa public API
 #   2. Check DB → skip already-processed records
 #   3. For new records: fetch metadata → check PDF accessibility
-#   4. If PDF accessible: OCR in-memory → LLaMA (Groq llama-3.1-8b-instant)
+#   4. If PDF accessible: OCR in-memory → LLaMA (Groq llama-3.3-70b-versatile)
 #   5. Store document + extracted properties in Supabase Postgres
 #   6. Track run stats in pipeline_runs table
 # =============================================================================

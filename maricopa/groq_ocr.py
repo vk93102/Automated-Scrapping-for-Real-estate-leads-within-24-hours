@@ -14,13 +14,10 @@ def _groq_key() -> str:
 
 
 def _groq_model() -> str:
-    # Try newer vision model first, fall back to alternative if needed
     model_env = (os.environ.get("GROQ_OCR_MODEL") or "").strip()
-    if model_env:
-        return model_env
-    # Default fallback chain: newer vision models
-    # Note: Groq's vision model availability changes; if unavailable, system falls back to metadata
-    return "llama-2-vision-preview"
+    if not model_env:
+        raise RuntimeError("GROQ_OCR_MODEL is required to use Groq OCR")
+    return model_env
 
 
 def _timeout_s() -> float:
