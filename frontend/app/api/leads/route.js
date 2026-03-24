@@ -106,21 +106,46 @@ export async function GET(request) {
       };
       const tableName = tableMap[county];
       let whereClause = "($1::timestamptz IS NULL OR created_at >= $1::timestamptz)";
-      if (county === "santa-cruz") {
-        whereClause += ` AND property_address != 'NOT_FOUND'`;
-      }
+      
+      // Only Santa Cruz has the document_urls column
+      const imageUrlsColumn = county === "santa-cruz" ? "document_urls as image_urls" : "NULL as image_urls";
+
+      // Manual review fields are stored in `raw_record` across county pipelines.
+      // Use `raw_record` here so the API is resilient even if the physical columns
+      // haven't been migrated/added yet.
+      const manualReviewColumns = [
+        "COALESCE(NULLIF(raw_record->>'manualReview','')::boolean,false) as manual_review",
+        "NULLIF(BTRIM(raw_record->>'manualReviewReasons'), '') as manual_review_reasons",
+        "NULLIF(BTRIM(raw_record->>'manualReviewSummary'), '') as manual_review_summary",
+        "NULLIF(BTRIM(raw_record->>'manualReviewContext'), '') as manual_review_context",
+      ].join(", ");
+      
       query = `
         SELECT
           id,
           source_county,
           document_id,
-          recording_number,
-          document_type,
+          COALESCE(
+            NULLIF(BTRIM(recording_number), ''),
+            NULLIF(BTRIM(raw_record->>'recordingNumber'), ''),
+            NULLIF(BTRIM(raw_record->>'recording_number'), '')
+          ) AS recording_number,
+          COALESCE(
+            NULLIF(BTRIM(recording_date), ''),
+            NULLIF(BTRIM(raw_record->>'recordingDate'), ''),
+            NULLIF(BTRIM(raw_record->>'recording_date'), '')
+          ) AS recording_date,
+          COALESCE(
+            NULLIF(BTRIM(document_type), ''),
+            NULLIF(BTRIM(raw_record->>'documentType'), ''),
+            NULLIF(BTRIM(raw_record->>'document_type'), '')
+          ) AS document_type,
           grantors,
           grantees,
           trustor,
           principal_amount,
           property_address,
+          ${manualReviewColumns},
           created_at,
           updated_at,
           COALESCE(
@@ -141,7 +166,7 @@ export async function GET(request) {
             NULLIF(BTRIM(raw_record->>'principalAmount'), '')
           ) AS original_principal_balance,
           NULL as detail_url,
-          document_urls as image_urls,
+          ${imageUrlsColumn},
           NULL as ocr_method,
           NULL::integer as ocr_chars,
           NULL::boolean as used_groq,
@@ -192,10 +217,28 @@ export async function GET(request) {
 
     const { rows } = await pool.query(query, [sinceIso]);
 
-    const formattedRows = rows.map(r => ({
-      id: r.id,
-      source_county: r.source_county || null,
-      document_id: r.document_id || r.id,
+    const formattedRows = rows.map(r => {
+      // Extract parcel_id from manual_review_context if present
+      let parcel_id = null;
+      if (r.manual_review_context) {
+        const parcelMatch = r.manual_review_context.match(/Parcel ID:\s*([^\s,;|]+)/i);
+        if (parcelMatch) {
+          parcel_id = parcelMatch[1];
+        }
+      }
+
+      return {
+        id: r.id,
+        source_county: r.source_county || null,
+        document_id: r.document_id || r.id,
+        recording_number: r.recording_number || null,
+        recording_date: r.recording_date || null,
+        document_type: r.document_type || null,
+        parcel_id: parcel_id || "NOT_FOUND",
+        manual_review: r.manual_review ?? null,
+      manual_review_reasons: r.manual_review_reasons ?? null,
+      manual_review_summary: r.manual_review_summary ?? null,
+      manual_review_context: r.manual_review_context ?? null,
       trustor_1_full_name: r.trustor_1_full_name || null,
       trustor_2_full_name: r.trustor_2_full_name || null,
       grantors: r.grantors || null,
@@ -203,7 +246,7 @@ export async function GET(request) {
       trustor: r.trustor || null,
       trustee: r.trustee || null,
       beneficiary: r.beneficiary || null,
-      property_address: r.property_address || null,
+      property_address: r.property_address_display || r.property_address || null,
       address_city: r.address_city || null,
       address_state: r.address_state || null,
       address_zip: r.address_zip || null,
@@ -226,7 +269,8 @@ export async function GET(request) {
         grantees: r.grantees || null,
         created_at: r.created_at,
       },
-    }));
+      };
+    });
 
     return NextResponse.json({
       range,

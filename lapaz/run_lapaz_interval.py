@@ -98,6 +98,10 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
               property_address text,
               detail_url       text,
               image_urls       text,
+                            manual_review    boolean,
+                            manual_review_reasons text,
+                            manual_review_summary text,
+                            manual_review_context text,
               ocr_method       text,
               ocr_chars        integer,
               used_groq        boolean,
@@ -126,6 +130,10 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
         cur.execute("alter table lapaz_leads add column if not exists property_address text;")
         cur.execute("alter table lapaz_leads add column if not exists detail_url text;")
         cur.execute("alter table lapaz_leads add column if not exists image_urls text;")
+        cur.execute("alter table lapaz_leads add column if not exists manual_review boolean;")
+        cur.execute("alter table lapaz_leads add column if not exists manual_review_reasons text;")
+        cur.execute("alter table lapaz_leads add column if not exists manual_review_summary text;")
+        cur.execute("alter table lapaz_leads add column if not exists manual_review_context text;")
         cur.execute("alter table lapaz_leads add column if not exists ocr_method text;")
         cur.execute("alter table lapaz_leads add column if not exists ocr_chars integer;")
         cur.execute("alter table lapaz_leads add column if not exists used_groq boolean;")
@@ -212,6 +220,10 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "property_address": r.get("propertyAddress", ""),
                 "detail_url": r.get("detailUrl", ""),
                 "image_urls": r.get("imageUrls", ""),
+                "manual_review": bool(r.get("manualReview", False)),
+                "manual_review_reasons": r.get("manualReviewReasons", ""),
+                "manual_review_summary": r.get("manualReviewSummary", ""),
+                "manual_review_context": r.get("manualReviewContext", ""),
                 "ocr_method": r.get("ocrMethod", ""),
                 "ocr_chars": int(r.get("ocrChars") or 0),
                 "used_groq": used_groq,
@@ -226,12 +238,14 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 insert into lapaz_leads (
                   source_county, document_id, recording_number, recording_date, document_type,
                   grantors, grantees, trustor, trustee, beneficiary, principal_amount, property_address,
-                  detail_url, image_urls, ocr_method, ocr_chars, used_groq, groq_model, groq_error,
+                                    detail_url, image_urls, manual_review, manual_review_reasons, manual_review_summary, manual_review_context,
+                                    ocr_method, ocr_chars, used_groq, groq_model, groq_error,
                   analysis_error, run_date, raw_record
                 ) values (
                   %(source_county)s, %(document_id)s, %(recording_number)s, %(recording_date)s, %(document_type)s,
                   %(grantors)s, %(grantees)s, %(trustor)s, %(trustee)s, %(beneficiary)s, %(principal_amount)s, %(property_address)s,
-                  %(detail_url)s, %(image_urls)s, %(ocr_method)s, %(ocr_chars)s, %(used_groq)s, %(groq_model)s, %(groq_error)s,
+                                    %(detail_url)s, %(image_urls)s, %(manual_review)s, %(manual_review_reasons)s, %(manual_review_summary)s, %(manual_review_context)s,
+                                    %(ocr_method)s, %(ocr_chars)s, %(used_groq)s, %(groq_model)s, %(groq_error)s,
                   %(analysis_error)s, %(run_date)s, %(raw_record)s
                 )
                 on conflict (source_county, document_id) do update set
@@ -247,6 +261,10 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                   property_address = excluded.property_address,
                   detail_url       = excluded.detail_url,
                   image_urls       = excluded.image_urls,
+                  manual_review          = excluded.manual_review,
+                  manual_review_reasons  = excluded.manual_review_reasons,
+                  manual_review_summary  = excluded.manual_review_summary,
+                  manual_review_context  = excluded.manual_review_context,
                   ocr_method       = excluded.ocr_method,
                   ocr_chars        = excluded.ocr_chars,
                   used_groq        = excluded.used_groq,

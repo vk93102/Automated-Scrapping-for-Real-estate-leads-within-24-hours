@@ -81,14 +81,29 @@ export default function HomePage() {
   const [searchResults, setSearchResults] = useState([]);
   const isGrahamView = activeCounty === "graham";
   const isMaricopaView = activeCounty === "maricopa";
+  const isSantaCruzView = activeCounty === "santa-cruz";
 
-  
+  const hasAddress = (row) => {
+    const v = (row?.property_address || "").trim();
+    return v !== "" && v !== "NOT_FOUND";
+  };
+
+  const esc = (value) => {
+    const s = String(value ?? "");
+    return s
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  };
+
   const handleExportCSV = () => {
     const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
     if (activeRows.length === 0) return;
     const displayRows = activeRows.filter(r => {
-      if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
-      if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+      if (addressFilter === "with") return hasAddress(r);
+      if (addressFilter === "without") return !hasAddress(r);
       return true;
     });
 
@@ -112,6 +127,18 @@ export default function HomePage() {
           "Recording Date",
           "Principal Amount"
         ]
+      : isSantaCruzView
+      ? [
+          "Document ID",
+          "Recording Number",
+          "Document Type",
+          "Parcel ID",
+          "Grantors",
+          "Grantees",
+          "Trustor",
+          "Principal Amount",
+          "Property Address",
+        ]
       : [
           "Recording Number",
           "Type",
@@ -126,32 +153,45 @@ export default function HomePage() {
       const doc = row.documents || {};
       if (isGrahamView) {
         return [
-          `"${doc.recording_number || ""}"`,
-          `"${doc.recording_date || ""}"`,
-          `"${(row.grantors || "").replace(/"/g, '""')}"`,
-          `"${(row.grantees || "").replace(/"/g, '""')}"`,
-          `"${row.original_principal_balance || row.principal_amount || ""}"`,
-          `"${(row.property_address || "").replace(/"/g, '""')}"`
+          `"${(doc.recording_number || "").replace(/\"/g, '""')}"`,
+          `"${(doc.recording_date || "").replace(/\"/g, '""')}"`,
+          `"${(row.grantors || "").replace(/\"/g, '""')}"`,
+          `"${(row.grantees || "").replace(/\"/g, '""')}"`,
+          `"${(row.original_principal_balance || row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
+          `"${(row.property_address || "").replace(/\"/g, '""')}"`,
         ].join(",");
       }
       if (isMaricopaView) {
         return [
-          `"${(row.trustor_1_full_name || "").replace(/"/g, '""')}"`,
-          `"${(row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
-          `"${(row.property_address || "").replace(/"/g, '""')}"`,
-          `"${(row.address_city || "").replace(/"/g, '""')}"`,
-          `"${(row.address_state || "").replace(/"/g, '""')}"`,
-          `"${doc.recording_number || ""}"`,
-          `"${doc.recording_date || ""}"`,
-          `"${row.original_principal_balance || ""}"`
+          `"${(row.trustor_1_full_name || "").replace(/\"/g, '""')}"`,
+          `"${(row.trustor_2_full_name || "").replace(/\"/g, '""')}"`,
+          `"${(row.property_address || "").replace(/\"/g, '""')}"`,
+          `"${(row.address_city || "").replace(/\"/g, '""')}"`,
+          `"${(row.address_state || "").replace(/\"/g, '""')}"`,
+          `"${(row.recording_number || doc.recording_number || "").replace(/\"/g, '""')}"`,
+          `"${(row.recording_date || doc.recording_date || "").replace(/\"/g, '""')}"`,
+          `"${(row.original_principal_balance || row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
+        ].join(",");
+      }
+      if (isSantaCruzView) {
+        return [
+          `"${(row.document_id || "").replace(/\"/g, '""')}"`,
+          `"${(row.recording_number || "").replace(/\"/g, '""')}"`,
+          `"${(row.document_type || "").replace(/\"/g, '""')}"`,
+          `"${(row.parcel_id || "").replace(/\"/g, '""')}"`,
+          `"${(row.grantors || "").replace(/\"/g, '""')}"`,
+          `"${(row.grantees || "").replace(/\"/g, '""')}"`,
+          `"${(row.trustor || "").replace(/\"/g, '""')}"`,
+          `"${(row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
+          `"${(row.property_address || "").replace(/\"/g, '""')}"`,
         ].join(",");
       }
       return [
         `"${doc.recording_number || ""}"`,
         `"${doc.document_type || ""}"`,
         `"${doc.recording_date || ""}"`,
-        `"${(row.trustor_1_full_name || row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
-        `"${(row.property_address || "").replace(/"/g, '""')}"`,
+        `"${row.trustor_1_full_name || row.trustor_2_full_name || "-"}"`,
+        `"${row.property_address || "-"}"`,
         `"${row.address_city || ""}"`,
         `"${row.original_principal_balance || ""}"`,
         `"${formatDate(row.created_at)}"`
@@ -173,10 +213,90 @@ export default function HomePage() {
     const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
     if (activeRows.length === 0) return;
     const displayRows = activeRows.filter(r => {
-      if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
-      if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+      if (addressFilter === "with") return hasAddress(r);
+      if (addressFilter === "without") return !hasAddress(r);
       return true;
     });
+
+    const headerCells = isGrahamView
+      ? ["Recording", "Recorded Date", "Grantors", "Grantees", "Principal Amount", "Property Address"]
+      : isMaricopaView
+      ? [
+          "Trustor 1 Full Name",
+          "Trustor 2 Full Name",
+          "Property Address",
+          "Address City",
+          "Address State",
+          "Recording Number",
+          "Recording Date",
+          "Principal Amount",
+        ]
+      : isSantaCruzView
+      ? [
+          "Document ID",
+          "Recording Number",
+          "Document Type",
+          "Parcel ID",
+          "Grantors",
+          "Grantees",
+          "Trustor",
+          "Principal Amount",
+          "Property Address",
+        ]
+      : ["Recording", "Type", "Recorded Date", "Borrower / Trustor", "Address", "City", "Principal Bal", "System Date"];
+
+    const theadHtml = `<tr>${headerCells.map((h) => `<th>${esc(h)}</th>`).join("")}</tr>`;
+
+    const tbodyHtml = displayRows
+      .map((row) => {
+        const doc = row.documents || {};
+        if (isGrahamView) {
+          return `<tr>
+            <td>${esc(doc.recording_number || "-")}</td>
+            <td>${esc(doc.recording_date || "-")}</td>
+            <td>${esc(row.grantors || "-")}</td>
+            <td>${esc(row.grantees || "-")}</td>
+            <td>${esc(row.original_principal_balance || row.principal_amount || "-")}</td>
+            <td>${esc(row.property_address || "-")}</td>
+          </tr>`;
+        }
+        if (isMaricopaView) {
+          return `<tr>
+            <td>${esc(row.trustor_1_full_name || "-")}</td>
+            <td>${esc(row.trustor_2_full_name || "-")}</td>
+            <td>${esc(row.property_address || "-")}</td>
+            <td>${esc(row.address_city || "-")}</td>
+            <td>${esc(row.address_state || "-")}</td>
+            <td>${esc(row.recording_number || doc.recording_number || "-")}</td>
+            <td>${esc(row.recording_date || doc.recording_date || "-")}</td>
+            <td>${esc(row.original_principal_balance || row.principal_amount || "-")}</td>
+          </tr>`;
+        }
+        if (isSantaCruzView) {
+          return `<tr>
+            <td>${esc(row.document_id || "-")}</td>
+            <td>${esc(row.recording_number || "-")}</td>
+            <td>${esc(row.document_type || "-")}</td>
+            <td>${esc(row.parcel_id || "-")}</td>
+            <td>${esc(row.grantors || "-")}</td>
+            <td>${esc(row.grantees || "-")}</td>
+            <td>${esc(row.trustor || "-")}</td>
+            <td>${esc(row.principal_amount || "-")}</td>
+            <td>${esc(row.property_address || "-")}</td>
+          </tr>`;
+        }
+        return `<tr>
+          <td>${esc(doc.recording_number || "-")}</td>
+          <td>${esc(doc.document_type || "-")}</td>
+          <td>${esc(doc.recording_date || "-")}</td>
+          <td>${esc(row.trustor_1_full_name || row.trustor_2_full_name || "-")}</td>
+          <td>${esc(row.property_address || "-")}</td>
+          <td>${esc(row.address_city || "-")}</td>
+          <td>${esc(row.original_principal_balance || "-")}</td>
+          <td>${esc(formatDate(row.created_at))}</td>
+        </tr>`;
+      })
+      .join("\n");
 
     const printWindow = window.open("", "_blank");
     printWindow.document.write(`
@@ -199,77 +319,10 @@ export default function HomePage() {
           <p>Generated on: ${new Date().toLocaleString()}</p>
           <table>
             <thead>
-              <tr>
-                ${isGrahamView
-                  ? `
-                    <th>Recording</th>
-                    <th>Recorded Date</th>
-                    <th>Grantors</th>
-                    <th>Grantees</th>
-                    <th>Principal Amount</th>
-                    <th>Property Address</th>
-                  `
-                  : isMaricopaView
-                  ? `
-                    <th>Trustor 1 Full Name</th>
-                    <th>Trustor 2 Full Name</th>
-                    <th>Property Address</th>
-                    <th>Address City</th>
-                    <th>Address State</th>
-                    <th>Recording Number</th>
-                    <th>Recording Date</th>
-                    <th>Principal Amount</th>
-                  `
-                  : `
-                    <th>Recording</th>
-                    <th>Type</th>
-                    <th>Recorded Date</th>
-                    <th>Borrower / Trustor</th>
-                    <th>Address</th>
-                    <th>Principal Bal</th>
-                  `}
-              </tr>
+              ${theadHtml}
             </thead>
             <tbody>
-              ${displayRows.map(row => {
-                const doc = row.documents || {};
-                if (isGrahamView) {
-                  return `
-                    <tr>
-                      <td>${doc.recording_number || "-"}</td>
-                      <td>${doc.recording_date || "-"}</td>
-                      <td>${row.grantors || "-"}</td>
-                      <td>${row.grantees || "-"}</td>
-                      <td>${row.original_principal_balance || row.principal_amount || "-"}</td>
-                      <td>${row.property_address || "-"}</td>
-                    </tr>
-                  `;
-                }
-                if (isMaricopaView) {
-                  return `
-                    <tr>
-                      <td>${row.trustor_1_full_name || "-"}</td>
-                      <td>${row.trustor_2_full_name || "-"}</td>
-                      <td>${row.property_address || "-"}</td>
-                      <td>${row.address_city || "-"}</td>
-                      <td>${row.address_state || "-"}</td>
-                      <td>${doc.recording_number || "-"}</td>
-                      <td>${doc.recording_date || "-"}</td>
-                      <td>${row.original_principal_balance || "-"}</td>
-                    </tr>
-                  `;
-                }
-                return `
-                  <tr>
-                    <td>${doc.recording_number || "-"}</td>
-                    <td>${doc.document_type || "-"}</td>
-                    <td>${doc.recording_date || "-"}</td>
-                    <td>${row.trustor_1_full_name || row.trustor_2_full_name || "-"}</td>
-                    <td>${row.property_address || "-"} ${row.address_city || ""}</td>
-                    <td>${row.original_principal_balance || "-"}</td>
-                  </tr>
-                `;
-              }).join("")}
+              ${tbodyHtml}
             </tbody>
           </table>
         </body>
@@ -362,7 +415,7 @@ export default function HomePage() {
   }, [range, isLiveCounty, activeCounty]);
 
   const stats = useMemo(() => {
-    const withAddress = rows.filter((r) => r.property_address).length;
+    const withAddress = rows.filter((r) => hasAddress(r)).length;
     const latestLeadDate = rows.length > 0 ? rows[0]?.created_at : null;
     return {
       total: rows.length,
@@ -568,6 +621,18 @@ export default function HomePage() {
                               <th>Recording Date</th>
                               <th>Principal Amount</th>
                             </>
+                          ) : isSantaCruzView ? (
+                            <>
+                              <th>Document ID</th>
+                              <th>Recording Number</th>
+                              <th>Document Type</th>
+                              <th>Parcel ID</th>
+                              <th>Grantors</th>
+                              <th>Grantees</th>
+                              <th>Trustor</th>
+                              <th>Principal Amount</th>
+                              <th>Property Address</th>
+                            </>
                           ) : (
                             <>
                               <th>Recording</th>
@@ -584,17 +649,16 @@ export default function HomePage() {
                       </thead>
                       <tbody>
                         {(() => {
-                          // Use search results if searching, otherwise use filtered rows
                           const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
                           const displayRows = activeRows.filter(r => {
-                            if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
-                            if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
+                            if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "" && r.property_address !== "NOT_FOUND";
+                            if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "" || r.property_address === "NOT_FOUND";
                             return true;
                           });
 
                           return displayRows.length === 0 ? (
                             <tr>
-                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 7 : 8} className="empty-state">
+                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 8 : isSantaCruzView ? 8 : 8} className="empty-state">
                                 {searchQuery && searchQuery.length >= 2
                                   ? "No records found matching your search."
                                   : "No records found for the selected view."}
@@ -624,6 +688,18 @@ export default function HomePage() {
                                       <td className="fw-medium">{doc.recording_number || "-"}</td>
                                       <td>{doc.recording_date || "-"}</td>
                                       <td className="fw-medium">{row.original_principal_balance || "-"}</td>
+                                    </>
+                                  ) : isSantaCruzView ? (
+                                    <>
+                                      <td>{row.document_id || "-"}</td>
+                                      <td>{row.recording_number || "-"}</td>
+                                      <td>{row.document_type || "-"}</td>
+                                      <td>{row.parcel_id || "-"}</td>
+                                      <td>{row.grantors || "-"}</td>
+                                      <td>{row.grantees || "-"}</td>
+                                      <td>{row.trustor || "-"}</td>
+                                      <td>{row.principal_amount || "-"}</td>
+                                      <td>{row.property_address || "-"}</td>
                                     </>
                                   ) : (
                                     <>

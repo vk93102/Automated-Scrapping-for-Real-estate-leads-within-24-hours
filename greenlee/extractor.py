@@ -91,7 +91,51 @@ CSV_FIELDS = [
     "groqError",
     "sourceCounty",
     "analysisError",
+    "manualReview",
+    "manualReviewReasons",
+    "manualReviewSummary",
+    "manualReviewContext",
 ]
+
+
+def _compute_manual_review(record: dict, merged_text: str = "") -> tuple[bool, str, str, str]:
+    not_found_fields: list[str] = []
+    # Lead-critical fields for review: trustor, principalAmount, propertyAddress.
+    for k in ["trustor", "principalAmount", "propertyAddress"]:
+        if str(record.get(k, "") or "").strip() == "NOT_FOUND":
+            not_found_fields.append(k)
+
+    groq_err = str(record.get("groqError", "") or "").strip()
+
+    # Only trigger manual review when key extraction is missing/failed.
+    # (Santa Cruz request: focus on NOT_FOUND records; Groq errors also require review.)
+    manual = bool(not_found_fields or groq_err)
+
+    reasons: list[str] = []
+    if manual:
+        if not_found_fields:
+            reasons.append("NOT_FOUND:" + ",".join(not_found_fields))
+        if groq_err:
+            reasons.append("GROQ_ERROR")
+        # analysisError is often a non-fatal note (e.g., image-blocked counties).
+        # Include it as context only when we're already flagging manual review.
+        if str(record.get("analysisError", "") or "").strip():
+            reasons.append("ANALYSIS_ERROR")
+    reasons_s = " | ".join(reasons)
+
+    summary = ""
+    context = ""
+    if manual:
+        trustor = str(record.get("trustor", "") or "").strip()
+        beneficiary = str(record.get("beneficiary", "") or "").strip()
+        addr = str(record.get("propertyAddress", "") or "").strip()
+        amt = str(record.get("principalAmount", "") or "").strip()
+        summary = f"trustor={trustor}; beneficiary={beneficiary}; address={addr}; principal={amt}"
+
+        snippet = re.sub(r"\s+", " ", str(merged_text or "")).strip()
+        context = snippet[:800]
+
+    return manual, reasons_s, summary, context
 
 COUNTY_LLM_SYSTEM_PROMPT = """
 You are an expert AI assistant and certified prompt engineer specializing in structured data extraction from real estate legal documents — specifically Deeds of Trust, Grant Deeds, Warranty Deeds, Quitclaim Deeds, and related instruments recorded in Cochise County, AZ. You have deep knowledge of Arizona real property law terminology, OCR artifact patterns, and legal document formatting conventions.
@@ -2335,6 +2379,12 @@ def enrich_record(
                 detail_address,
                 record.get("propertyAddress", ""),
             )
+
+            manual, reasons, summary, context = _compute_manual_review(record, merged_text=detail.get("rawText", ""))
+            record["manualReview"] = manual
+            record["manualReviewReasons"] = reasons
+            record["manualReviewSummary"] = summary
+            record["manualReviewContext"] = context
             return record
         except Exception as e:
             record.setdefault("groqError", "")
@@ -2389,6 +2439,15 @@ def enrich_record(
                     detail_address,
                     record.get("propertyAddress", ""),
                 )
+
+                manual, reasons, summary, context = _compute_manual_review(
+                    record,
+                    merged_text=(ocr_text + "\n" + str(detail.get("rawText", "") or "")).strip(),
+                )
+                record["manualReview"] = manual
+                record["manualReviewReasons"] = reasons
+                record["manualReviewSummary"] = summary
+                record["manualReviewContext"] = context
                 return record
 
     if disable_local_ocr:
@@ -2544,6 +2603,12 @@ def enrich_record(
             f"{detail.get('imageAccessNote', 'Image unavailable')}; "
             "detail page does not expose property address/principal amount"
         )
+
+    manual, reasons, summary, context = _compute_manual_review(record, merged_text=merged)
+    record["manualReview"] = manual
+    record["manualReviewReasons"] = reasons
+    record["manualReviewSummary"] = summary
+    record["manualReviewContext"] = context
     return record
 
 
@@ -2673,8 +2738,19 @@ def run_greenlee_pipeline(
                 },
                 ensure_ascii=False,
             )
+
+            manual, reasons, summary, context = _compute_manual_review(rec, merged_text=detail.get("rawText", ""))
+            rec["manualReview"] = manual
+            rec["manualReviewReasons"] = reasons
+            rec["manualReviewSummary"] = summary
+            rec["manualReviewContext"] = context
         except Exception as e:
             rec["analysisError"] = f"detail fetch failed: {e}"
+            manual, reasons, summary, context = _compute_manual_review(rec, merged_text="")
+            rec["manualReview"] = manual
+            rec["manualReviewReasons"] = reasons
+            rec["manualReviewSummary"] = summary
+            rec["manualReviewContext"] = context
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"greenlee_leads_{ts}.csv"
     json_path = OUTPUT_DIR / f"greenlee_leads_{ts}.json"
