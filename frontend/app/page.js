@@ -76,13 +76,17 @@ export default function HomePage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [isSearching, setIsSearching] = useState(false);
+  const [searchResults, setSearchResults] = useState([]);
   const isGrahamView = activeCounty === "graham";
   const isMaricopaView = activeCounty === "maricopa";
 
   
   const handleExportCSV = () => {
-    if (rows.length === 0) return;
-    const displayRows = rows.filter(r => {
+    const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
+    if (activeRows.length === 0) return;
+    const displayRows = activeRows.filter(r => {
       if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
       if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
       return true;
@@ -103,7 +107,9 @@ export default function HomePage() {
           "Trustor 2 Full Name",
           "Property Address",
           "Address City",
-          "Address State"
+          "Address State",
+          "Recording Number",
+          "Recording Date"
         ]
       : [
           "Recording Number",
@@ -133,7 +139,9 @@ export default function HomePage() {
           `"${(row.trustor_2_full_name || "").replace(/"/g, '""')}"`,
           `"${(row.property_address || "").replace(/"/g, '""')}"`,
           `"${(row.address_city || "").replace(/"/g, '""')}"`,
-          `"${(row.address_state || "").replace(/"/g, '""')}"`
+          `"${(row.address_state || "").replace(/"/g, '""')}"`,
+          `"${doc.recording_number || ""}"`,
+          `"${doc.recording_date || ""}"`
         ].join(",");
       }
       return [
@@ -160,8 +168,9 @@ export default function HomePage() {
   };
 
   const handleExportPDF = () => {
-    if (rows.length === 0) return;
-    const displayRows = rows.filter(r => {
+    const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
+    if (activeRows.length === 0) return;
+    const displayRows = activeRows.filter(r => {
       if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
       if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
       return true;
@@ -205,6 +214,8 @@ export default function HomePage() {
                     <th>Property Address</th>
                     <th>Address City</th>
                     <th>Address State</th>
+                    <th>Recording Number</th>
+                    <th>Recording Date</th>
                   `
                   : `
                     <th>Recording</th>
@@ -239,6 +250,8 @@ export default function HomePage() {
                       <td>${row.property_address || "-"}</td>
                       <td>${row.address_city || "-"}</td>
                       <td>${row.address_state || "-"}</td>
+                      <td>${doc.recording_number || "-"}</td>
+                      <td>${doc.recording_date || "-"}</td>
                     </tr>
                   `;
                 }
@@ -264,7 +277,45 @@ export default function HomePage() {
 
   const isLiveCounty = ["maricopa", "graham", "la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(activeCounty);
 
+  // Search functionality
+  useEffect(() => {
+    if (!searchQuery || searchQuery.length < 2) {
+      setSearchResults([]);
+      setIsSearching(false);
+      return;
+    }
 
+    const abort = new AbortController();
+
+    async function performSearch() {
+      try {
+        setIsSearching(true);
+        const res = await fetch(
+          `/api/search?q=${encodeURIComponent(searchQuery)}&county=${activeCounty}`,
+          { signal: abort.signal, cache: "no-store" }
+        );
+
+        if (!res.ok) {
+          throw new Error("Search failed");
+        }
+
+        const data = await res.json();
+        setSearchResults(Array.isArray(data?.rows) ? data.rows : []);
+      } catch (e) {
+        if (e.name !== "AbortError") {
+          setSearchResults([]);
+        }
+      } finally {
+        setIsSearching(false);
+      }
+    }
+
+    const timer = setTimeout(performSearch, 300);
+    return () => {
+      clearTimeout(timer);
+      abort.abort();
+    };
+  }, [searchQuery, activeCounty]);
 
   useEffect(() => {
     if (!isLiveCounty) {
@@ -438,7 +489,27 @@ export default function HomePage() {
                       </button>
                     ))}
                   </div>
-                  
+
+                  <div className="search-box" style={{ flex: 1, maxWidth: "300px" }}>
+                    <div style={{ position: "relative" }}>
+                      <Icon path={ICONS.search} style={{ position: "absolute", left: "10px", top: "50%", transform: "translateY(-50%)", color: "#666", pointerEvents: "none" }} />
+                      <input
+                        type="text"
+                        placeholder="Search by name, address, recording ID..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        style={{
+                          width: "100%",
+                          padding: "8px 10px 8px 36px",
+                          border: "1px solid #ddd",
+                          borderRadius: "4px",
+                          fontSize: "14px",
+                          boxSizing: "border-box",
+                        }}
+                      />
+                    </div>
+                  </div>
+
                   <div className="filter-group">
                     <button className={`filter-btn ${addressFilter === "all" ? "active" : ""}`} onClick={() => setAddressFilter("all")}>All Records</button>
                     <button className={`filter-btn ${addressFilter === "with" ? "active" : ""}`} onClick={() => setAddressFilter("with")}>Has Address</button>
@@ -462,14 +533,14 @@ export default function HomePage() {
                 )}
 
                 <div className="table-container">
-                  {loading && (
+                  {(loading || isSearching) && (
                     <div className="loading-state">
                       <div className="spinner"></div>
-                      Processing latest database records...
+                      {isSearching ? "Searching..." : "Processing latest database records..."}
                     </div>
                   )}
                   
-                  {!loading && (
+                  {!loading && !isSearching && (
                     <table className="data-table">
                       <thead>
                         <tr>
@@ -489,6 +560,8 @@ export default function HomePage() {
                               <th>Property Address</th>
                               <th>Address City</th>
                               <th>Address State</th>
+                              <th>Recording Number</th>
+                              <th>Recording Date</th>
                             </>
                           ) : (
                             <>
@@ -506,7 +579,9 @@ export default function HomePage() {
                       </thead>
                       <tbody>
                         {(() => {
-                          const displayRows = rows.filter(r => {
+                          // Use search results if searching, otherwise use filtered rows
+                          const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
+                          const displayRows = activeRows.filter(r => {
                             if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "";
                             if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "";
                             return true;
@@ -514,8 +589,10 @@ export default function HomePage() {
 
                           return displayRows.length === 0 ? (
                             <tr>
-                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 5 : 8} className="empty-state">
-                                No records found for the selected view.
+                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 7 : 8} className="empty-state">
+                                {searchQuery && searchQuery.length >= 2
+                                  ? "No records found matching your search."
+                                  : "No records found for the selected view."}
                               </td>
                             </tr>
                           ) : (
@@ -539,6 +616,8 @@ export default function HomePage() {
                                       <td className="td-truncate" title={row.property_address}>{row.property_address || "-"}</td>
                                       <td>{row.address_city || "-"}</td>
                                       <td>{row.address_state || "-"}</td>
+                                      <td className="fw-medium">{doc.recording_number || "-"}</td>
+                                      <td>{doc.recording_date || "-"}</td>
                                     </>
                                   ) : (
                                     <>
