@@ -109,7 +109,8 @@ export default function HomePage() {
           "Address City",
           "Address State",
           "Recording Number",
-          "Recording Date"
+          "Recording Date",
+          "Principal Amount"
         ]
       : [
           "Recording Number",
@@ -141,7 +142,8 @@ export default function HomePage() {
           `"${(row.address_city || "").replace(/"/g, '""')}"`,
           `"${(row.address_state || "").replace(/"/g, '""')}"`,
           `"${doc.recording_number || ""}"`,
-          `"${doc.recording_date || ""}"`
+          `"${doc.recording_date || ""}"`,
+          `"${row.original_principal_balance || ""}"`
         ].join(",");
       }
       return [
@@ -216,6 +218,7 @@ export default function HomePage() {
                     <th>Address State</th>
                     <th>Recording Number</th>
                     <th>Recording Date</th>
+                    <th>Principal Amount</th>
                   `
                   : `
                     <th>Recording</th>
@@ -252,6 +255,7 @@ export default function HomePage() {
                       <td>${row.address_state || "-"}</td>
                       <td>${doc.recording_number || "-"}</td>
                       <td>${doc.recording_date || "-"}</td>
+                      <td>${row.original_principal_balance || "-"}</td>
                     </tr>
                   `;
                 }
@@ -562,6 +566,7 @@ export default function HomePage() {
                               <th>Address State</th>
                               <th>Recording Number</th>
                               <th>Recording Date</th>
+                              <th>Principal Amount</th>
                             </>
                           ) : (
                             <>
@@ -618,6 +623,7 @@ export default function HomePage() {
                                       <td>{row.address_state || "-"}</td>
                                       <td className="fw-medium">{doc.recording_number || "-"}</td>
                                       <td>{doc.recording_date || "-"}</td>
+                                      <td className="fw-medium">{row.original_principal_balance || "-"}</td>
                                     </>
                                   ) : (
                                     <>
