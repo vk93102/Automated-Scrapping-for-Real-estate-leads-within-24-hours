@@ -338,8 +338,8 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                                     ocr_chars        = greatest(coalesce(excluded.ocr_chars, 0), coalesce(greenlee_leads.ocr_chars, 0)),
                   used_groq        = excluded.used_groq,
                                     groq_model       = coalesce(nullif(excluded.groq_model, ''), greenlee_leads.groq_model),
-                                    groq_error       = coalesce(nullif(excluded.groq_error, ''), greenlee_leads.groq_error),
-                                    analysis_error   = coalesce(nullif(excluded.analysis_error, ''), greenlee_leads.analysis_error),
+                                                                        groq_error       = excluded.groq_error,
+                                                                        analysis_error   = excluded.analysis_error,
                   run_date         = excluded.run_date,
                   raw_record       = excluded.raw_record,
                   updated_at       = now()
