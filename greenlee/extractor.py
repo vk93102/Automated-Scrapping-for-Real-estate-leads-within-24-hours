@@ -989,7 +989,10 @@ def _goto_document_search(page: Any, verbose: bool = False) -> None:
     county_sel = "select[id*='cboCounties'], select[name*='cboCounties']"
     if page.locator(county_sel).count() > 0:
         try:
-            page.locator(county_sel).first.select_option(label=COUNTY_LABEL)
+            ok = _select_option_containing(page, county_sel, COUNTY_LABEL)
+            if not ok:
+                # Fallback: try exact label selection (older behavior)
+                page.locator(county_sel).first.select_option(label=COUNTY_LABEL)
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:
@@ -1533,47 +1536,6 @@ def ocr_document_images(
     return "\n".join(texts).strip(), used
 
 
-def _regex_principal(text: str) -> str:
-    def _format_money(raw: str) -> str:
-        return _normalize_principal_amount_numeric(raw)
-
-    pats = [
-        r"(?:original\s+principal(?:\s+amount)?|principal\s+balance|unpaid\s+principal(?:\s+balance)?|loan\s+amount|amount\s+of\s+the\s+indebtedness|sum\s+of)[^\d\n]{0,80}(\$?\s*\d[\d,]*(?:\.\d{2})?)",
-        r"(?:principal|indebtedness)[^\d\n]{0,40}(\$?\s*\d[\d,]*(?:\.\d{2})?)",
-    ]
-    for p in pats:
-        m = re.search(p, text, re.I | re.S | re.M)
-        if m:
-            val = _format_money(m.group(1).strip())
-            if val:
-                return val
-
-    for ln in (text or "").splitlines():
-        line = ln.strip()
-        if not line:
-            continue
-        u = line.upper()
-        if not any(k in u for k in ["PRINCIPAL", "INDEBTEDNESS", "LOAN AMOUNT", "UNPAID BALANCE"]):
-            continue
-        amounts = re.findall(r"\$?\s*\d[\d,]*(?:\.\d{2})?", line)
-        if not amounts:
-            continue
-        # Prefer the largest amount on the principal-indicative line.
-        best = ""
-        best_val = 0.0
-        for amt in amounts:
-            fm = _format_money(amt)
-            if not fm:
-                continue
-            v = float(re.sub(r"[^\d.]", "", fm))
-            if v > best_val:
-                best_val = v
-                best = fm
-        if best:
-            return best
-    return ""
-
-
 _ADDRESS_NOISE_PATTERNS = [
     r"\bREQUESTED\s+BY\b",
     r"\bWHEN\s+RECORDED\s+MAIL\s+TO\b",
@@ -1681,24 +1643,6 @@ def _sanitization_disabled() -> bool:
     return False
 
 
-def _llm_regex_fallback_enabled() -> bool:
-    """Whether to allow regex fallback even when LLM is enabled.
-
-    Some counties benefit from hybrid extraction for property addresses when
-    the LLM returns only parcel/APN or misses the street address.
-    """
-    env_key = _county_env_key()
-    candidates = [
-        "LLM_REGEX_FALLBACK",
-        f"{env_key}_LLM_REGEX_FALLBACK",
-        f"{env_key.replace('_', '')}_LLM_REGEX_FALLBACK",
-    ]
-    for k in candidates:
-        if str(os.getenv(k, "")).strip() == "1":
-            return True
-    return False
-
-
 def _maybe_sanitize_property_address(value: str) -> str:
     raw = re.sub(r"\s+", " ", str(value or "")).strip()
     if not raw or raw.upper() == "NOT_FOUND":
@@ -1752,140 +1696,6 @@ def _choose_best_property_address(*candidates: str) -> str:
             best = cleaned
             best_score = score
     return best
-
-
-def _regex_address(text: str) -> str:
-    exclude = [
-        r"\bDEED OF TRUST\b",
-        r"\bLegal Lot Block\b",
-        r"Section.*Township",
-        r"0\s+Items\s+in\s+Cart",
-        r"\bSign In\b",
-        r"County,\s*AZ\s*Record",
-        r"theCountyRecorder\.com",
-        r"County Selection Missing",
-        r"Skip Navigation Links",
-        r"Requested By",
-        r"Recording Fee",
-    ]
-
-    def _clean_candidate(val: str) -> str:
-        v = _maybe_sanitize_property_address(val)
-        if not v:
-            return ""
-        if any(re.search(e, v, re.I) for e in exclude):
-            return ""
-        return v
-
-    # Prefer explicit property labels to avoid capturing party mailing addresses.
-    label_pats = [
-        r"(?:property\s+address|situs\s+address|premises\s+address|commonly\s+known\s+as|property\s+located\s+at|located\s+at)\s*[:\-]\s*(.+)",
-        r"(?:property\s+address|situs\s+address|premises\s+address|commonly\s+known\s+as)\s+(.+)",
-    ]
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln and ln.strip()]
-    for idx, line in enumerate(lines):
-        for lp in label_pats:
-            m = re.search(lp, line, re.I)
-            if not m:
-                continue
-            cand = m.group(1)
-            if idx + 1 < len(lines) and len(cand) < 12:
-                cand = f"{cand} {lines[idx + 1]}"
-            out = _clean_candidate(cand)
-            if out:
-                return out
-
-    pats = [
-        r"\b\d{1,6}\s+(?:[NSEW]\.?\s+)?[A-Z0-9][A-Za-z0-9\s.,#\-']{3,90}\b(?:ST|STREET|AVE|AVENUE|RD|ROAD|DR|DRIVE|LN|LANE|BLVD|BOULEVARD|CT|COURT|PL|PLACE|WAY|HWY|HIGHWAY|PKWY|PARKWAY|CIR|CIRCLE)\b(?:,\s*[A-Z][A-Za-z .'-]+,\s*AZ(?:\s+\d{5}(?:-\d{4})?)?)?",
-    ]
-    for p in pats:
-        m = re.search(p, text, re.I | re.M)
-        if m:
-            val = m.group(1) if m.lastindex and m.group(1) else m.group(0)
-            out = _clean_candidate(val)
-            if out:
-                return out
-    return ""
-
-
-def _regex_party(text: str, label: str) -> str:
-    lines = [re.sub(r"\s+", " ", ln).strip(" |:;,-") for ln in (text or "").splitlines()]
-    stop_terms = [
-        "SHOW NAME INDEXING",
-        "HIDE NAME INDEXING",
-        "UNDER THIS SECURITY INSTRUMENT",
-        "TO THE EXTENT OF",
-        "REQUESTED BY",
-    ]
-    label_re = re.compile(rf"\b{re.escape(label)}\b", re.I)
-    for i, line in enumerate(lines):
-        if not label_re.search(line):
-            continue
-        cand = label_re.sub("", line).strip(" :-|,")
-        if not cand and i + 1 < len(lines):
-            cand = lines[i + 1]
-        cand = re.sub(r"\s+", " ", cand).strip(" |:;,-")
-        if not cand:
-            continue
-        if any(t in cand.upper() for t in stop_terms):
-            continue
-        if len(cand) < 4:
-            continue
-        if not re.search(r"[A-Za-z]", cand):
-            continue
-        return cand
-    return ""
-
-
-def _extract_party_block(text: str, role: str) -> str:
-    if not text:
-        return ""
-    lines = [re.sub(r"\s+", " ", ln).strip(" |:;,-") for ln in text.splitlines() if ln and ln.strip()]
-    label_patterns = [
-        rf"name\s+and\s+address\s+of\s+(?:the\s+)?{role}",
-        rf"\b{role}\b",
-    ]
-    stop_patterns = [
-        r"name\s+and\s+address\s+of",
-        r"recording\s+requested\s+by",
-        r"when\s+recorded\s+mail\s+to",
-        r"notice\s+of",
-        r"apn\b",
-    ]
-    for i, line in enumerate(lines):
-        if not any(re.search(lp, line, re.I) for lp in label_patterns):
-            continue
-        candidate_parts: list[str] = []
-        after = line
-        for lp in label_patterns:
-            after = re.sub(lp, "", after, flags=re.I)
-        after = after.strip(" :-|,")
-        if after:
-            candidate_parts.append(after)
-        for j in range(i + 1, min(i + 4, len(lines))):
-            nxt = lines[j]
-            if any(re.search(sp, nxt, re.I) for sp in stop_patterns):
-                break
-            if nxt:
-                candidate_parts.append(nxt)
-            if len(" ".join(candidate_parts)) > 140:
-                break
-        cand = re.sub(r"\s+", " ", " ".join(candidate_parts)).strip(" |:;,-")
-        if not cand:
-            continue
-        bad = [
-            "UNDER THIS SECURITY INSTRUMENT",
-            "TO THE EXTENT OF",
-            "SHOW NAME INDEXING",
-            "HIDE NAME INDEXING",
-            "NAME AND ADDRESS",
-        ]
-        if any(b in cand.upper() for b in bad):
-            continue
-        if len(cand) < 5 or not re.search(r"[A-Za-z]", cand):
-            continue
-        return cand
-    return ""
 
 
 def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int = 60) -> tuple[dict, str]:
@@ -2446,6 +2256,7 @@ def enrich_record(
             )
             record["usedGroq"] = True
             record["groqModel"] = model
+            record["llmSource"] = "hosted-document-endpoint"
             record["ocrMethod"] = "hosted-document-endpoint"
             record["ocrChars"] = len(hosted_ocr_text or "")
 
@@ -2473,15 +2284,32 @@ def enrich_record(
             )
             record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
             record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
-            regex_addr = ""
-            if _llm_regex_fallback_enabled():
-                merged_for_addr = (str(hosted_ocr_text or "") + "\n" + str(detail.get("rawText", "") or "")).strip()
-                regex_addr = _regex_address(merged_for_addr)
             record["propertyAddress"] = _choose_best_property_address(
                 detail_address,
                 record.get("propertyAddress", ""),
-                regex_addr,
             )
+
+            # Enforce final output constraints (keep consistent with the non-hosted path).
+            if _strict_valuation_disabled():
+                record["principalAmount"] = str(record.get("principalAmount", "") or "").strip() or "NOT_FOUND"
+            else:
+                record["principalAmount"] = _normalize_principal_amount_numeric(record.get("principalAmount", "")) or "NOT_FOUND"
+
+            # Santa Cruz: parcel-id-only "addresses" are not usable as property addresses.
+            if str(COUNTY_LABEL or "").strip().upper() == "SANTA CRUZ":
+                pa = str(record.get("propertyAddress", "") or "")
+                if re.match(r"^\s*parcel\s*id\b", pa, flags=re.I):
+                    record["propertyAddress"] = ""
+
+            if _sanitization_disabled():
+                record["propertyAddress"] = (
+                    re.sub(r"\s+", " ", str(record.get("propertyAddress", "") or "")).strip() or "NOT_FOUND"
+                )
+            else:
+                record["propertyAddress"] = sanitize_property_address(record.get("propertyAddress", "")) or "NOT_FOUND"
+            for key in ["trustor", "trustee", "beneficiary"]:
+                v = str(record.get(key, "") or "").strip()
+                record[key] = v if v else "NOT_FOUND"
 
             manual, reasons, summary, context = _compute_manual_review(record, merged_text=detail.get("rawText", ""))
             record["manualReview"] = manual
@@ -2514,6 +2342,7 @@ def enrich_record(
                         )
                         record["usedGroq"] = True
                         record["groqModel"] = model
+                        record["llmSource"] = "groq-api"
                         for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
                             llm_val = (llm.get(key) or "").strip()
                             if key == "trustor":
@@ -2542,6 +2371,27 @@ def enrich_record(
                     detail_address,
                     record.get("propertyAddress", ""),
                 )
+
+                # Enforce final output constraints (keep consistent with the non-hosted path).
+                if _strict_valuation_disabled():
+                    record["principalAmount"] = str(record.get("principalAmount", "") or "").strip() or "NOT_FOUND"
+                else:
+                    record["principalAmount"] = _normalize_principal_amount_numeric(record.get("principalAmount", "")) or "NOT_FOUND"
+
+                if str(COUNTY_LABEL or "").strip().upper() == "SANTA CRUZ":
+                    pa = str(record.get("propertyAddress", "") or "")
+                    if re.match(r"^\s*parcel\s*id\b", pa, flags=re.I):
+                        record["propertyAddress"] = ""
+
+                if _sanitization_disabled():
+                    record["propertyAddress"] = (
+                        re.sub(r"\s+", " ", str(record.get("propertyAddress", "") or "")).strip() or "NOT_FOUND"
+                    )
+                else:
+                    record["propertyAddress"] = sanitize_property_address(record.get("propertyAddress", "")) or "NOT_FOUND"
+                for key in ["trustor", "trustee", "beneficiary"]:
+                    v = str(record.get(key, "") or "").strip()
+                    record[key] = v if v else "NOT_FOUND"
 
                 manual, reasons, summary, context = _compute_manual_review(
                     record,
@@ -2593,6 +2443,7 @@ def enrich_record(
             )
             record["usedGroq"] = True
             record["groqModel"] = model
+            record["llmSource"] = "hosted-text-endpoint"
             record["ocrMethod"] = "hosted-text-endpoint"
             record["ocrChars"] = len(str(detail.get("rawText", "") or ""))
 
@@ -2619,6 +2470,7 @@ def enrich_record(
             )
             record["usedGroq"] = True
             record["groqModel"] = model
+            record["llmSource"] = "groq-api"
 
             # LLM-first mapping (no regex dependency when LLM is enabled).
             for key in ["trustor", "trustee", "beneficiary", "propertyAddress", "principalAmount"]:
@@ -2636,31 +2488,17 @@ def enrich_record(
                 record["grantors"] = " | ".join(_normalise_party(x) for x in llm_grantors if str(x).strip())
             if isinstance(llm_grantees, list) and llm_grantees:
                 record["grantees"] = " | ".join(_normalise_party(x) for x in llm_grantees if str(x).strip())
-
-            # Optional hybrid fallback for address when LLM misses street address.
-            if _llm_regex_fallback_enabled():
-                if not str(record.get("propertyAddress", "") or "").strip() or str(record.get("propertyAddress", "")).strip().upper() == "NOT_FOUND":
-                    record["propertyAddress"] = _regex_address(merged) or record.get("propertyAddress", "")
         except Exception as e:
             record["groqError"] = str(e)
 
     if not llm_enabled:
-        # Regex fallback path only when LLM is unavailable/disabled.
-        if not record.get("principalAmount"):
-            record["principalAmount"] = _regex_principal(merged)
-        if not record.get("propertyAddress"):
-            record["propertyAddress"] = _regex_address(merged)
-        for label, key in [("trustor", "trustor"), ("trustee", "trustee"), ("beneficiary", "beneficiary")]:
-            if not record.get(key):
-                record[key] = _extract_party_block(ocr_text, label)
-            if not record.get(key):
-                record[key] = _extract_party_block(merged, label)
-            if not record.get(key):
-                record[key] = _regex_party(merged, label)
+        # LLM is required for extraction; no regex fallback path available.
+        # Ensure minimum fields are populated from metadata if LLM is unavailable.
         if not record.get("trustor"):
             record["trustor"] = _first_party(record.get("grantors", ""))
         if not record.get("beneficiary"):
             record["beneficiary"] = _first_party(record.get("grantees", ""))
+
 
     if llm_enabled:
         record["trustor"] = _choose_best_borrower_name(
@@ -2675,8 +2513,8 @@ def enrich_record(
             detail_trustor,
             record.get("trustor", ""),
             _first_party(record.get("grantors", "")),
-            _extract_party_block(merged, "trustor"),
-            _regex_party(merged, "trustor"),
+            "",
+            "",
         )
     record["trustee"] = _safe_filtered_party(record.get("trustee", ""))
     record["beneficiary"] = _safe_filtered_party(record.get("beneficiary", ""))
@@ -2689,15 +2527,6 @@ def enrich_record(
         record["propertyAddress"] = _choose_best_property_address(
             detail_address,
             record.get("propertyAddress", ""),
-            _regex_address(merged),
-        )
-
-    # Optional hybrid fallback: include regex address even when LLM is enabled.
-    if llm_enabled and _llm_regex_fallback_enabled():
-        record["propertyAddress"] = _choose_best_property_address(
-            detail_address,
-            record.get("propertyAddress", ""),
-            _regex_address(merged),
         )
 
     # Enforce final output constraints.

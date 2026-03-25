@@ -473,9 +473,19 @@ def _run_once(
                     addr_kind = "empty"
                 elif upper.startswith("PARCEL") or upper.startswith("APN") or "PARCEL ID" in upper:
                     addr_kind = "parcel"
+
+                used_llm = bool(r.get("usedGroq", False))
+                ocr_method = str(r.get("ocrMethod", "") or "").strip()
+                ocr_chars = int(r.get("ocrChars") or 0)
+                model = str(r.get("groqModel", "") or "").strip()
+                err = str(r.get("groqError", "") or "").strip()
+                err_short = (err[:120] + "…") if len(err) > 120 else err
                 _log(
                     f"realtime[{i+1}/{min(len(records),50)}] docId={doc_id or '(missing)'} "
-                    f"type={str(r.get('documentType','') or '').strip()} addr_kind={addr_kind} addr={addr[:160]}"
+                    f"type={str(r.get('documentType','') or '').strip()} llm={used_llm} "
+                    f"ocr={ocr_method}:{ocr_chars} model={model or '-'} "
+                    f"addr_kind={addr_kind} addr={addr[:160]}"
+                    f"{(' groq_err=' + err_short) if err_short else ''}"
                 )
 
         inserted, updated, llm_used = _upsert_records(conn, records, today)

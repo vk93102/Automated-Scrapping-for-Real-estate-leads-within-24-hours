@@ -8,11 +8,43 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+const RANGE_MAP = {
+  day: 1,
+  week: 7,
+  month: 30,
+  all: null,
+};
+
+function getSinceIso(range) {
+  const days = RANGE_MAP[range] ?? null;
+  if (!days) return null;
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  // Include exactly `days` calendar days including today.
+  d.setDate(d.getDate() - (days - 1));
+  return d.toISOString();
+}
+
+function sqlParsedDateFromText(textExpr) {
+  return `(
+    CASE
+      WHEN ${textExpr} IS NULL OR BTRIM(${textExpr}) = '' THEN NULL
+      WHEN ${textExpr} ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN (${textExpr})::date
+      WHEN ${textExpr} ~ '^\\d{4}-\\d{2}-\\d{2}T' THEN (substring(${textExpr} from 1 for 10))::date
+      WHEN ${textExpr} ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(${textExpr}, 'MM/DD/YYYY')
+      WHEN ${textExpr} ~ '^\\d{1,2}-\\d{1,2}-\\d{4}$' THEN to_date(${textExpr}, 'MM-DD-YYYY')
+      ELSE NULL
+    END
+  )`;
+}
+
 export async function GET(request) {
   try {
     const { searchParams } = new URL(request.url);
     const query = (searchParams.get("q") || "").trim();
     const county = searchParams.get("county") || "maricopa";
+    const range = searchParams.get("range") || (county === "maricopa" ? "day" : "all");
+    const sinceIso = getSinceIso(range);
     
     if (!query || query.length < 2) {
       return NextResponse.json({ rows: [] });
@@ -22,6 +54,9 @@ export async function GET(request) {
     let sql = "";
 
     if (county === "graham") {
+      const recordingDateText = "NULLIF(BTRIM(recording_date::text), '')";
+      const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
+      const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
       sql = `
         SELECT
           id,
@@ -67,6 +102,7 @@ export async function GET(request) {
           OR trustor ILIKE $1
           OR property_address ILIKE $1
         )
+        AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
         ORDER BY created_at DESC
         LIMIT 100;
       `;
@@ -79,6 +115,13 @@ export async function GET(request) {
         "cochise": "cochise_leads"
       };
       const tableName = tableMap[county];
+      const recordingDateText = `COALESCE(
+        NULLIF(BTRIM(recording_date::text), ''),
+        NULLIF(BTRIM(raw_record->>'recordingDate'), ''),
+        NULLIF(BTRIM(raw_record->>'recording_date'), '')
+      )`;
+      const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
+      const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
       sql = `
         SELECT
           id,
@@ -118,11 +161,13 @@ export async function GET(request) {
           OR trustor ILIKE $1
           OR property_address ILIKE $1
         )
+        AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
         ORDER BY created_at DESC
         LIMIT 100;
       `;
     } else {
       // Maricopa and others
+      const effectiveTs = "COALESCE(d.recording_date::timestamptz, d.created_at)";
       sql = `
         SELECT
           d.id,
@@ -153,8 +198,8 @@ export async function GET(request) {
           NULL::integer as ocr_chars,
           NULL::boolean as used_groq,
           p.llm_model
-        FROM documents d
-        LEFT JOIN properties p ON p.document_id = d.id
+        FROM maricopa.documents d
+        LEFT JOIN maricopa.properties p ON p.document_id = d.id
         WHERE (
           d.recording_number ILIKE $1
           OR p.trustor_1_full_name ILIKE $1
@@ -162,12 +207,13 @@ export async function GET(request) {
           OR p.property_address ILIKE $1
           OR p.address_city ILIKE $1
         )
+        AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
         ORDER BY d.created_at DESC
         LIMIT 100;
       `;
     }
 
-    const { rows } = await pool.query(sql, [searchTerm]);
+    const { rows } = await pool.query(sql, [searchTerm, sinceIso]);
 
     const formattedRows = rows.map(r => ({
       id: r.id,
@@ -207,6 +253,7 @@ export async function GET(request) {
 
     return NextResponse.json({
       query,
+      range,
       total: formattedRows.length,
       rows: formattedRows,
     });

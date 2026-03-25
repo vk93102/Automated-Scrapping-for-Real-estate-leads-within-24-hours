@@ -45,9 +45,104 @@ from extractor import (
     fetch_session_results_pages,
     load_env,
     parse_search_results_html,
+    run_live_search,
 )
+import db_supabase
 
 STATE_FILE = OUTPUT_DIR / "session_state.json"
+
+
+def _cookie_from_storage_state(path: Path) -> str:
+    """Build a Cookie header string from a Playwright storage_state JSON file."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    cookies = data.get("cookies")
+    if not isinstance(cookies, list):
+        return ""
+    parts: list[str] = []
+    for c in cookies:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "").strip()
+        value = str(c.get("value") or "")
+        if name:
+            parts.append(f"{name}={value}")
+    return "; ".join(parts)
+
+
+def _search_all_records(
+    start_date: str,
+    end_date: str,
+    doc_types: list[str],
+    headless: bool,
+    page_limit: int | None,
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """Return (cookie_header, records, summary) without hard-stopping on CAPTCHA."""
+    try:
+        cookie, page1_records, page1_summary = _playwright_search(
+            start_date=start_date,
+            end_date=end_date,
+            doc_types=doc_types,
+            headless=headless,
+            page_limit=page_limit,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "reCAPTCHA" not in msg:
+            raise
+
+        print(f"[WARN] {msg}")
+
+        # 1) Best-effort: use already-saved cookies and run the requests-only flow.
+        if STATE_FILE.exists():
+            cookie_from_state = _cookie_from_storage_state(STATE_FILE)
+            if cookie_from_state.strip():
+                print("[AUTH] Trying requests-only live search with stored cookies …")
+                res = run_live_search(
+                    start_date=start_date,
+                    end_date=end_date,
+                    document_types=doc_types,
+                    page_limit=page_limit,
+                    cookie=cookie_from_state,
+                    save_html=True,
+                )
+                records = list(res.get("records", []) or [])
+                summary = dict(res.get("summary", {}) or {})
+                if records:
+                    print(f"[SEARCH] Requests-only search succeeded: {len(records)} records")
+                    return cookie_from_state, records, summary
+                print("[WARN] Stored-cookie search returned 0 records; cookies may be expired.")
+
+        # 2) Optional: interactive retry to refresh cookies.
+        allow_headful_retry = str(os.environ.get("COCONINO_CAPTCHA_HEADFUL_RETRY", "")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if headless and allow_headful_retry:
+            print("[AUTH] Retrying Playwright in headful mode to refresh cookies …")
+            cookie, page1_records, page1_summary = _playwright_search(
+                start_date=start_date,
+                end_date=end_date,
+                doc_types=doc_types,
+                headless=False,
+                page_limit=page_limit,
+            )
+        else:
+            raise RuntimeError(
+                "Blocked by Coconino disclaimer reCAPTCHA and no valid stored-cookie session was available. "
+                "Run once with `--headful` to accept the disclaimer/captcha (this will save cookies to output/session_state.json), "
+                "or set `COCONINO_CAPTCHA_HEADFUL_RETRY=1` to auto-retry headful when headless is blocked."
+            )
+
+    if not cookie.strip():
+        raise RuntimeError("[AUTH] Failed to extract session cookies.")
+
+    # With a valid cookie, paginate remaining pages via requests.
+    all_records, summary = _paginate_all_pages(cookie, page1_records, page1_summary, page_limit)
+    return cookie, all_records, summary
 
 # ─── Target document types ────────────────────────────────────────────────────
 
@@ -194,7 +289,9 @@ def _playwright_search(
                         "Run in headful mode once and manually click 'I Accept', then re-run interval job."
                     )
                 print("[AUTH] Waiting for manual disclaimer/captcha acceptance in headful mode …")
-                page.wait_for_url("**/web/search/**", timeout=240_000)
+                # Allow plenty of time for manual interaction.
+                wait_ms = int(os.environ.get("COCONINO_CAPTCHA_WAIT_MS", "1800000") or 1800000)
+                page.wait_for_url("**/web/search/**", timeout=wait_ms, wait_until="domcontentloaded")
 
         # Fill date range
         if page.locator("#field_rdate_DOT_StartDate").count() > 0:
@@ -354,19 +451,30 @@ def run_pipeline(
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     effective_types = doc_types or TARGET_DOC_TYPES
 
-    # ── Stage 1: Playwright auth + search form submit ────────────────────────
-    cookie, page1_records, page1_summary = _playwright_search(
-        start_date=start_date,
-        end_date=end_date,
-        doc_types=effective_types,
-        headless=headless,
-        page_limit=page_limit,
-    )
-    if not cookie.strip():
-        raise RuntimeError("[AUTH] Failed to extract session cookies.")
-
-    # ── Stage 2: Paginate all remaining pages ────────────────────────────────
-    all_records, summary = _paginate_all_pages(cookie, page1_records, page1_summary, page_limit)
+    # ── Stage 1+2: Search + pagination (CAPTCHA-safe) ───────────────────────
+    try:
+        cookie, all_records, summary = _search_all_records(
+            start_date=start_date,
+            end_date=end_date,
+            doc_types=effective_types,
+            headless=headless,
+            page_limit=page_limit,
+        )
+    except RuntimeError as exc:
+        msg = str(exc)
+        if "reCAPTCHA" not in msg:
+            raise
+        print(f"[WARN] {msg}")
+        return {
+            "ok": False,
+            "startDate": start_date,
+            "endDate": end_date,
+            "documentTypes": effective_types,
+            "recordCount": 0,
+            "records": [],
+            "error": "captcha_blocked",
+            "message": msg,
+        }
 
     # ── Stage 3: Client-side filter ──────────────────────────────────────────
     records = _apply_filter(all_records)
@@ -417,22 +525,50 @@ def run_pipeline(
             )
             # Prefer Groq-extracted fields when available
             groq = analysis.get("groqAnalysis") or {}
-            groq_prop = groq.get("property") or {}
-            groq_fin = groq.get("financials") or {}
+            
+            # Extract fields directly from Groq response (flat structure from system prompt)
+            # The system prompt returns keys: trustor, trustee, beneficiary, principalAmount, propertyAddress
+            
+            if not record.get("trustor"):
+                val = groq.get("trustor")
+                if val and val != "NOT_FOUND":
+                     record["trustor"] = val
+            
+            if not record.get("trustee"):
+                val = groq.get("trustee")
+                if val and val != "NOT_FOUND":
+                     record["trustee"] = val
+                     
+            if not record.get("beneficiary"):
+                val = groq.get("beneficiary")
+                if val and val != "NOT_FOUND":
+                     record["beneficiary"] = val
 
             if not record.get("propertyAddress"):
-                addr = groq_prop.get("address") or (analysis.get("addressCandidates") or [None])[0]
-                if addr:
+                # Fallback to nested 'property' if prompt structure changes, or direct key
+                addr = groq.get("propertyAddress") or (groq.get("property") or {}).get("address") or (analysis.get("addressCandidates") or [None])[0]
+                if addr and addr != "NOT_FOUND":
                     record["propertyAddress"] = str(addr).strip()
 
             if not record.get("principalAmount"):
+                # Fallback to nested 'financials' if prompt structure changes, or direct key
                 amt = (
-                    groq_fin.get("amount")
-                    or groq_fin.get("loanAmount")
+                    groq.get("principalAmount")
+                    or (groq.get("financials") or {}).get("amount")
+                    or (groq.get("financials") or {}).get("loanAmount")
                     or (analysis.get("principalCandidates") or [None])[0]
                 )
-                if amt:
+                if amt and amt != "NOT_FOUND":
                     record["principalAmount"] = str(amt).strip()
+            
+            # Map Grantors/Grantees from LLM if available and better
+            llm_grantors = groq.get("grantors")
+            if llm_grantors and isinstance(llm_grantors, list) and llm_grantors:
+                record["grantors"] = llm_grantors
+                
+            llm_grantees = groq.get("grantees")
+            if llm_grantees and isinstance(llm_grantees, list) and llm_grantees:
+                record["grantees"] = llm_grantees
 
             record["documentUrl"] = analysis.get("documentUrl", "")
             record["ocrMethod"] = analysis.get("ocrMethod", "")
@@ -474,6 +610,21 @@ def run_pipeline(
         csv_path = export_csv(records, csv_name=effective_csv)
         print(f"[CSV]  Saved → {csv_path}")
 
+    # ── Stage 9: DB Upsert ──────────────────────────────────────────────────
+    try:
+        print("[DB] Connecting to Supabase...")
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url:
+            conn = db_supabase.connect_db(db_url)
+            with conn:
+                db_supabase.ensure_schema(conn)
+                inserted, updated = db_supabase.upsert_records(conn, records)
+                print(f"[DB] Upsert complete: {inserted} inserted, {updated} updated")
+        else:
+            print("[DB] DATABASE_URL not set, skipping DB upsert")
+    except Exception as e:
+        print(f"[DB] Error upserting records: {e}")
+
     result = {
         "ok": True,
         "startDate": start_date,
@@ -501,7 +652,8 @@ def run_pipeline(
 
 def _default_date_range() -> tuple[str, str]:
     today = datetime.now()
-    return (today - timedelta(days=30)).strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
+    # Last 3 days as per user requirement
+    return (today - timedelta(days=3)).strftime("%m/%d/%Y"), today.strftime("%m/%d/%Y")
 
 
 def main() -> None:

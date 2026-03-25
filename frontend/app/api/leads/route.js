@@ -15,11 +15,34 @@ const RANGE_MAP = {
   all: null,
 };
 
+function sqlParsedDateFromText(textExpr) {
+  // Parse multiple recording_date formats into a DATE.
+  // Supported:
+  // - YYYY-MM-DD
+  // - YYYY-MM-DDTHH:MM:SS...
+  // - M/D/YYYY or MM/DD/YYYY
+  // - M-D-YYYY or MM-DD-YYYY
+  return `(
+    CASE
+      WHEN ${textExpr} IS NULL OR BTRIM(${textExpr}) = '' THEN NULL
+      WHEN ${textExpr} ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN (${textExpr})::date
+      WHEN ${textExpr} ~ '^\\d{4}-\\d{2}-\\d{2}T' THEN (substring(${textExpr} from 1 for 10))::date
+      WHEN ${textExpr} ~ '^\\d{1,2}/\\d{1,2}/\\d{4}$' THEN to_date(${textExpr}, 'MM/DD/YYYY')
+      WHEN ${textExpr} ~ '^\\d{1,2}-\\d{1,2}-\\d{4}$' THEN to_date(${textExpr}, 'MM-DD-YYYY')
+      ELSE NULL
+    END
+  )`;
+}
+
 function getSinceIso(range) {
   const days = RANGE_MAP[range] ?? null;
   if (!days) return null;
   const d = new Date();
-  d.setDate(d.getDate() - days);
+  // Use start-of-day to make “Last Day/Week/Month” stable and intuitive.
+  d.setHours(0, 0, 0, 0);
+  // Include exactly `days` calendar days including today.
+  // Example: day(1) => today 00:00; week(7) => 6 days ago 00:00.
+  d.setDate(d.getDate() - (days - 1));
   return d.toISOString();
 }
 
@@ -40,6 +63,9 @@ export async function GET(request) {
     let query = "";
     if (county === "graham") {
       const tableName = "graham_leads";
+      const recordingDateText = "NULLIF(BTRIM(recording_date::text), '')";
+      const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
+      const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
       query = `
         SELECT
           id,
@@ -99,7 +125,7 @@ export async function GET(request) {
           used_groq,
           groq_model as llm_model
         FROM ${tableName}
-        WHERE ($1::timestamptz IS NULL OR created_at >= $1::timestamptz)
+        WHERE ($1::timestamptz IS NULL OR ${effectiveTs} >= $1::timestamptz)
         ORDER BY created_at DESC
         LIMIT $2;
       `;
@@ -112,7 +138,14 @@ export async function GET(request) {
         "cochise": "cochise_leads"
       };
       const tableName = tableMap[county];
-      let whereClause = "($1::timestamptz IS NULL OR created_at >= $1::timestamptz)";
+      const recordingDateText = `COALESCE(
+        NULLIF(BTRIM(recording_date::text), ''),
+        NULLIF(BTRIM(raw_record->>'recordingDate'), ''),
+        NULLIF(BTRIM(raw_record->>'recording_date'), '')
+      )`;
+      const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
+      const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
+      let whereClause = `($1::timestamptz IS NULL OR ${effectiveTs} >= $1::timestamptz)`;
       
       // Only Santa Cruz has the document_urls column
       const imageUrlsColumn = county === "santa-cruz" ? "document_urls as image_urls" : "NULL as image_urls";
@@ -137,11 +170,7 @@ export async function GET(request) {
             NULLIF(BTRIM(raw_record->>'recordingNumber'), ''),
             NULLIF(BTRIM(raw_record->>'recording_number'), '')
           ) AS recording_number,
-          COALESCE(
-            NULLIF(BTRIM(recording_date), ''),
-            NULLIF(BTRIM(raw_record->>'recordingDate'), ''),
-            NULLIF(BTRIM(raw_record->>'recording_date'), '')
-          ) AS recording_date,
+          ${recordingDateText} AS recording_date,
           COALESCE(
             NULLIF(BTRIM(document_type), ''),
             NULLIF(BTRIM(raw_record->>'documentType'), ''),
@@ -184,6 +213,7 @@ export async function GET(request) {
         LIMIT $2;
       `;
     } else {
+      const effectiveTs = "COALESCE(d.recording_date::timestamptz, d.created_at)";
       query = `
         SELECT
           d.id,
@@ -221,7 +251,7 @@ export async function GET(request) {
           p.llm_model
         FROM maricopa.documents d
         LEFT JOIN maricopa.properties p ON p.document_id = d.id
-        WHERE ($1::timestamptz IS NULL OR d.created_at >= $1::timestamptz)
+        WHERE ($1::timestamptz IS NULL OR ${effectiveTs} >= $1::timestamptz)
         ORDER BY d.created_at DESC
         LIMIT $2;
       `;

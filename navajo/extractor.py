@@ -11,6 +11,15 @@ from greenlee import extractor as _base
 _base.COUNTY_LABEL = "NAVAJO"
 _base.COUNTY_DISPLAY = "Navajo"
 
+# Navajo prompt override: load from dedicated prompt file so we can pin the
+# exact system prompt used end-to-end without modifying the shared pipeline.
+PROMPT_PATH = Path(__file__).resolve().parent / "LLM_PROMPT.txt"
+if PROMPT_PATH.exists():
+    try:
+        _base.COUNTY_LLM_SYSTEM_PROMPT = PROMPT_PATH.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 _base.OUTPUT_DIR = OUTPUT_DIR

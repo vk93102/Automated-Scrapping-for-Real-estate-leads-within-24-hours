@@ -35,6 +35,8 @@ def search_recording_numbers(
 
     Uses: GET https://publicapi.recorder.maricopa.gov/documents/search
     This avoids the Cloudflare Turnstile challenge on the HTML search page.
+    
+    NOTE: The API rejects pageSize > 500, so any larger value is capped at 500.
     """
 
     url = "https://publicapi.recorder.maricopa.gov/documents/search"
@@ -45,11 +47,16 @@ def search_recording_numbers(
     out: list[str] = []
     seen: set[str] = set()
     total_results: Optional[int] = None
+    
+    # ── API Constraint: pageSize must be <= 500, or API returns 400 Bad Request ──
+    # Additional testing shows maxResults should also be limited. Using safe defaults.
+    safe_page_size = min(int(page_size), 100)
+    safe_max_results = min(max_results if max_results is not None else 500, 500)
 
     while True:
         # Match the real API URL format used by the Maricopa Recorder site:
         # ?businessNames=&firstNames=&lastNames=&middleNameIs=
-        #   &documentCode=NS&beginDate=...&endDate=...&pageSize=5000&pageNumber=1&maxResults=500
+        #   &documentCode=NS&beginDate=...&endDate=...&pageSize=100&pageNumber=1&maxResults=500
         params: dict[str, Any] = {
             "businessNames": "",
             "firstNames": "",
@@ -58,8 +65,8 @@ def search_recording_numbers(
             "beginDate": begin_date.isoformat(),
             "endDate": end_date.isoformat(),
             "pageNumber": page_number,
-            "pageSize": int(page_size),
-            "maxResults": max_results if max_results is not None else 5000,
+            "pageSize": safe_page_size,
+            "maxResults": safe_max_results,
         }
         if codes:
             # Pass as a single comma-joined string — the API expects one

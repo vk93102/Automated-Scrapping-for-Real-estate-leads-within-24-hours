@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import socket
 import sys
@@ -19,7 +21,7 @@ ROOT_DIR = COUNTY_DIR.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from county_doc_types import UNIFIED_LEAD_DOC_TYPES
-from gila.live_pipeline import run_pipeline  # noqa: E402
+from gila import extractor as gila_extractor  # noqa: E402
 
 
 def _load_env() -> None:
@@ -80,71 +82,132 @@ def _connect_db(database_url: str, retries: int = 3, sleep_s: int = 3) -> psycop
 
 
 def _ensure_schema(conn: psycopg.Connection) -> None:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            create table if not exists gila_leads (
-              id               bigserial primary key,
-              source_county    text not null default 'Gila',
-              document_id      text not null,
-              recording_number text,
-              recording_date   text,
-              document_type    text,
-              grantors         text,
-              grantees         text,
-              trustor          text,
-              trustee          text,
-              beneficiary      text,
-              principal_amount text,
-              property_address text,
-              detail_url       text,
-              image_urls       text,
-              ocr_method       text,
-              ocr_chars        integer,
-              used_groq        boolean,
-              groq_model       text,
-              groq_error       text,
-              analysis_error   text,
-              run_date         date,
-              raw_record       jsonb not null default '{}'::jsonb,
-              created_at       timestamptz not null default now(),
-              updated_at       timestamptz not null default now(),
-              unique (source_county, document_id)
-            );
-            """
-        )
-        cur.execute(
-            """
-            create table if not exists gila_pipeline_runs (
-              id              bigserial primary key,
-              run_started_at  timestamptz not null default now(),
-              run_finished_at timestamptz,
-              run_date        date,
-              total_records   integer default 0,
-              inserted_rows   integer default 0,
-              updated_rows    integer default 0,
-              llm_used_rows   integer default 0,
-              status          text not null default 'running',
-              error_message   text,
-              created_at      timestamptz not null default now()
-            );
-            """
-        )
-    conn.commit()
+        with conn.cursor() as cur:
+                cur.execute(
+                        """
+                        create table if not exists gila_leads (
+                            id               bigserial primary key,
+                            source_county    text not null default 'Gila',
+                            document_id      text not null,
+                            recording_number text,
+                            recording_date   text,
+                            document_type    text,
+                            grantors         text,
+                            grantees         text,
+                            trustor          text,
+                            trustee          text,
+                            beneficiary      text,
+                            principal_amount text,
+                            property_address text,
+                            detail_url       text,
+                            image_urls       text,
+                            ocr_method       text,
+                            ocr_chars        integer,
+                            used_groq        boolean,
+                            groq_model       text,
+                            groq_error       text,
+                            analysis_error   text,
+                            run_date         date,
+                            raw_record       jsonb not null default '{}'::jsonb,
+                            created_at       timestamptz not null default now(),
+                            updated_at       timestamptz not null default now(),
+                            unique (source_county, document_id)
+                        );
+                        """
+                )
+
+                # Compatibility name requested by user: `gila_county_leads`.
+                # Implemented as a view over gila_leads to avoid duplicating storage.
+                cur.execute(
+                        """
+                        do $$
+                        begin
+                            if not exists (
+                                select 1 from pg_views where schemaname = 'public' and viewname = 'gila_county_leads'
+                            ) then
+                                execute 'create view public.gila_county_leads as select * from public.gila_leads';
+                            end if;
+                        end $$;
+                        """
+                )
+
+                cur.execute(
+                        """
+                        create table if not exists gila_pipeline_runs (
+                            id              bigserial primary key,
+                            run_started_at  timestamptz not null default now(),
+                            run_finished_at timestamptz,
+                            run_date        date,
+                            total_records   integer default 0,
+                            inserted_rows   integer default 0,
+                            updated_rows    integer default 0,
+                            llm_used_rows   integer default 0,
+                            status          text not null default 'running',
+                            error_message   text,
+                            created_at      timestamptz not null default now()
+                        );
+                        """
+                )
+        conn.commit()
 
 
-def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: date) -> tuple[int, int, int]:
+def _stable_synthetic_document_id(record: dict, idx: int) -> str:
+    """Generate a stable fallback document_id to avoid skipping DB upserts.
+
+    Prefer stable fields so reruns map to the same DB row.
+    """
+    parts = [
+        str(record.get("recordingNumber") or "").strip(),
+        str(record.get("recordingDate") or "").strip(),
+        str(record.get("detailUrl") or "").strip(),
+        str(record.get("documentType") or "").strip(),
+    ]
+    base = "|".join(parts)
+    if not base.strip("| "):
+        base = json.dumps(record, sort_keys=True, default=str)[:1000]
+    digest = hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"SYNTH-{digest}-{idx + 1}"  # 1-based for readability
+
+
+def _ensure_document_id(record: dict, idx: int) -> str:
+    doc_id = str(record.get("documentId") or "").strip()
+    if doc_id:
+        return doc_id
+    doc_id = _stable_synthetic_document_id(record, idx)
+    record["documentId"] = doc_id
+    return doc_id
+
+
+def _upsert_records(
+    conn: psycopg.Connection,
+    records: list[dict],
+    run_date: date,
+    *,
+    realtime: bool = False,
+) -> tuple[int, int, int]:
     inserted = 0
     updated = 0
     llm_used = 0
     with conn.cursor() as cur:
-        for r in records:
-            doc_id = str(r.get("documentId", "") or "").strip()
-            if not doc_id:
-                continue
+        for idx, r in enumerate(records):
+            doc_id = _ensure_document_id(r, idx)
             used_groq = bool(r.get("usedGroq", False))
             if used_groq:
                 llm_used += 1
+
+            if realtime:
+                ocr_method = str(r.get("ocrMethod") or "").strip() or "none"
+                ocr_chars = int(r.get("ocrChars") or 0)
+                groq_model = str(r.get("groqModel") or "").strip()
+                groq_err = str(r.get("groqError") or "").strip()
+                addr = str(r.get("propertyAddress") or "").strip()
+                addr_kind = "addr" if addr and addr != "NOT_FOUND" else "NO_ADDR"
+                _log(
+                    f"realtime doc={doc_id} llm={int(used_groq)} "
+                    f"ocr={ocr_method}:{ocr_chars} model={groq_model[:48]} "
+                    f"groq_err={(groq_err[:120] if groq_err else '')} {addr_kind}"
+                )
+
             payload = {
                 "source_county": "Gila",
                 "document_id": doc_id,
@@ -159,13 +222,13 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
                 "principal_amount": r.get("principalAmount", ""),
                 "property_address": r.get("propertyAddress", ""),
                 "detail_url": r.get("detailUrl", ""),
-                "image_urls": r.get("documentUrl", "") or r.get("imageUrls", ""),
+                "image_urls": r.get("imageUrls", "") or r.get("documentUrls", "") or r.get("documentUrl", ""),
                 "ocr_method": r.get("ocrMethod", ""),
-                "ocr_chars": int(len(r.get("ocrTextPreview", "") or "")),
+                "ocr_chars": int(r.get("ocrChars") or 0),
                 "used_groq": used_groq,
                 "groq_model": r.get("groqModel", ""),
                 "groq_error": r.get("groqError", ""),
-                "analysis_error": r.get("documentAnalysisError", "") or r.get("documentAnalysisError", ""),
+                "analysis_error": r.get("analysisError", "") or r.get("documentAnalysisError", ""),
                 "run_date": run_date,
                 "raw_record": psycopg.types.json.Jsonb(r),
             }
@@ -217,7 +280,15 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
     return inserted, updated, llm_used
 
 
-def _run_once(doc_types: list[str], lookback_days: int, strict_llm: bool) -> tuple[int, int, int, int]:
+def _run_once(
+    doc_types: list[str],
+    lookback_days: int,
+    strict_llm: bool,
+    *,
+    workers: int,
+    ocr_limit: int,
+    realtime: bool,
+) -> tuple[int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
     start_day = today - timedelta(days=lookback_days - 1)
@@ -230,34 +301,74 @@ def _run_once(doc_types: list[str], lookback_days: int, strict_llm: bool) -> tup
     with _connect_db(db_url) as conn:
         _ensure_schema(conn)
 
-    res = run_pipeline(
-        start_date=start_date,
-        end_date=end_date,
-        page_limit=0,
-        ocr_limit=0,
-        use_groq=True,
-        csv_name="",
-        doc_types=doc_types,
-        verbose=False,
-        write_output_files=False,
-    )
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                insert into gila_pipeline_runs (run_date, status)
+                values (%s, 'running')
+                returning id;
+                """,
+                (today,),
+            )
+            run_id = int(cur.fetchone()[0])
+        conn.commit()
+
+    try:
+        res = gila_extractor.run_gila_pipeline(
+            start_date=start_date,
+            end_date=end_date,
+            doc_types=doc_types,
+            max_pages=0,
+            ocr_limit=ocr_limit,
+            workers=workers,
+            use_groq=True,
+            headless=True,
+            verbose=False,
+            write_output_files=False,
+        )
+    except Exception as exc:
+        with _connect_db(db_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    update gila_pipeline_runs
+                    set run_finished_at = now(), status = 'failed', error_message = %s
+                    where id = %s;
+                    """,
+                    (str(exc), run_id),
+                )
+            conn.commit()
+        raise
 
     records = res.get("records", [])
+    _log(f"pipeline fetched records={len(records)}; preparing DB upsert")
+    # Ensure no record is skipped due to missing documentId.
+    for idx, r in enumerate(records):
+        _ensure_document_id(r, idx)
+
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
         if missing:
             sample = ", ".join(x for x in missing[:10] if x)
-            raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+            raise RuntimeError(
+                f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]"
+            )
     with _connect_db(db_url) as conn:
-        inserted, updated, llm_used = _upsert_records(conn, records, today)
+        inserted, updated, llm_used = _upsert_records(conn, records, today, realtime=realtime)
         with conn.cursor() as cur:
             cur.execute(
                 """
-                insert into gila_pipeline_runs
-                  (run_date, run_finished_at, total_records, inserted_rows, updated_rows, llm_used_rows, status)
-                values (%s, now(), %s, %s, %s, %s, 'success');
+                update gila_pipeline_runs
+                set run_finished_at = now(),
+                    total_records = %s,
+                    inserted_rows = %s,
+                    updated_rows = %s,
+                    llm_used_rows = %s,
+                    status = 'success',
+                    error_message = null
+                where id = %s;
                 """,
-                (today, len(records), inserted, updated, llm_used),
+                (len(records), inserted, updated, llm_used, run_id),
             )
         conn.commit()
 
@@ -274,6 +385,9 @@ def main() -> None:
     p.add_argument("--once", action="store_true")
     p.add_argument("--strict-llm", action="store_true", help="Fail run if not all records used LLM")
     p.add_argument("--doc-types", nargs="+", default=UNIFIED_LEAD_DOC_TYPES)
+    p.add_argument("--workers", type=int, default=3)
+    p.add_argument("--ocr-limit", type=int, default=0, help="0=all records; -1=skip enrichment")
+    p.add_argument("--realtime", action="store_true", help="Log one line per record before DB upsert")
     args = p.parse_args()
 
     _log(
@@ -284,7 +398,14 @@ def main() -> None:
     while True:
         started = datetime.now()
         try:
-            total, ins, upd, llm_used = _run_once(args.doc_types, args.lookback_days, args.strict_llm)
+            total, ins, upd, llm_used = _run_once(
+                args.doc_types,
+                args.lookback_days,
+                args.strict_llm,
+                workers=args.workers,
+                ocr_limit=args.ocr_limit,
+                realtime=args.realtime,
+            )
             _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
         except Exception as exc:
             _log(f"run failed: {exc}")

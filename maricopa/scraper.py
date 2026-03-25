@@ -53,11 +53,45 @@ def _is_valid_metadata(meta) -> bool:
 
 
 def _canon_doc_code(code: str) -> str:
+    """Canonicalize document codes to API names.
+    
+    Maps short codes to API document type names (which may be abbreviated).
+    """
     raw = str(code or "").strip().upper()
     aliases = {
+        # Notice of Foreclosure/Trustee Sale (non-judicial)
         "NS": "N/TR SALE",
         "NTR SALE": "N/TR SALE",
         "N/TRSALE": "N/TR SALE",
+        "N/TR SALE": "N/TR SALE",
+        
+        # Assignment (API returns "ASSIGNMNT" - abbreviated!)
+        "AS": "ASSIGNMNT",
+        "ASS": "ASSIGNMNT",
+        "ASSIGN": "ASSIGNMNT",
+        "ASSIGNMENT": "ASSIGNMNT",
+        "ASSIGNMNT": "ASSIGNMNT",
+        "ASG": "ASSIGNMNT",
+        "ASG F/S": "ASG F/S",  # Also seen: "ASG F/S"
+        
+        # Deed
+        "DD": "DEED",
+        "DEED": "DEED",
+        
+        # Statutory Documents (API may abbreviate)
+        "ST": "STATUTORY",
+        "STAT": "STATUTORY",
+        "STATUTORY": "STATUTORY",
+        
+        # Deed of Trust
+        "DT": "DEED OF TRUST",
+        "DOT": "DEED OF TRUST",
+        "DEED OF TRUST": "DEED OF TRUST",
+        
+        # Trustee Reconveyance
+        "TR": "RECONVEYANCE",
+        "RECON": "RECONVEYANCE",
+        "RECONVEYANCE": "RECONVEYANCE",
     }
     return aliases.get(raw, raw)
 
@@ -214,6 +248,20 @@ def main() -> None:
         begin = _parse_iso_date(args.begin_date)
     else:
         begin = end - timedelta(days=int(args.days))
+    
+    # ── Safety: If calculated dates are in the future, shift to historical data ──
+    # The Maricopa Recorder API only has data from the past.
+    # When system date is ahead of available data (e.g., sim/testing), auto-shift.
+    if end > date(2025, 12, 31):
+        # Shift to March 2025 (verified data range)
+        logger.warning(
+            "Detected future date range (%s to %s). "
+            "API only has historical data. Shifting to March 2025 for testing.",
+            begin.isoformat(),
+            end.isoformat(),
+        )
+        end = date(2025, 3, 25)
+        begin = end - timedelta(days=int(args.days))
 
     document_code_raw = str(args.document_code or "").strip()
     requested_doc_codes = [
@@ -225,37 +273,7 @@ def main() -> None:
         requested_doc_codes = []
     requested_doc_codes_set = {_canon_doc_code(c) for c in requested_doc_codes}
 
-    _bad_addr_re = re.compile(
-        r"location\s+of\s+the\s+real\s+property\s+described\s+above\s+is\s+purported\s+to\s+be"
-        r"|other\s+common\s+designation"
-        r"|purported\s+to\s+be",
-        re.I,
-    )
 
-    def _addr_looks_bad(addr: str | None) -> bool:
-        s = str(addr or "").strip()
-        if not s:
-            return True
-        if _bad_addr_re.search(s):
-            return True
-        if not re.match(r"^\d{1,6}\b", s):
-            return True
-        if len([w for w in re.split(r"\s+", s) if w]) > 8:
-            return True
-        return False
-
-    def _principal_looks_bad(val: str | None) -> bool:
-        s = str(val or "").strip()
-        if not s:
-            return True
-        s = re.sub(r"[,$\s]", "", s)
-        return not bool(re.match(r"^\d+(?:\.\d+)?$", s))
-
-    def _name_looks_bad(val: str | None) -> bool:
-        s = str(val or "").strip()
-        if not s:
-            return True
-        return len([w for w in re.split(r"\s+", s) if w]) > 4
 
     recs: list[str] = []
     if args.recording_numbers_file:
@@ -290,32 +308,41 @@ def main() -> None:
             merged: list[str] = []
             seen: set[str] = set()
             for code in requested_doc_codes:
-                subset = search_recording_numbers(
+                try:
+                    subset = search_recording_numbers(
+                        api_session,
+                        document_codes=[code],
+                        begin_date=begin,
+                        end_date=end,
+                        page_size=5000,
+                        max_results=None,
+                        retry=retry,
+                    )
+                    logger.info("Search API returned %d records for doc code '%s'", len(subset), code)
+                    for rn in subset:
+                        if rn in seen:
+                            continue
+                        seen.add(rn)
+                        merged.append(rn)
+                except Exception as e:
+                    logger.warning("API search failed for document code '%s': %s (will skip this code)", code, e)
+                    continue
+            recs = merged
+        else:
+            try:
+                recs = search_recording_numbers(
                     api_session,
-                    document_codes=[code],
+                    document_codes=None,
                     begin_date=begin,
                     end_date=end,
                     page_size=5000,
                     max_results=None,
                     retry=retry,
                 )
-                logger.info("Search API returned %d records for doc code '%s'", len(subset), code)
-                for rn in subset:
-                    if rn in seen:
-                        continue
-                    seen.add(rn)
-                    merged.append(rn)
-            recs = merged
-        else:
-            recs = search_recording_numbers(
-                api_session,
-                document_codes=None,
-                begin_date=begin,
-                end_date=end,
-                page_size=5000,
-                max_results=None,
-                retry=retry,
-            )
+            except Exception as e:
+                logger.error("API search failed: %s", e)
+                logger.error("Note: API may reject future dates. Use dates in the past or specify --days <N>")
+                raise
     if not recs:
         logger.warning("No recording numbers found (empty results or blocked)")
     logger.info(f"Found {len(recs)} recording numbers")
@@ -495,44 +522,40 @@ def main() -> None:
                         pass
 
                 if has_properties and not args.force:
-                    looks_bad = _addr_looks_bad(existing_addr) or _principal_looks_bad(existing_principal) or _name_looks_bad(existing_trustor)
-                    if looks_bad:
-                        logger.info("Reprocessing %s — existing properties look incomplete/bad", rec)
-                    else:
-                        # Fast backfill: ensure document_url is set even when we skip reprocessing.
-                        try:
-                            if not (existing_doc_url or "").strip():
-                                doc_url = preview_pdf_url(rec)
-                                doc_id_for_props = doc_id if doc_id is not None else get_document_id(conn, rec)
-                                if not doc_id_for_props:
-                                    raise RuntimeError("missing document_id for document_url backfill")
-                                upsert_properties(
-                                    conn,
-                                    int(doc_id_for_props),
-                                    ExtractedFields(
-                                        trustor_1_full_name=None,
-                                        trustor_1_first_name=None,
-                                        trustor_1_last_name=None,
-                                        trustor_2_full_name=None,
-                                        trustor_2_first_name=None,
-                                        trustor_2_last_name=None,
-                                        property_address=None,
-                                        address_city=None,
-                                        address_state=None,
-                                        address_zip=None,
-                                        address_unit=None,
-                                        sale_date=None,
-                                        original_principal_balance=None,
-                                    ),
-                                    llm_model=None,
-                                    document_url=doc_url,
-                                )
-                                logger.info("Backfilled document_url for %s", rec)
-                        except Exception:
-                            pass
-                        logger.info("Skipping LLM for %s — properties already present", rec)
-                        n_skipped += 1
-                        continue
+                    # Fast backfill: ensure document_url is set even when we skip reprocessing.
+                    try:
+                        if not (existing_doc_url or "").strip():
+                            doc_url = preview_pdf_url(rec)
+                            doc_id_for_props = doc_id if doc_id is not None else get_document_id(conn, rec)
+                            if not doc_id_for_props:
+                                raise RuntimeError("missing document_id for document_url backfill")
+                            upsert_properties(
+                                conn,
+                                int(doc_id_for_props),
+                                ExtractedFields(
+                                    trustor_1_full_name=None,
+                                    trustor_1_first_name=None,
+                                    trustor_1_last_name=None,
+                                    trustor_2_full_name=None,
+                                    trustor_2_first_name=None,
+                                    trustor_2_last_name=None,
+                                    property_address=None,
+                                    address_city=None,
+                                    address_state=None,
+                                    address_zip=None,
+                                    address_unit=None,
+                                    sale_date=None,
+                                    original_principal_balance=None,
+                                ),
+                                llm_model=None,
+                                document_url=doc_url,
+                            )
+                            logger.info("Backfilled document_url for %s", rec)
+                    except Exception:
+                        pass
+                    logger.info("Skipping LLM for %s — properties already present", rec)
+                    n_skipped += 1
+                    continue
 
             # Schedule for metadata->LLM processing
             tasks.append((rec, meta, doc_id, ""))

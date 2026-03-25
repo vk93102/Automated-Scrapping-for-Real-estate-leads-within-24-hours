@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 const FILTERS = [
   { label: "Last Day", value: "day" },
@@ -21,12 +21,25 @@ const COUNTIES = [
   { key: "santa-cruz", name: "Santa Cruz", status: "Live" },
 ];
 
+// Cross-county document types (union across counties).
+// This is informational (not a filter) and is shown in the “View document types” panel.
 const DOC_TYPES = [
-  { name: "Notice of Trustee Sale", desc: "Foreclosure initiation notice due to mortgage default." },
-  { name: "Lis Pendens", desc: "Formal notice of a pending lawsuit involving the property." },
-  { name: "Deed in Lieu", desc: "Voluntary property title transfer to lender to avoid foreclosure." },
-  { name: "Notice of Reinstatement", desc: "Filed when a defaulted loan is successfully brought current." },
-  { name: "Treasurer's Deed", desc: "Transfers ownership after a tax lien sale." },
+  { name: "Deed", desc: "Transfers an ownership interest in real property." },
+  { name: "Deed of Trust", desc: "Secures a loan using real property as collateral.", aliases: ["Trust Deed"] },
+  { name: "Mortgage", desc: "Lien instrument securing a loan against property." },
+  { name: "Notice of Sale", desc: "Notice that a property is scheduled for sale/auction." },
+  { name: "Notice of Trustee Sale", desc: "Non-judicial foreclosure sale notice.", aliases: ["N/TR SALE"] },
+  { name: "Notice of Default", desc: "Recorded notice that the loan is in default." },
+  { name: "Notice of Reinstatement", desc: "Recorded notice that a default was cured." },
+  { name: "Lis Pendens", desc: "Notice of pending litigation affecting the property." },
+  { name: "Lien", desc: "Recorded claim against property for a debt/obligation." },
+  { name: "Judgment", desc: "Court judgment that may attach to real property." },
+  { name: "Judgment Lien", desc: "Judgment recorded as a lien against property." },
+  { name: "Tax Lien", desc: "Lien recorded for unpaid property taxes." },
+  { name: "Foreclosure", desc: "Foreclosure-related filing (label varies by county)." },
+  { name: "Deed in Lieu", desc: "Voluntary transfer to lender to avoid foreclosure." },
+  { name: "Trustee's Deed", desc: "Deed issued after a trustee sale.", aliases: ["Trustees Deed"] },
+  { name: "Treasurer's Deed", desc: "Deed issued after a tax lien sale/redemption period." },
 ];
 
 function formatDate(value) {
@@ -72,6 +85,7 @@ export default function HomePage() {
   const [activeCounty, setActiveCounty] = useState("maricopa");
   const [range, setRange] = useState("all");
   const [addressFilter, setAddressFilter] = useState("all");
+  const [manualReviewFilter, setManualReviewFilter] = useState("all");
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -79,6 +93,8 @@ export default function HomePage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [isSearching, setIsSearching] = useState(false);
   const [searchResults, setSearchResults] = useState([]);
+  const [docTypesOpen, setDocTypesOpen] = useState(false);
+  const leadsLoadSeqRef = useRef(0);
   const isGrahamView = activeCounty === "graham";
   const isMaricopaView = activeCounty === "maricopa";
   const isSantaCruzView = activeCounty === "santa-cruz";
@@ -99,6 +115,47 @@ export default function HomePage() {
     return v;
   };
 
+  const countWords = (text) => {
+    if (!text) return 0;
+    return text.trim().split(/\s+/).filter(word => word.length > 0).length;
+  };
+
+  const needsManualReview = (row) => {
+    // Get name and address
+    const name = row.trustor_1_full_name || row.grantors || row.trustor || "";
+    const address = row.property_address || "";
+    
+    // Flag if address starts with "Parcel" (e.g., "Parcel ID" or "Parcel 123...")
+    if (address.trim().toUpperCase().startsWith("PARCEL")) {
+      return true;
+    }
+    
+    // Check if name or address has commas - if yes, it's properly formatted, don't flag
+    const nameHasCommas = name.includes(',');
+    const addressHasCommas = address.includes(',');
+    if (nameHasCommas || addressHasCommas) {
+      return false;
+    }
+    
+    // Check if address has more than 6 words - if yes, flag for review (6 words is acceptable)
+    const addressWords = countWords(address);
+    if (addressWords > 6) {
+      return true;
+    }
+    
+    return false;
+  };
+
+  const isManualReviewRow = (row) => {
+    return row?.manual_review === true || needsManualReview(row);
+  };
+
+  const matchesManualReviewFilter = (row) => {
+    if (manualReviewFilter === "needs") return isManualReviewRow(row);
+    if (manualReviewFilter === "clean") return !isManualReviewRow(row);
+    return true;
+  };
+
   const esc = (value) => {
     const s = String(value ?? "");
     return s
@@ -113,6 +170,7 @@ export default function HomePage() {
     const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
     if (activeRows.length === 0) return;
     const displayRows = activeRows.filter(r => {
+      if (!matchesManualReviewFilter(r)) return false;
       if (addressFilter === "with") return hasAddress(r);
       if (addressFilter === "without") return !hasAddress(r);
       return true;
@@ -122,6 +180,7 @@ export default function HomePage() {
       ? [
           "Recording Number",
           "Recorded Date",
+          "Document Type",
           "Grantors",
           "Grantees",
           "Principal Amount",
@@ -136,6 +195,7 @@ export default function HomePage() {
           "Address State",
           "Recording Number",
           "Recording Date",
+          "Document Type",
           "Principal Amount",
           "Document URL"
         ]
@@ -166,6 +226,7 @@ export default function HomePage() {
         return [
           `"${(doc.recording_number || "").replace(/\"/g, '""')}"`,
           `"${(doc.recording_date || "").replace(/\"/g, '""')}"`,
+          `"${(row.document_type || "").replace(/\"/g, '""')}"`,
           `"${(row.grantors || "").replace(/\"/g, '""')}"`,
           `"${(row.grantees || "").replace(/\"/g, '""')}"`,
           `"${(row.original_principal_balance || row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
@@ -181,6 +242,7 @@ export default function HomePage() {
           `"${(row.address_state || "").replace(/\"/g, '""')}"`,
           `"${(row.recording_number || doc.recording_number || "").replace(/\"/g, '""')}"`,
           `"${(row.recording_date || doc.recording_date || "").replace(/\"/g, '""')}"`,
+          `"${(row.document_type || "").replace(/\"/g, '""')}"`,
           `"${(row.original_principal_balance || row.principal_amount || "").toString().replace(/\"/g, '""')}"`,
           `"${(row.document_url || "").replace(/\"/g, '""')}"`,
         ].join(",");
@@ -225,13 +287,14 @@ export default function HomePage() {
     const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
     if (activeRows.length === 0) return;
     const displayRows = activeRows.filter(r => {
+      if (!matchesManualReviewFilter(r)) return false;
       if (addressFilter === "with") return hasAddress(r);
       if (addressFilter === "without") return !hasAddress(r);
       return true;
     });
 
     const headerCells = isGrahamView
-      ? ["Recording", "Recorded Date", "Grantors", "Grantees", "Principal Amount", "Property Address"]
+      ? ["Recording", "Recorded Date", "Document Type", "Grantors", "Grantees", "Principal Amount", "Property Address"]
       : isMaricopaView
       ? [
           "Trustor 1 Full Name",
@@ -241,6 +304,7 @@ export default function HomePage() {
           "Address State",
           "Recording Number",
           "Recording Date",
+          "Document Type",
           "Principal Amount",
           "Document URL",
         ]
@@ -266,6 +330,7 @@ export default function HomePage() {
           return `<tr>
             <td>${esc(doc.recording_number || "-")}</td>
             <td>${esc(doc.recording_date || "-")}</td>
+            <td>${esc(row.document_type || "-")}</td>
             <td>${esc(row.grantors || "-")}</td>
             <td>${esc(row.grantees || "-")}</td>
             <td>${esc(row.original_principal_balance || row.principal_amount || "-")}</td>
@@ -281,6 +346,7 @@ export default function HomePage() {
             <td>${esc(row.address_state || "-")}</td>
             <td>${esc(row.recording_number || doc.recording_number || "-")}</td>
             <td>${esc(row.recording_date || doc.recording_date || "-")}</td>
+            <td>${esc(row.document_type || "-")}</td>
             <td>${esc(row.original_principal_balance || row.principal_amount || "-")}</td>
             <td><a href="${esc(row.document_url || "")}" target="_blank">Link</a></td>
           </tr>`;
@@ -361,7 +427,7 @@ export default function HomePage() {
       try {
         setIsSearching(true);
         const res = await fetch(
-          `/api/search?q=${encodeURIComponent(searchQuery)}&county=${activeCounty}`,
+          `/api/search?q=${encodeURIComponent(searchQuery)}&county=${activeCounty}&range=${range}`,
           { signal: abort.signal, cache: "no-store" }
         );
 
@@ -385,7 +451,7 @@ export default function HomePage() {
       clearTimeout(timer);
       abort.abort();
     };
-  }, [searchQuery, activeCounty]);
+  }, [searchQuery, activeCounty, range]);
 
   useEffect(() => {
     if (!isLiveCounty) {
@@ -396,6 +462,7 @@ export default function HomePage() {
     }
 
     const abort = new AbortController();
+    const seq = ++leadsLoadSeqRef.current;
 
     async function load() {
       try {
@@ -413,12 +480,14 @@ export default function HomePage() {
         }
 
         const body = await res.json();
+        if (seq !== leadsLoadSeqRef.current) return;
+        setError("");
         setRows(Array.isArray(body?.rows) ? body.rows : []);
       } catch (e) {
-        if (e.name !== "AbortError") {
-          setError(e.message || "Unknown error");
-        }
+        if (seq !== leadsLoadSeqRef.current) return;
+        if (e.name !== "AbortError") setError(e.message || "Unknown error");
       } finally {
+        if (seq !== leadsLoadSeqRef.current) return;
         setLoading(false);
       }
     }
@@ -531,69 +600,106 @@ export default function HomePage() {
           <div className="content-panel">
             {/* Document Types Info Panel */}
             <div className="info-banner">
-              <div className="banner-header">
-                <Icon path={ICONS.info} className="info-icon" />
-                <h4>Understanding Document Types</h4>
+              <div className="banner-header banner-header--toggle">
+                <div className="banner-title">
+                  <Icon path={ICONS.info} className="info-icon" />
+                  <h4>Document Types</h4>
+                </div>
+                <button
+                  type="button"
+                  className="doc-types-toggle"
+                  aria-expanded={docTypesOpen}
+                  aria-controls="doc-types-panel"
+                  onClick={() => setDocTypesOpen((v) => !v)}
+                >
+                  {docTypesOpen ? "Hide" : "View"} document types ({DOC_TYPES.length})
+                  <span className={`doc-types-caret ${docTypesOpen ? "open" : ""}`} aria-hidden="true">▾</span>
+                </button>
               </div>
-              <div className="doc-definitions">
-                {DOC_TYPES.map(dt => (
-                  <div key={dt.name} className="doc-def">
-                    <span className="dt-name">{dt.name}:</span>
-                    <span className="dt-desc">{dt.desc}</span>
-                  </div>
-                ))}
-              </div>
+
+              {docTypesOpen && (
+                <div id="doc-types-panel" className="doc-definitions" role="region" aria-label="Document types list">
+                  {DOC_TYPES.map((dt) => (
+                    <div key={dt.name} className="doc-def">
+                      <span className="dt-name">{dt.name}</span>
+                      <span className="dt-desc">
+                        {dt.desc}
+                        {Array.isArray(dt.aliases) && dt.aliases.length > 0 ? (
+                          <span className="dt-aliases"> Also seen as: {dt.aliases.join(", ")}</span>
+                        ) : null}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
 
             {isLiveCounty ? (
               <>
                 <div className="data-toolbar">
-                  <div className="filter-group">
-                    {FILTERS.map((f) => (
-                      <button
-                        key={f.value}
-                        type="button"
-                        className={`filter-btn ${range === f.value ? "active" : ""}`}
-                        onClick={() => setRange(f.value)}
-                      >
-                        {f.label}
-                      </button>
-                    ))}
-                  </div>
+                  <div className="toolbar-row">
+                    <div className="toolbar-left">
+                      <div className="filter-group" aria-label="Date range filter">
+                        {FILTERS.map((f) => (
+                          <button
+                            key={f.value}
+                            type="button"
+                            className={`filter-btn ${range === f.value ? "active" : ""}`}
+                            onClick={() => setRange(f.value)}
+                          >
+                            {f.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
 
-                  <div className="search-box" style={{ flex: 1, maxWidth: "300px" }}>
-                    <div style={{ position: "relative" }}>
-                      <Icon path={ICONS.search} style={{ position: "absolute", left: "10px", top: "50%", transform: "translateY(-50%)", color: "#666", pointerEvents: "none" }} />
-                      <input
-                        type="text"
-                        placeholder="Search by name, address, recording ID..."
-                        value={searchQuery}
-                        onChange={(e) => setSearchQuery(e.target.value)}
-                        style={{
-                          width: "100%",
-                          padding: "8px 10px 8px 36px",
-                          border: "1px solid #ddd",
-                          borderRadius: "4px",
-                          fontSize: "14px",
-                          boxSizing: "border-box",
-                        }}
-                      />
+                    <div className="toolbar-center">
+                      <div className="search-box">
+                        <Icon path={ICONS.search} className="search-icon" />
+                        <input
+                          className="search-input"
+                          type="text"
+                          placeholder="Search by name, address, recording ID..."
+                          value={searchQuery}
+                          onChange={(e) => setSearchQuery(e.target.value)}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="toolbar-right toolbar-actions">
+                      <button
+                        className="action-btn"
+                        onClick={handleExportCSV}
+                        disabled={rows.length === 0}
+                        title="Download CSV"
+                        type="button"
+                      >
+                        <Icon path={ICONS.download} className="btn-icon" /> CSV
+                      </button>
+                      <button
+                        className="action-btn"
+                        onClick={handleExportPDF}
+                        disabled={rows.length === 0}
+                        title="Print / PDF"
+                        type="button"
+                      >
+                        <Icon path={ICONS.printer} className="btn-icon" /> PDF
+                      </button>
                     </div>
                   </div>
 
-                  <div className="filter-group">
-                    <button className={`filter-btn ${addressFilter === "all" ? "active" : ""}`} onClick={() => setAddressFilter("all")}>All Records</button>
-                    <button className={`filter-btn ${addressFilter === "with" ? "active" : ""}`} onClick={() => setAddressFilter("with")}>Has Address</button>
-                    <button className={`filter-btn ${addressFilter === "without" ? "active" : ""}`} onClick={() => setAddressFilter("without")}>No Address</button>
-                  </div>
+                  <div className="toolbar-row">
+                    <div className="filter-group" aria-label="Address filter">
+                      <button className={`filter-btn ${addressFilter === "all" ? "active" : ""}`} onClick={() => setAddressFilter("all")}>All Records</button>
+                      <button className={`filter-btn ${addressFilter === "with" ? "active" : ""}`} onClick={() => setAddressFilter("with")}>Has Address</button>
+                      <button className={`filter-btn ${addressFilter === "without" ? "active" : ""}`} onClick={() => setAddressFilter("without")}>No Address</button>
+                    </div>
 
-                                    <div className="filter-group">
-                    <button className="filter-btn" onClick={handleExportCSV} disabled={rows.length===0} title="Download CSV" style={{border: '1px solid currentColor', background:'transparent'}}>
-                      <Icon path={ICONS.download} style={{marginRight: '6px'}}/> CSV
-                    </button>
-                    <button className="filter-btn" onClick={handleExportPDF} disabled={rows.length===0} title="Print / PDF" style={{border: '1px solid currentColor', background:'transparent'}}>
-                      <Icon path={ICONS.printer} style={{marginRight: '6px'}}/> PDF
-                    </button>
+                    <div className="filter-group" aria-label="Manual review filter">
+                      <button className={`filter-btn ${manualReviewFilter === "all" ? "active" : ""}`} onClick={() => setManualReviewFilter("all")}>All</button>
+                      <button className={`filter-btn ${manualReviewFilter === "needs" ? "active" : ""}`} onClick={() => setManualReviewFilter("needs")}>Manual Review</button>
+                      <button className={`filter-btn ${manualReviewFilter === "clean" ? "active" : ""}`} onClick={() => setManualReviewFilter("clean")}>Clean</button>
+                    </div>
                   </div>
                 </div>
 
@@ -619,6 +725,7 @@ export default function HomePage() {
                             <>
                               <th>Recording</th>
                               <th>Recorded Date</th>
+                              <th>Document Type</th>
                               <th>Grantors</th>
                               <th>Grantees</th>
                               <th>Principal Amount</th>
@@ -633,6 +740,7 @@ export default function HomePage() {
                               <th>Address State</th>
                               <th>Recording Number</th>
                               <th>Recording Date</th>
+                              <th>Document Type</th>
                               <th>Principal Amount</th>
                               <th>Document URL</th>
                             </>
@@ -665,14 +773,15 @@ export default function HomePage() {
                         {(() => {
                           const activeRows = searchQuery && searchQuery.length >= 2 ? searchResults : rows;
                           const displayRows = activeRows.filter(r => {
-                            if (addressFilter === "with") return r.property_address && r.property_address.trim() !== "" && r.property_address !== "NOT_FOUND";
-                            if (addressFilter === "without") return !r.property_address || r.property_address.trim() === "" || r.property_address === "NOT_FOUND";
+                            if (!matchesManualReviewFilter(r)) return false;
+                            if (addressFilter === "with") return hasAddress(r);
+                            if (addressFilter === "without") return !hasAddress(r);
                             return true;
                           });
 
                           return displayRows.length === 0 ? (
                             <tr>
-                              <td colSpan={isGrahamView ? 6 : isMaricopaView ? 8 : isSantaCruzView ? 8 : 8} className="empty-state">
+                              <td colSpan={isGrahamView ? 7 : isMaricopaView ? 10 : isSantaCruzView ? 8 : 8} className="empty-state">
                                 {searchQuery && searchQuery.length >= 2
                                   ? "No records found matching your search."
                                   : "No records found for the selected view."}
@@ -681,12 +790,28 @@ export default function HomePage() {
                           ) : (
                             displayRows.map((row) => {
                               const doc = row.documents || {};
+                              const needsReview = needsManualReview(row);
+                              const reviewReasons = [];
+                              const name = row.trustor_1_full_name || row.grantors || row.trustor || "";
+                              const address = row.property_address || "";
+                              const addressWords = countWords(address);
+                              const nameHasCommas = name.includes(',');
+                              const addressHasCommas = address.includes(',');
+                              const addressStartsWithParcel = address.trim().toUpperCase().startsWith("PARCEL");
+                              
+                              if (addressStartsWithParcel) {
+                                reviewReasons.push("Address starts with 'Parcel ID'");
+                              } else if (!nameHasCommas && !addressHasCommas && addressWords > 6) {
+                                reviewReasons.push(`Address has ${addressWords} words (more than 6 words)`);
+                              }
+                              const reviewTitle = needsReview ? `⚠️ Manual Review Needed:\n${reviewReasons.join("\n")}` : "";
                               return (
-                                <tr key={`${row.id}-${doc.recording_number || "none"}`}>
+                                <tr key={`${row.id}-${doc.recording_number || "none"}`} className={needsReview ? "needs-review" : ""} title={reviewTitle}>
                                   {isGrahamView ? (
                                     <>
                                       <td className="fw-medium">{doc.recording_number || "-"}</td>
                                       <td>{doc.recording_date || "-"}</td>
+                                      <td><span className="doc-badge">{row.document_type || "-"}</span></td>
                                       <td className="td-truncate" title={row.grantors}>{row.grantors || "-"}</td>
                                       <td className="td-truncate" title={row.grantees}>{row.grantees || "-"}</td>
                                       <td className="fw-medium">{row.original_principal_balance || row.principal_amount || "-"}</td>
@@ -701,6 +826,7 @@ export default function HomePage() {
                                       <td>{row.address_state || "-"}</td>
                                       <td className="fw-medium">{doc.recording_number || "-"}</td>
                                       <td>{doc.recording_date || "-"}</td>
+                                      <td><span className="doc-badge">{row.document_type || "-"}</span></td>
                                       <td className="fw-medium">{row.original_principal_balance || "-"}</td>
                                       <td><a href={row.document_url} target="_blank" rel="noopener noreferrer" style={{color: '#0066cc', textDecoration: 'none'}}>{row.document_url ? 'Link' : '-'}</a></td>
                                     </>

@@ -1316,6 +1316,8 @@ def fetch_document_ocr_and_analysis(
     groq_analysis: dict[str, Any] = {}
     groq_error = ""
     used_groq = False
+    
+    # Force use_groq if ocrText is available (User Requirement: No regex fallback dependence)
     if use_groq and ocr_result["ocrText"].strip():
         try:
             groq_analysis = analyze_document_text_with_groq(
@@ -1327,6 +1329,7 @@ def fetch_document_ocr_and_analysis(
             used_groq = True
         except Exception as exc:
             groq_error = str(exc)
+            
     preview_text = ocr_result["ocrText"][:1500]
     return {
         "documentId": document_id,
@@ -1343,8 +1346,9 @@ def fetch_document_ocr_and_analysis(
         "usedGroq": used_groq,
         "groqError": groq_error,
         "groqAnalysis": groq_analysis,
-        "addressCandidates": _extract_address_candidates(ocr_result["ocrText"]),
-        "principalCandidates": _extract_principal_candidates(ocr_result["ocrText"]),
+        # Regex candidates are removed/empty to ensure we don't rely on them
+        "addressCandidates": [], 
+        "principalCandidates": [],
     }
 
 
@@ -1559,11 +1563,18 @@ def enrich_with_groq(records: list[ExtractedRecord], batch_size: int = 5, timeou
                     "recordingNumber": str(item.get("recordingNumber") or base["recordingNumber"]),
                     "documentType": str(item.get("documentType") or base["documentType"]),
                     "recordingDate": str(item.get("recordingDate") or base["recordingDate"]),
+                    # Prefer LLM extracted grantors/grantees, fall back to base
                     "grantors": _string_list(item.get("grantors"), base["grantors"]),
                     "grantees": _string_list(item.get("grantees"), base["grantees"]),
                     "legalDescriptions": _string_list(item.get("legalDescriptions"), base["legalDescriptions"]),
                     "detailUrl": str(item.get("detailUrl") or base["detailUrl"]),
                     "sourceFile": base["sourceFile"],
+                    # Capture additional LLM fields
+                    "trustor": str(item.get("trustor") or ""),
+                    "trustee": str(item.get("trustee") or ""),
+                    "beneficiary": str(item.get("beneficiary") or ""),
+                    "principalAmount": str(item.get("principalAmount") or ""),
+                    "propertyAddress": str(item.get("propertyAddress") or ""),
                 }
             )
     return normalized

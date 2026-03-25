@@ -102,6 +102,10 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
               property_address text,
               detail_url       text,
               image_urls       text,
+              manual_review         boolean,
+              manual_review_reasons text,
+              manual_review_summary text,
+              manual_review_context text,
               ocr_method       text,
               ocr_chars        integer,
               used_groq        boolean,
@@ -116,6 +120,12 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
             );
             """
         )
+
+        # Backfill columns on existing deployments
+        cur.execute("alter table cochise_leads add column if not exists manual_review boolean;")
+        cur.execute("alter table cochise_leads add column if not exists manual_review_reasons text;")
+        cur.execute("alter table cochise_leads add column if not exists manual_review_summary text;")
+        cur.execute("alter table cochise_leads add column if not exists manual_review_context text;")
         cur.execute(
             """
             create table if not exists cochise_pipeline_runs (
@@ -234,18 +244,26 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
         with _connect_db(db_url) as conn:
             _ensure_schema(conn)
 
-    res = run_cochise_pipeline(
-        start_date=start_date,
-        end_date=end_date,
-        doc_types=doc_types,
-        max_pages=0,
-        ocr_limit=ocr_limit,
-        workers=max(1, workers),
-        use_groq=True,
-        headless=True,
-        verbose=bool(os.environ.get("COCHISE_VERBOSE", "")),
-        write_output_files=bool(os.environ.get("COCHISE_WRITE_FILES", "")),
-    )
+    try:
+        res = run_cochise_pipeline(
+            start_date=start_date,
+            end_date=end_date,
+            doc_types=doc_types,
+            max_pages=0,
+            ocr_limit=ocr_limit,
+            workers=max(1, workers),
+            use_groq=True,
+            headless=True,
+            verbose=bool(os.environ.get("COCHISE_VERBOSE", "")),
+            write_output_files=bool(os.environ.get("COCHISE_WRITE_FILES", "")),
+        )
+    except Exception as e:
+        _log(f"error: pipeline execution failed: {e}")
+        raise
+
+    if not res:
+        _log("warning: pipeline returned None, using empty result")
+        res = {"records": []}
 
     records = res.get("records", [])
     if strict_llm:
