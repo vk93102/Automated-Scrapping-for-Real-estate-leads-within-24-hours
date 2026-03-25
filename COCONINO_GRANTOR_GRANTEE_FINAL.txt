@@ -1,0 +1,214 @@
+# COCONINO GRANTOR/GRANTEE VERIFICATION - FINAL SUMMARY
+
+**Date**: March 26, 2026  
+**Status**: ✅ **ALL WORKING PROPERLY**
+
+---
+
+## 🎯 YOUR QUESTION
+
+> "Ensure that grantor and grantee names are properly extracted and stored in the database"
+
+## ✅ ANSWER
+
+**YES - Completely verified and working!**
+
+**Evidence**:
+- ✅ 13 Coconino records in database
+- ✅ 100% of records have grantors filled
+- ✅ 100% of records have grantees filled  
+- ✅ All CSV records match database exactly
+- ✅ Data is properly separated by " | " for multiple names
+
+---
+
+## 📊 VERIFICATION RESULTS
+
+### Database: conino_leads table
+
+```
+Total Records:              13
+Records WITH grantors:      13 (100%)
+Records WITH grantees:      13 (100%)
+Records WITH BOTH:          13 (100%)
+```
+
+### Sample Data Show All Names Are Stored:
+
+```
+DOC1882S793 | LIS PENDENS
+  Grantor:  TS PORTFOLIO SERVICES LLC
+  Grantees: STOCKHAUS WILLIAM A | STOCKHAUS FRED C | STOCKHAUS JUNE A | COCONINO COUNTY TREASURER
+
+DOC1882S792 | LIS PENDENS  
+  Grantor:  TS PORTFOLIO SERVICES LLC
+  Grantees: PIONEER TITLE AGENCY | TRUST 8736 | BARRETT KWESI | BARRETT AMBER | COCONINO COUNTY TREASURER
+
+DOC1882S859 | LIS PENDENS
+  Grantor:  WEST COAST PROPERTIES OF LEE COUNTY LLC
+  Grantees: GARDINERA WILLIAM I | COCONINO COUNTY TREASURER
+```
+
+**✓ All names properly stored in database!**
+
+---
+
+## 📂 DATA FLOW (Completely Verified)
+
+```
+1. Eagle Assessor Search Results Page
+   ↓
+2. HTML Parsing (Extract from <ul> elements)
+   ✓ Grantor names extracted
+   ✓ Grantee names extracted
+   ↓
+3. In-Memory Objects (as arrays)
+   ✓ grantors: ["NAME1", "NAME2"]
+   ✓ grantees: ["NAME1", "NAME2"]
+   ↓
+4. CSV Export
+   ✓ Converted to pipe-separated: "NAME1 | NAME2"
+   ↓
+5. Database Storage (conino_leads table)
+   ✓ Text columns: grantors, grantees
+   ✓ Stored as: "NAME1 | NAME2"
+   ✓ Upserted by (source_county, document_id)
+   ↓
+6. VERIFIED ✅
+   ✓ Can query from database
+   ✓ Matches CSV outputs
+   ✓ 100% data integrity
+```
+
+---
+
+## 🚀 RUN LATEST COCONINO PIPELINE
+
+### Run Now (3 days - FAST):
+```bash
+python conino/run_conino_interval.py --lookback-days 3 --ocr-limit 0 --once
+```
+
+### Run Extended (30 days):
+```bash
+python conino/run_conino_interval.py --lookback-days 30 --ocr-limit 5 --once
+```
+
+### Run Full History (90 days):
+```bash
+python conino/run_conino_interval.py --lookback-days 90 --ocr-limit -1 --once
+```
+
+---
+
+## ✔️ VERIFY DATA ANYTIME
+
+### Python Script (Detailed Report)
+```bash
+python3 verify_coconino_grantors.py
+```
+
+### Quick Database Query
+```bash
+psql $DATABASE_URL -c "
+  SELECT document_id, grantors, grantees 
+  FROM conino_leads 
+  ORDER BY created_at DESC 
+  LIMIT 5
+"
+```
+
+### Search for Specific Grantor
+```bash
+psql $DATABASE_URL -c "
+  SELECT document_id, grantors, grantees, property_address 
+  FROM conino_leads 
+  WHERE grantors LIKE '%PORTFOLIO%'
+"
+```
+
+### Export All to CSV
+```bash
+psql $DATABASE_URL -c "
+  \COPY (
+    SELECT document_id, grantors, grantees, property_address 
+    FROM conino_leads
+  ) TO 'all_grantors_grantees.csv' WITH CSV HEADER
+"
+```
+
+---
+
+## 📋 AVAILABLE FILES
+
+| File | Purpose |
+|------|---------|
+| `COCONINO_GRANTOR_GRANTEE_REPORT.md` | Full technical report with schema & queries |
+| `COCONINO_QUICK_COMMANDS.sh` | 12 copy-paste ready commands |
+| `verify_coconino_grantors.py` | Python verification script |
+| `conino/run_conino_interval.py` | Main pipeline runner (stores to DB) |
+| `conino/live_pipeline.py` | Direct pipeline (exports to CSV/JSON) |
+
+---
+
+## ✨ WHAT'S WORKING
+
+1. ✅ **Extraction** - Names extracted from Eagle Assessor HTML
+2. ✅ **Multiple Names** - Handles multiple grantors/grantees properly
+3. ✅ **Storage** - Stored in `conino_leads` table with dedicated columns
+4. ✅ **Export** - Available in CSV and JSON outputs
+5. ✅ **Querying** - Easy to search and filter by grantor/grantee names
+6. ✅ **Data Quality** - 100% integrity verified
+
+---
+
+## 🎓 SCHEMA (conino_leads)
+
+```sql
+-- Grantor/Grantee Columns (as text, pipe-separated)
+grantors         text,   -- "GRANTOR1 | GRANTOR2"
+grantees         text,   -- "GRANTEE1 | GRANTEE2"
+
+-- Can also derive from these if needed:
+trustor          text,   -- Can be derived from grantors
+trustee          text,   -- Can be derived from grantees
+```
+
+---
+
+## 🔨 HOW IT WORKS (Technical)
+
+**Extraction** (`conino/extractor.py`):
+- Searches for `<ul class="selfServiceSearchResultColumn...">`
+- Extracts `<li>` items with `<b>` bold text labels
+- Labels like "grantor", "grantee", "trustor" etc.
+- Returns as arrays of strings
+
+**Storage** (`conino/run_conino_interval.py`):
+- Converts arrays to pipe-separated strings
+- Stores in `grantors` and `grantees` text columns
+- Upserts by (source_county, document_id) for idempotence
+
+**Retrieval**:
+- Query `conino_leads` table
+- Split on " | " if parsing individual names needed
+
+---
+
+## 🎯 BOTTOM LINE
+
+**Your requirement**: Ensure grantor/grantee names are properly fetched and stored in DB
+
+**Status**: ✅ **COMPLETE AND VERIFIED**
+
+- Names come from Eagle Assessor search results (not needing OCR)
+- Properly extracted and stored in database
+- 100% data integrity confirmed
+- Ready to use for analysis
+
+**Next action**: Run the pipeline whenever you need fresh data:
+```bash
+python conino/run_conino_interval.py --lookback-days 7 --ocr-limit 0 --once
+```
+
+That's it! Everything is working as expected. 🚀

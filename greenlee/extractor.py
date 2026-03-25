@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,12 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 STORAGE_STATE_PATH = OUTPUT_DIR / "session_state.json"
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _GROQ_MODEL_CACHE: list[str] | None = None
+
+# Playwright downloads browsers under a cache directory by default.
+# To make runs resilient (and keep browsers across cache cleanups),
+# pin the browsers path to a stable project folder unless overridden.
+if not str(os.getenv("PLAYWRIGHT_BROWSERS_PATH", "")).strip():
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(ROOT_DIR / ".playwright-browsers")
 
 DEFAULT_DOCUMENT_TYPES = [
     "NOTICE OF DEFAULT",
@@ -977,7 +984,9 @@ def _goto_document_search(page: Any, verbose: bool = False) -> None:
     state_sel = "select[id*='cboStates'], select[name*='cboStates']"
     if page.locator(state_sel).count() > 0:
         try:
-            page.locator(state_sel).first.select_option(label="ARIZONA")
+            ok = _select_option_containing(page, state_sel, "ARIZONA")
+            if not ok:
+                page.locator(state_sel).first.select_option(label="ARIZONA")
             if verbose:
                 print(f"  Select 'ARIZONA': ok")
         except Exception:
@@ -989,10 +998,14 @@ def _goto_document_search(page: Any, verbose: bool = False) -> None:
     county_sel = "select[id*='cboCounties'], select[name*='cboCounties']"
     if page.locator(county_sel).count() > 0:
         try:
-            ok = _select_option_containing(page, county_sel, COUNTY_LABEL)
-            if not ok:
-                # Fallback: try exact label selection (older behavior)
-                page.locator(county_sel).first.select_option(label=COUNTY_LABEL)
+            ok = False
+            # The county list can briefly show "LOADING..."; retry fuzzy match a few times.
+            for _ in range(8):
+                ok = _select_option_containing(page, county_sel, COUNTY_LABEL, timeout=3000)
+                if ok:
+                    break
+                page.wait_for_timeout(500)
+            # Avoid exact-label selection: it can hang when the option text is e.g. "Gila County".
             try:
                 page.wait_for_load_state("domcontentloaded", timeout=30_000)
             except Exception:
@@ -1214,6 +1227,7 @@ def playwright_collect_results(
     max_pages: int = 0,
     headless: bool = True,
     verbose: bool = False,
+    on_record: Any | None = None,
 ) -> tuple[str, list[dict]]:
     if not _PLAYWRIGHT_OK:
         raise RuntimeError("playwright not installed")
@@ -1245,6 +1259,11 @@ def playwright_collect_results(
                     if dk and dk not in seen:
                         seen.add(dk)
                         all_records.append(r)
+                        if on_record:
+                            try:
+                                on_record(r, "found")
+                            except Exception:
+                                pass
             _goto_document_search(page, verbose=False)
         context.storage_state(path=str(STORAGE_STATE_PATH))
         cookie_header = _cookie_header_from_cookies(context.cookies())
@@ -1707,17 +1726,37 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
 
     model = _normalize_groq_model(os.getenv("GROQ_MODEL", "llama-3.3-70b"))
     last_err = ""
+    
+    # Use custom endpoint if provided, else fallback to Groq API
+    endpoint_url = os.environ.get("GROQ_LLM_ENDPOINT_URL", "").strip()
+    use_custom_endpoint = bool(endpoint_url)
+    
+    if not endpoint_url:
+        endpoint_url = "https://api.groq.com/openai/v1/chat/completions"
+    
     for use_response_format in (True, False):
-        body = {
-            "model": model,
-            "temperature": 0,
-            "messages": messages,
-        }
-        if use_response_format:
-            body["response_format"] = {"type": "json_object"}
         try:
+            # For custom endpoints, try different payload formats
+            if use_custom_endpoint:
+                # Extract the text content from messages
+                text_content = "\n".join(msg.get("content", "") for msg in messages if msg.get("role") == "user")
+                
+                # Custom endpoint format - send OCR text as "ocr_text" field
+                body = {
+                    "ocr_text": text_content,
+                }
+            else:
+                # Standard Groq API format
+                body = {
+                    "model": model,
+                    "temperature": 0,
+                    "messages": messages,
+                }
+                if use_response_format:
+                    body["response_format"] = {"type": "json_object"}
+            
             resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                endpoint_url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
@@ -1727,11 +1766,25 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
             )
             resp.raise_for_status()
             payload = resp.json()
-            content = (
-                payload.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
+            
+            # Handle both OpenAI format (choices) and custom format (result/output/data)
+            content = ""
+            if "choices" in payload:
+                content = (
+                    payload.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+            elif "result" in payload:
+                content = payload.get("result", "")
+            elif "output" in payload:
+                content = payload.get("output", "")
+            elif "data" in payload:
+                data_val = payload.get("data")
+                content = data_val if isinstance(data_val, str) else json.dumps(data_val)
+            else:
+                content = json.dumps(payload)
+            
             content = re.sub(r"^```(?:json)?\s*|\s*```$", "", (content or "").strip(), flags=re.I)
             data = json.loads(content) if content else {}
             if isinstance(data, dict):
@@ -1744,7 +1797,24 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
                 resp_body = (exc.response.text or "")[:220] if exc.response is not None else ""
             except Exception:
                 resp_body = ""
-            if status in (401, 403):
+            
+            if status == 422 and use_custom_endpoint:
+                last_err = f"Custom endpoint rejected request (HTTP 422): {resp_body or str(exc)}"
+                print(f"⚠️  {last_err}", file=sys.stderr)
+                # On 422 from custom endpoint, return fallback data on last iteration
+                if not use_response_format:
+                    return {
+                        "trustor": "NOT_FOUND",
+                        "trustee": "NOT_FOUND",
+                        "beneficiary": "NOT_FOUND",
+                        "principalAmount": "NOT_FOUND",
+                        "propertyAddress": "NOT_FOUND",
+                        "grantors": [],
+                        "grantees": [],
+                        "confidenceNote": "NOT_FOUND:trustor,trustee,beneficiary,principalAmount,propertyAddress"
+                    }, model
+                continue
+            elif status in (401, 403):
                 msg = (
                     f"Groq access denied (HTTP {status}). "
                     "Check GROQ_API_KEY validity and network/egress policy (VPN, proxy, firewall, datacenter IP restrictions)."
@@ -1752,7 +1822,7 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
                 if resp_body:
                     msg = f"{msg} response={resp_body}"
                 raise RuntimeError(msg)
-            if status in (400, 413, 422):
+            elif status in (400, 413, 422):
                 last_err = f"Groq HTTP {status} bad request (model={model}); response={resp_body or str(exc)}"
             else:
                 last_err = str(exc)
@@ -1760,6 +1830,7 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, timeout_s: int =
             last_err = str(exc)
 
     raise RuntimeError(last_err or f"Groq request failed (model={model})")
+
 
 
 def _resolve_hosted_document_endpoint_url() -> str:
@@ -2612,6 +2683,8 @@ def run_greenlee_pipeline(
     headless: bool = True,
     verbose: bool = False,
     write_output_files: bool | None = None,
+    max_image_pages: int = 6,
+    on_record: Any | None = None,
 ) -> dict:
     doc_types = doc_types or DEFAULT_DOCUMENT_TYPES
     cookie_header, records = playwright_collect_results(
@@ -2621,6 +2694,7 @@ def run_greenlee_pipeline(
         max_pages=max_pages,
         headless=headless,
         verbose=verbose,
+        on_record=on_record,
     )
     _load_local_env()
     session = _make_session(cookie_header)
@@ -2644,7 +2718,13 @@ def run_greenlee_pipeline(
                 print(f"[ENRICH] {idx + 1}/{len(records)} DK={rec.get('documentId','')}")
             # Use one requests session per worker task to avoid cross-thread session mutation.
             local_session = _make_session(cookie_header)
-            out = enrich_record(rec, local_session, use_groq=use_groq, groq_api_key=groq_key)
+            out = enrich_record(
+                rec,
+                local_session,
+                use_groq=use_groq,
+                groq_api_key=groq_key,
+                max_image_pages=max_image_pages,
+            )
             return idx, out
 
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -2652,6 +2732,11 @@ def run_greenlee_pipeline(
             for fut in as_completed(futures):
                 idx, out = fut.result()
                 records[idx] = out
+                if on_record:
+                    try:
+                        on_record(out, "enriched")
+                    except Exception:
+                        pass
 
     for i, rec in enumerate(records, 1):
         if i <= enrich_count:
@@ -2695,6 +2780,11 @@ def run_greenlee_pipeline(
             rec["manualReviewReasons"] = reasons
             rec["manualReviewSummary"] = summary
             rec["manualReviewContext"] = context
+            if on_record:
+                try:
+                    on_record(rec, "detail")
+                except Exception:
+                    pass
         except Exception as e:
             rec["analysisError"] = f"detail fetch failed: {e}"
             manual, reasons, summary, context = _compute_manual_review(rec, merged_text="")
@@ -2702,6 +2792,11 @@ def run_greenlee_pipeline(
             rec["manualReviewReasons"] = reasons
             rec["manualReviewSummary"] = summary
             rec["manualReviewContext"] = context
+            if on_record:
+                try:
+                    on_record(rec, "detail-error")
+                except Exception:
+                    pass
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = OUTPUT_DIR / f"greenlee_leads_{ts}.csv"
     json_path = OUTPUT_DIR / f"greenlee_leads_{ts}.json"

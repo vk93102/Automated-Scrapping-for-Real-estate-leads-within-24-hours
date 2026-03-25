@@ -4,12 +4,10 @@ Gila County, AZ — Real Estate Lead Scraper
 ================================================
 Entry point for the Gila County pipeline.
 
-This script is a lightweight wrapper around the shared `greenlee` extractor,
-configured for Gila County's specifics. It handles command-line argument
-parsing and invokes the main pipeline logic.
+This script is a lightweight wrapper around the Gila County extractor.
+It handles command-line argument parsing and invokes the main pipeline logic.
 
-For core scraping, OCR, and LLM logic, see `greenlee/extractor.py`.
-For Gila-specific configurations, see `gila/extractor.py`.
+For core scraping logic, see `gila/extractor.py`.
 """
 
 from __future__ import annotations

@@ -50,6 +50,34 @@ from extractor import (
 import db_supabase
 
 STATE_FILE = OUTPUT_DIR / "session_state.json"
+COOKIE_FILE = OUTPUT_DIR / "coconino_cookie.txt"
+COOKIE_ENV_FILE = OUTPUT_DIR / "coconino_cookie.env"
+
+
+def _read_cookie_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def _persist_cookie(cookie_header: str) -> None:
+    cookie_header = (cookie_header or "").strip()
+    if not cookie_header:
+        return
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        COOKIE_FILE.write_text(cookie_header + "\n", encoding="utf-8")
+        COOKIE_ENV_FILE.write_text(f"COCONINO_COOKIE={cookie_header}\n", encoding="utf-8")
+        try:
+            os.chmod(COOKIE_FILE, 0o600)
+            os.chmod(COOKIE_ENV_FILE, 0o600)
+        except Exception:
+            pass
+        print(f"[AUTH] Persisted cookie for unattended runs → {COOKIE_ENV_FILE}")
+    except Exception:
+        # Non-fatal: pipeline can still run without persisting
+        pass
 
 
 def _cookie_from_storage_state(path: Path) -> str:
@@ -80,6 +108,32 @@ def _search_all_records(
     page_limit: int | None,
 ) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
     """Return (cookie_header, records, summary) without hard-stopping on CAPTCHA."""
+
+    # Fast-path: if a valid session cookie is injected, run requests-only search.
+    # This avoids Playwright and therefore avoids the disclaimer-page reCAPTCHA.
+    injected_cookie = (os.environ.get("COCONINO_COOKIE") or "").strip()
+    if not injected_cookie and COOKIE_FILE.exists():
+        injected_cookie = _read_cookie_file(COOKIE_FILE)
+    force_playwright = str(os.environ.get("COCONINO_FORCE_PLAYWRIGHT", "")).strip().lower() in {"1", "true", "yes"}
+    if injected_cookie and not force_playwright:
+        src = "env" if os.environ.get("COCONINO_COOKIE") else "file"
+        print(f"[AUTH] Using injected COCONINO_COOKIE from {src} (requests-only search) …")
+        try:
+            res = run_live_search(
+                start_date=start_date,
+                end_date=end_date,
+                document_types=doc_types,
+                page_limit=page_limit,
+                cookie=injected_cookie,
+                save_html=True,
+            )
+            records = list(res.get("records", []) or [])
+            summary = dict(res.get("summary", {}) or {})
+            print(f"[SEARCH] Requests-only search OK: {len(records)} records")
+            return injected_cookie, records, summary
+        except Exception as exc:
+            print(f"[WARN] Requests-only search failed; falling back to Playwright: {exc}")
+
     try:
         cookie, page1_records, page1_summary = _playwright_search(
             start_date=start_date,
@@ -378,6 +432,9 @@ def _playwright_search(
             f"{c['name']}={c['value']}" for c in cookies if c.get("name")
         )
         print(f"[AUTH] Cookie extracted ({len(cookie_header)} chars, {len(cookies)} cookies)")
+
+        # Persist the cookie so subsequent runs can use requests-only mode.
+        _persist_cookie(cookie_header)
 
         browser.close()
 

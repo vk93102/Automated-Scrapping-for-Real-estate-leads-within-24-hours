@@ -61,7 +61,56 @@ export async function GET(request) {
     const sinceIso = getSinceIso(range);
 
     let query = "";
-    if (county === "graham") {
+    if (county === "gila") {
+      const tableName = "gila_leads";
+      const recordingDateText = `COALESCE(
+        NULLIF(BTRIM(recording_date::text), ''),
+        NULLIF(BTRIM(raw_record->>'recordingDate'), ''),
+        NULLIF(BTRIM(raw_record->>'recording_date'), '')
+      )`;
+      const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
+      const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
+      const whereClause = `($1::timestamptz IS NULL OR ${effectiveTs} >= $1::timestamptz)`;
+      
+      query = `
+        SELECT
+          id,
+          'gila' as source_county,
+          document_id,
+          recording_number,
+          ${recordingDateText} AS recording_date,
+          document_type,
+          grantors,
+          grantees,
+          COALESCE(trustor, '') as trustor,
+          principal_amount,
+          property_address,
+          COALESCE(NULLIF(raw_record->>'manualReview','')::boolean,false) as manual_review,
+          NULLIF(BTRIM(raw_record->>'manualReviewReasons'), '') as manual_review_reasons,
+          NULLIF(BTRIM(raw_record->>'manualReviewSummary'), '') as manual_review_summary,
+          NULLIF(BTRIM(raw_record->>'manualReviewContext'), '') as manual_review_context,
+          created_at,
+          updated_at,
+          COALESCE(trustor, '') as trustor_1_full_name,
+          '' as trustor_2_full_name,
+          property_address as property_address_display,
+          '' as address_city,
+          '' as address_state,
+          '' as address_zip,
+          NULL as sale_date,
+          principal_amount as original_principal_balance,
+          detail_url,
+          NULL as image_urls,
+          NULL as ocr_method,
+          NULL::integer as ocr_chars,
+          NULL::boolean as used_groq,
+          NULL as llm_model
+        FROM ${tableName}
+        WHERE ${whereClause}
+        ORDER BY created_at DESC
+        LIMIT $2;
+      `;
+    } else if (county === "graham") {
       const tableName = "graham_leads";
       const recordingDateText = "NULLIF(BTRIM(recording_date::text), '')";
       const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
@@ -129,13 +178,14 @@ export async function GET(request) {
         ORDER BY created_at DESC
         LIMIT $2;
       `;
-    } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(county)) {
+    } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise", "coconino"].includes(county)) {
       const tableMap = {
         "la-paz": "lapaz_leads",
         "navajo": "navajo_leads",
         "santa-cruz": "santacruz_leads",
         "greenlee": "greenlee_leads",
-        "cochise": "cochise_leads"
+        "cochise": "cochise_leads",
+        "coconino": "coconino_leads"
       };
       const tableName = tableMap[county];
       const recordingDateText = `COALESCE(
@@ -151,8 +201,6 @@ export async function GET(request) {
       const imageUrlsColumn = county === "santa-cruz" ? "document_urls as image_urls" : "NULL as image_urls";
 
       // Manual review fields are stored in `raw_record` across county pipelines.
-      // Use `raw_record` here so the API is resilient even if the physical columns
-      // haven't been migrated/added yet.
       const manualReviewColumns = [
         "COALESCE(NULLIF(raw_record->>'manualReview','')::boolean,false) as manual_review",
         "NULLIF(BTRIM(raw_record->>'manualReviewReasons'), '') as manual_review_reasons",
@@ -163,50 +211,33 @@ export async function GET(request) {
       query = `
         SELECT
           id,
-          source_county,
+          '${county === "coconino" ? "coconino" : county}' as source_county,
           document_id,
-          COALESCE(
-            NULLIF(BTRIM(recording_number), ''),
-            NULLIF(BTRIM(raw_record->>'recordingNumber'), ''),
-            NULLIF(BTRIM(raw_record->>'recording_number'), '')
-          ) AS recording_number,
+          recording_number,
           ${recordingDateText} AS recording_date,
-          COALESCE(
-            NULLIF(BTRIM(document_type), ''),
-            NULLIF(BTRIM(raw_record->>'documentType'), ''),
-            NULLIF(BTRIM(raw_record->>'document_type'), '')
-          ) AS document_type,
-          grantors,
-          grantees,
-          trustor,
-          principal_amount,
-          property_address,
+          document_type,
+          COALESCE(NULLIF(BTRIM(grantors), ''), NULLIF(BTRIM(raw_record->>'grantors'), '')) AS grantors,
+          COALESCE(NULLIF(BTRIM(grantees), ''), NULLIF(BTRIM(raw_record->>'grantees'), '')) AS grantees,
+          COALESCE(NULLIF(BTRIM(trustor), ''), NULLIF(BTRIM(raw_record->>'trustor'), '')) AS trustor,
+          COALESCE(NULLIF(BTRIM(principal_amount), ''), NULLIF(BTRIM(raw_record->>'principalAmount'), '')) AS principal_amount,
+          COALESCE(NULLIF(BTRIM(property_address), ''), NULLIF(BTRIM(raw_record->>'propertyAddress'), '')) AS property_address,
           ${manualReviewColumns},
           created_at,
           updated_at,
-          COALESCE(
-            NULLIF(BTRIM(trustor), ''),
-            NULLIF(BTRIM(raw_record->>'trustor'), '')
-          ) AS trustor_1_full_name,
-          NULL as trustor_2_full_name,
-          COALESCE(
-            NULLIF(BTRIM(property_address), ''),
-            NULLIF(BTRIM(raw_record->>'propertyAddress'), '')
-          ) AS property_address_display,
+          COALESCE(NULLIF(BTRIM(trustor), ''), NULLIF(BTRIM(SPLIT_PART(grantors, '|', 1)), ''), NULLIF(BTRIM(grantors), '')) AS trustor_1_full_name,
+          COALESCE(NULLIF(BTRIM(SPLIT_PART(grantors, '|', 2)), ''), NULL) AS trustor_2_full_name,
+          COALESCE(NULLIF(BTRIM(property_address), ''), NULLIF(BTRIM(raw_record->>'propertyAddress'), '')) AS property_address_display,
           NULL as address_city,
           NULL as address_state,
           NULL as address_zip,
           NULL as sale_date,
-          COALESCE(
-            NULLIF(BTRIM(principal_amount), ''),
-            NULLIF(BTRIM(raw_record->>'principalAmount'), '')
-          ) AS original_principal_balance,
-          NULL as detail_url,
+          COALESCE(NULLIF(BTRIM(principal_amount), ''), NULLIF(BTRIM(raw_record->>'principalAmount'), '')) AS original_principal_balance,
+          detail_url,
           ${imageUrlsColumn},
           NULL as ocr_method,
           NULL::integer as ocr_chars,
           NULL::boolean as used_groq,
-          groq_model as llm_model
+          NULL as llm_model
         FROM ${tableName}
         WHERE ${whereClause}
         ORDER BY created_at DESC

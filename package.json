@@ -1,0 +1,13 @@
+{
+  "name": "foreclosure-root",
+  "private": true,
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "vercel-build": "npm run build --workspace frontend && rm -rf frontend/.next/cache && rm -rf .next && cp -R -X frontend/.next .next",
+    "build": "npm run build --workspace frontend",
+    "dev": "npm run dev --workspace frontend",
+    "start": "npm run start --workspace frontend"
+  }
+}

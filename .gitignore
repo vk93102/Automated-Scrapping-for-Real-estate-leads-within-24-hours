@@ -34,9 +34,24 @@ maricopa_scraper/*.log
 downloads/
 output/
 logs/
+.playwright-browsers/
+
+# Node / Next.js
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+.next_dev_pid
+**/.next_dev_pid
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Editor
 .vscode/
 .idea/
 .venv_old/
 tmp/
+.vercel
+.env*.local

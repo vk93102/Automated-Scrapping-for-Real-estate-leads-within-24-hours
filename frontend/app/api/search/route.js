@@ -106,13 +106,14 @@ export async function GET(request) {
         ORDER BY created_at DESC
         LIMIT 100;
       `;
-    } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(county)) {
+    } else if (["la-paz", "navajo", "santa-cruz", "greenlee", "cochise", "coconino"].includes(county)) {
       const tableMap = {
         "la-paz": "lapaz_leads",
         "navajo": "navajo_leads",
         "santa-cruz": "santacruz_leads",
         "greenlee": "greenlee_leads",
-        "cochise": "cochise_leads"
+        "cochise": "cochise_leads",
+        "coconino": "coconino_leads"
       };
       const tableName = tableMap[county];
       const recordingDateText = `COALESCE(
@@ -122,49 +123,120 @@ export async function GET(request) {
       )`;
       const recordingDateParsed = sqlParsedDateFromText(recordingDateText);
       const effectiveTs = `COALESCE((${recordingDateParsed})::timestamptz, created_at)`;
-      sql = `
-        SELECT
-          id,
-          source_county,
-          document_id,
-          recording_number,
-          recording_date,
-          document_type,
-          NULL as grantors,
-          NULL as grantees,
-          NULL as trustor,
-          NULL as trustee,
-          NULL as beneficiary,
-          created_at,
-          updated_at,
-          COALESCE(
-            NULLIF(BTRIM(trustor), ''),
-            NULLIF(BTRIM(raw_record->>'trustor'), '')
-          ) AS trustor_1_full_name,
-          NULL as trustor_2_full_name,
-          property_address,
-          NULL as address_city,
-          NULL as address_state,
-          NULL as address_zip,
-          NULL as sale_date,
-          principal_amount as original_principal_balance,
-          NULL as principal_amount,
-          NULL as detail_url,
-          NULL as image_urls,
-          NULL as ocr_method,
-          NULL::integer as ocr_chars,
-          NULL::boolean as used_groq,
-          groq_model as llm_model
-        FROM ${tableName}
-        WHERE (
-          recording_number ILIKE $1
-          OR trustor ILIKE $1
-          OR property_address ILIKE $1
-        )
-        AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
-        ORDER BY created_at DESC
-        LIMIT 100;
-      `;
+
+      if (county === "coconino") {
+        // Coconino stores grantors/grantees/trustor/property_address directly.
+        // Search those fields so the UI search behaves like other counties.
+        sql = `
+          SELECT
+            id,
+            source_county,
+            document_id,
+            recording_number,
+            ${recordingDateText} AS recording_date,
+            document_type,
+            COALESCE(
+              NULLIF(BTRIM(grantors), ''),
+              NULLIF(BTRIM(raw_record->>'grantors'), ''),
+              NULLIF(BTRIM(raw_record->>'grantor'), '')
+            ) AS grantors,
+            COALESCE(
+              NULLIF(BTRIM(grantees), ''),
+              NULLIF(BTRIM(raw_record->>'grantees'), ''),
+              NULLIF(BTRIM(raw_record->>'grantee'), '')
+            ) AS grantees,
+            COALESCE(
+              NULLIF(BTRIM(trustor), ''),
+              NULLIF(BTRIM(raw_record->>'trustor'), '')
+            ) AS trustor,
+            NULL as trustee,
+            NULL as beneficiary,
+            created_at,
+            updated_at,
+            COALESCE(
+              NULLIF(BTRIM(trustor), ''),
+              NULLIF(BTRIM(raw_record->>'trustor'), ''),
+              NULLIF(BTRIM(SPLIT_PART(grantors, '|', 1)), ''),
+              NULLIF(BTRIM(grantors), '')
+            ) AS trustor_1_full_name,
+            NULL as trustor_2_full_name,
+            COALESCE(
+              NULLIF(BTRIM(property_address), ''),
+              NULLIF(BTRIM(raw_record->>'propertyAddress'), ''),
+              NULLIF(BTRIM(raw_record->>'property_address'), '')
+            ) AS property_address,
+            NULL as address_city,
+            NULL as address_state,
+            NULL as address_zip,
+            NULL as sale_date,
+            COALESCE(
+              NULLIF(BTRIM(principal_amount), ''),
+              NULLIF(BTRIM(raw_record->>'principalAmount'), '')
+            ) AS original_principal_balance,
+            principal_amount,
+            NULL as detail_url,
+            NULL as image_urls,
+            NULL as ocr_method,
+            NULL::integer as ocr_chars,
+            NULL::boolean as used_groq,
+            groq_model as llm_model
+          FROM ${tableName}
+          WHERE (
+            recording_number ILIKE $1
+            OR grantors ILIKE $1
+            OR grantees ILIKE $1
+            OR trustor ILIKE $1
+            OR property_address ILIKE $1
+          )
+          AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
+          ORDER BY created_at DESC
+          LIMIT 100;
+        `;
+      } else {
+        sql = `
+          SELECT
+            id,
+            source_county,
+            document_id,
+            recording_number,
+            recording_date,
+            document_type,
+            NULL as grantors,
+            NULL as grantees,
+            NULL as trustor,
+            NULL as trustee,
+            NULL as beneficiary,
+            created_at,
+            updated_at,
+            COALESCE(
+              NULLIF(BTRIM(trustor), ''),
+              NULLIF(BTRIM(raw_record->>'trustor'), '')
+            ) AS trustor_1_full_name,
+            NULL as trustor_2_full_name,
+            property_address,
+            NULL as address_city,
+            NULL as address_state,
+            NULL as address_zip,
+            NULL as sale_date,
+            principal_amount as original_principal_balance,
+            NULL as principal_amount,
+            NULL as detail_url,
+            NULL as image_urls,
+            NULL as ocr_method,
+            NULL::integer as ocr_chars,
+            NULL::boolean as used_groq,
+            groq_model as llm_model
+          FROM ${tableName}
+          WHERE (
+            recording_number ILIKE $1
+            OR trustor ILIKE $1
+            OR property_address ILIKE $1
+          )
+          AND ($2::timestamptz IS NULL OR ${effectiveTs} >= $2::timestamptz)
+          ORDER BY created_at DESC
+          LIMIT 100;
+        `;
+      }
     } else {
       // Maricopa and others
       const effectiveTs = "COALESCE(d.recording_date::timestamptz, d.created_at)";

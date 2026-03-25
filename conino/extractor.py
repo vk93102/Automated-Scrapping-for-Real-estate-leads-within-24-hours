@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -847,6 +848,14 @@ def run_live_search(
         method="POST",
     )
     post_body = opener.open(post_request, timeout=60).read().decode("utf-8", errors="ignore")
+
+    # If the session is invalid/expired, the server often returns the disclaimer page
+    # (with or without reCAPTCHA). Detect this early so callers can fall back to
+    # Playwright/headful cookie refresh.
+    lowered_post = post_body.lower()
+    if "/web/user/disclaimer" in lowered_post or "g-recaptcha" in lowered_post or "recaptcha" in lowered_post:
+        raise RuntimeError("Blocked by Coconino disclaimer reCAPTCHA (requests-only); refresh session cookies via Playwright/headful")
+
     post_file = _save_live_html("live_search_post", post_body) if save_html else ""
 
     all_records: list[dict[str, Any]] = []
@@ -860,6 +869,11 @@ def run_live_search(
             method="GET",
         )
         body = opener.open(request, timeout=60).read().decode("utf-8", errors="ignore")
+
+        lowered = body.lower()
+        if "/web/user/disclaimer" in lowered or "g-recaptcha" in lowered or "recaptcha" in lowered:
+            raise RuntimeError("Blocked by Coconino disclaimer reCAPTCHA (requests-only); refresh session cookies via Playwright/headful")
+
         source_name = _save_live_html(f"live_search_results_page_{current_page}", body) if save_html else f"live_page_{current_page}.html"
         if save_html:
             html_files.append(source_name)
@@ -1473,14 +1487,33 @@ def _chunk_records(records: list[ExtractedRecord], batch_size: int) -> list[list
 
 
 def _groq_request(messages: list[dict[str, str]], api_key: str, model: str, timeout_s: int) -> str:
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": messages,
-    }
+    # Use custom endpoint if provided, else fallback to Groq API
+    endpoint_url = os.environ.get("GROQ_LLM_ENDPOINT_URL", "").strip()
+    use_custom_endpoint = bool(endpoint_url)
+    
+    if not endpoint_url:
+        endpoint_url = "https://api.groq.com/openai/v1/chat/completions"
+    
+    # For custom endpoints, try different payload formats
+    if use_custom_endpoint:
+        # Extract the text content from messages
+        text_content = "\n".join(msg.get("content", "") for msg in messages if msg.get("role") == "user")
+        
+        # Custom endpoint format - send OCR text as "ocr_text" field
+        payload = {
+            "ocr_text": text_content,
+        }
+    else:
+        # Standard Groq API format
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "messages": messages,
+            "response_format": {"type": "json_object"}
+        }
+    
     request = Request(
-        "https://api.groq.com/openai/v1/chat/completions",
+        endpoint_url,
         data=json.dumps(payload).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {api_key}",
@@ -1492,7 +1525,19 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, model: str, time
         with urlopen(request, timeout=timeout_s) as response:
             body = response.read().decode("utf-8")
         data = json.loads(body)
-        return data["choices"][0]["message"]["content"]
+        
+        # Handle both OpenAI format (choices) and custom format (result/output/data)
+        if "choices" in data:
+            return data["choices"][0]["message"]["content"]
+        elif "result" in data:
+            return data["result"]
+        elif "output" in data:
+            return data["output"]
+        elif "data" in data:
+            return data["data"] if isinstance(data["data"], str) else json.dumps(data["data"])
+        else:
+            # If response structure is unexpected, try to find the content
+            return json.dumps(data)
     except HTTPError as exc:
         body = ""
         try:
@@ -1507,6 +1552,21 @@ def _groq_request(messages: list[dict[str, str]], api_key: str, model: str, time
             if body:
                 hint = f"{hint} response={body[:220]}"
             raise RuntimeError(hint)
+        elif exc.code == 422 and use_custom_endpoint:
+            # Log the 422 error but provide fallback for custom endpoint
+            error_detail = f"Custom endpoint rejected request (HTTP 422): {body[:300]}"
+            print(f"⚠️  {error_detail}", file=sys.stderr)
+            # Return a fallback response indicating data couldn't be extracted
+            return json.dumps({
+                "trustor": "NOT_FOUND",
+                "trustee": "NOT_FOUND",
+                "beneficiary": "NOT_FOUND",
+                "principalAmount": "NOT_FOUND",
+                "propertyAddress": "NOT_FOUND",
+                "grantors": [],
+                "grantees": [],
+                "confidenceNote": "NOT_FOUND:trustor,trustee,beneficiary,principalAmount,propertyAddress"
+            })
         raise
 
 

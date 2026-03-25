@@ -1,7 +1,6 @@
-python3 gila/live_pipeline.py \
-  --start-date "3/9/2026" \
-  --end-date "3/15/2026" \
-  --ocr-limit 3 \
-  --no-groq \
-  --store-db \
-  --write-files
+python gila/run_gila_interval.py \
+  --lookback-days 14 \
+  --ocr-limit -1 \
+  --write-files \
+  --workers 2 \
+  --once

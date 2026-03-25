@@ -11,13 +11,13 @@ const FILTERS = [
 
 const COUNTIES = [
   { key: "maricopa", name: "Maricopa", status: "Live" },
-  { key: "gila", name: "Gila", status: "Planned" },
+  { key: "gila", name: "Gila", status: "Live" },
   { key: "graham", name: "Graham", status: "Live" },
   { key: "greenlee", name: "Greenlee", status: "Live" },
   { key: "navajo", name: "Navajo", status: "Live" },
   { key: "cochise", name: "Cochise", status: "Live" },
   { key: "la-paz", name: "La Paz", status: "Live" },
-  { key: "coconino", name: "Coconino", status: "Planned" },
+  { key: "coconino", name: "Coconino", status: "Live" },
   { key: "santa-cruz", name: "Santa Cruz", status: "Live" },
 ];
 
@@ -411,7 +411,7 @@ export default function HomePage() {
     printWindow.focus();
   };
 
-  const isLiveCounty = ["maricopa", "graham", "la-paz", "navajo", "santa-cruz", "greenlee", "cochise"].includes(activeCounty);
+  const isLiveCounty = ["maricopa", "graham", "la-paz", "navajo", "santa-cruz", "greenlee", "cochise", "gila", "coconino"].includes(activeCounty);
 
   // Search functionality
   useEffect(() => {

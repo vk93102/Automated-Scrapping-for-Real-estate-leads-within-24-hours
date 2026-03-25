@@ -7,4 +7,4 @@ python3 cochise/live_pipeline.py \
   --workers 3 \
   --verbose
 
-  python3 cochise/run_cochise_interval.py --lookback-days 1 --workers 4 --ocr-limit 50 --write-files
+python3 cochise/run_cochise_interval.py --lookback-days 1 --ocr-limit 20 --write-files

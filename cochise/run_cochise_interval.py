@@ -241,9 +241,13 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
     if not os.environ.get("COCHISE_SKIP_DB"):
         if not db_url:
             raise RuntimeError("DATABASE_URL is missing (or pass --db-url)")
+        _log(f"connecting to database...")
         with _connect_db(db_url) as conn:
+            _log(f"ensuring schema...")
             _ensure_schema(conn)
+        _log(f"✓ database setup complete")
 
+    _log(f"fetching cochise records for {start_date} to {end_date}...")
     try:
         res = run_cochise_pipeline(
             start_date=start_date,
@@ -264,19 +268,37 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
     if not res:
         _log("warning: pipeline returned None, using empty result")
         res = {"records": []}
+    
+    records = res.get("records", [])
+    _log(f"✓ fetched {len(records)} records from playwright scrape")
 
     records = res.get("records", [])
+    llm_used = sum(1 for r in records if bool(r.get("usedGroq", False)))
+    
+    _log(f"processing extraction results...")
+    _log(f"  • records processed: {len(records)}")
+    _log(f"  • llm extraction used: {llm_used}")
+    _log(f"  • non-llm records: {len(records) - llm_used}")
+    
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
         if missing:
             sample = ", ".join(x for x in missing[:10] if x)
+            _log(f"error: strict LLM mode: {len(missing)} records without LLM")
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
+    
     if os.environ.get("COCHISE_SKIP_DB"):
-        llm_used = sum(1 for r in records if bool(r.get("usedGroq", False)))
+        _log(f"✓ skipping database write (--skip-db flag)")
+        _log(f"run summary — found={len(records)}  llm={llm_used}")
         return len(records), 0, 0, llm_used
 
+    _log(f"writing records to database...")
     with _connect_db(db_url) as conn:
         inserted, updated, llm_used = _upsert_records(conn, records, today)
+        _log(f"  • inserted: {inserted} new records")
+        _log(f"  • updated: {updated} existing records")
+        
+        _log(f"logging pipeline run to database...")
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -287,6 +309,7 @@ def _run_once(doc_types: list[str], workers: int, lookback_days: int, strict_llm
                 (today, len(records), inserted, updated, llm_used),
             )
         conn.commit()
+        _log(f"✓ database write complete")
 
     return len(records), inserted, updated, llm_used
 
@@ -336,8 +359,13 @@ def main() -> None:
 
     _log(
         f"starting cochise runner "
-        f"lookback_days={args.lookback_days} workers={args.workers}"
+        f"lookback_days={args.lookback_days} workers={args.workers} ocr_limit={args.ocr_limit}"
     )
+    _log(f"document types: {', '.join(doc_types) if doc_types else 'all'}")
+    if args.skip_db:
+        _log(f"note: database writes disabled (--skip-db)")
+    if args.write_files:
+        _log(f"note: will write CSV/JSON files (--write-files)")
 
     try:
         total, ins, upd, llm_used = _run_once(
@@ -347,9 +375,18 @@ def main() -> None:
             args.strict_llm,
             args.ocr_limit,
         )
-        _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used}")
+        _log(f"\n✓ pipeline run successful!")
+        _log(f"  • total records found: {total}")
+        _log(f"  • inserted to db: {ins}")
+        _log(f"  • updated in db: {upd}")
+        _log(f"  • llm enriched: {llm_used}")
+        if ins or upd:
+            _log(f"✓ data successfully synced to database")
+    except KeyboardInterrupt:
+        _log(f"\n⚠ pipeline interrupted by user")
+        raise
     except Exception as exc:
-        _log(f"run failed: {exc}")
+        _log(f"\n✗ pipeline failed: {exc}")
         raise
 
 
