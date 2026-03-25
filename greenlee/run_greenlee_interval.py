@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import socket
 import sys
@@ -151,16 +152,107 @@ def _ensure_schema(conn: psycopg.Connection) -> None:
               run_finished_at timestamptz,
               run_date        date,
               total_records   integer default 0,
+              records_missing_document_id integer default 0,
+              records_with_ocr integer default 0,
+              records_used_groq integer default 0,
+              records_with_trustor integer default 0,
+              records_with_address integer default 0,
+              records_with_groq_error integer default 0,
               inserted_rows   integer default 0,
               updated_rows    integer default 0,
               llm_used_rows   integer default 0,
+              lookback_days   integer,
+              workers         integer,
+              ocr_limit       integer,
+              strict_llm      boolean,
+              llm_regex_fallback_enabled boolean,
               status          text not null default 'running',
               error_message   text,
               created_at      timestamptz not null default now()
             );
             """
         )
+        # Backward-compatible schema migrations.
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists run_started_at timestamptz not null default now();")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists run_finished_at timestamptz;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists run_date date;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists total_records integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_missing_document_id integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_with_ocr integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_used_groq integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_with_trustor integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_with_address integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists records_with_groq_error integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists inserted_rows integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists updated_rows integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists llm_used_rows integer default 0;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists lookback_days integer;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists workers integer;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists ocr_limit integer;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists strict_llm boolean;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists llm_regex_fallback_enabled boolean;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists status text not null default 'running';")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists error_message text;")
+        cur.execute("alter table greenlee_pipeline_runs add column if not exists created_at timestamptz not null default now();")
     conn.commit()
+
+
+def _record_failed_run(
+    *,
+    db_url: str,
+    run_date: date,
+    lookback_days: int,
+    workers: int,
+    ocr_limit: int,
+    strict_llm: bool,
+    llm_regex_fallback_enabled: bool,
+    error_message: str,
+) -> None:
+    if not db_url:
+        return
+    try:
+        with _connect_db(db_url) as conn:
+            _ensure_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    insert into greenlee_pipeline_runs (
+                      run_date,
+                      run_finished_at,
+                      total_records,
+                      records_missing_document_id,
+                      records_with_ocr,
+                      records_used_groq,
+                      records_with_trustor,
+                      records_with_address,
+                      records_with_groq_error,
+                      inserted_rows,
+                      updated_rows,
+                      llm_used_rows,
+                      lookback_days,
+                      workers,
+                      ocr_limit,
+                      strict_llm,
+                      llm_regex_fallback_enabled,
+                      status,
+                      error_message
+                    ) values (
+                      %s, now(), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, %s, %s, %s, %s, %s, 'failed', %s
+                    );
+                    """,
+                    (
+                        run_date,
+                        int(lookback_days or 0),
+                        int(workers or 0),
+                        int(ocr_limit or 0),
+                        bool(strict_llm),
+                        bool(llm_regex_fallback_enabled),
+                        str(error_message or "")[:4000],
+                    ),
+                )
+            conn.commit()
+    except Exception as exc:
+        _log(f"warning: failed to record failed run into DB: {exc}")
 
 
 def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: date) -> tuple[int, int, int]:
@@ -171,7 +263,19 @@ def _upsert_records(conn: psycopg.Connection, records: list[dict], run_date: dat
         for r in records:
             doc_id = str(r.get("documentId", "") or "").strip()
             if not doc_id:
-                continue
+                # Avoid silently skipping: generate a stable synthetic ID from available fields.
+                basis = "|".join(
+                    [
+                        str(r.get("detailUrl", "") or "").strip(),
+                        str(r.get("recordingNumber", "") or "").strip(),
+                        str(r.get("recordingDate", "") or "").strip(),
+                        str(r.get("documentType", "") or "").strip(),
+                    ]
+                )
+                digest = hashlib.sha1(basis.encode("utf-8", errors="ignore")).hexdigest()[:16]
+                doc_id = f"synthetic:{digest}"
+                r["documentId"] = doc_id
+                r["syntheticDocumentId"] = True
             clean_address = sanitize_property_address(r.get("propertyAddress", ""))
             clean_trustor = sanitize_borrower_name(r.get("trustor", ""))
             r_clean = dict(r)
@@ -347,6 +451,7 @@ def _run_once(
     strict_llm: bool,
     ocr_limit: int,
     verbose: bool,
+    realtime: bool,
 ) -> tuple[int, int, int, int, int]:
     today = date.today()
     lookback_days = max(1, int(lookback_days or 1))
@@ -406,11 +511,24 @@ def _run_once(
     records_with_groq = len([r for r in records if bool(r.get("usedGroq", False))])
     records_with_ocr = len([r for r in records if int(r.get("ocrChars", 0) or 0) > 0])
     records_with_addr = len([r for r in records if (r.get("propertyAddress") or "").strip()])
+    records_missing_document_id = len([r for r in records if not str(r.get("documentId", "") or "").strip()])
+    records_with_groq_error = len([r for r in records if (r.get("groqError") or "").strip()])
+    llm_regex_fallback_enabled = str(os.environ.get("GREENLEE_LLM_REGEX_FALLBACK", "0")).strip() == "1"
     
     _log(
         f"extraction quality: {records_with_ocr} with OCR text, {records_with_groq} used Groq LLM, "
         f"{records_with_trustor} have trustor, {records_with_addr} have address"
     )
+    if records_missing_document_id:
+        _log(f"warning: {records_missing_document_id} records missing documentId (will use synthetic ids for DB upsert)")
+    if records_with_groq_error:
+        sample_err = ""
+        for r in records:
+            err = (r.get("groqError") or "").strip()
+            if err:
+                sample_err = err
+                break
+        _log(f"llm diagnostics: {records_with_groq_error} Groq call failures; sample_error={sample_err[:220]}")
     
     if strict_llm:
         missing = [str(r.get("documentId", "") or "") for r in records if not bool(r.get("usedGroq", False))]
@@ -418,6 +536,21 @@ def _run_once(
             sample = ", ".join(x for x in missing[:10] if x)
             raise RuntimeError(f"LLM coverage check failed before DB write: missing={len(missing)} sample=[{sample}]")
     with _connect_db(db_url) as conn:
+        if realtime:
+            _log("realtime: upserting records (docId, type, address)...")
+            for i, r in enumerate(records[:50]):
+                doc_id = str(r.get("documentId", "") or "").strip()
+                addr = str(r.get("propertyAddress") or "").strip()
+                addr_kind = "street"
+                upper = addr.upper()
+                if not addr:
+                    addr_kind = "empty"
+                elif upper.startswith("PARCEL") or upper.startswith("APN") or "PARCEL ID" in upper:
+                    addr_kind = "parcel"
+                _log(
+                    f"realtime[{i+1}/{min(len(records),50)}] docId={doc_id or '(missing)'} "
+                    f"type={str(r.get('documentType','') or '').strip()} addr_kind={addr_kind} addr={addr[:160]}"
+                )
         inserted, updated, llm_used = _upsert_records(conn, records, today)
         sanitized_existing = _sanitize_existing_record_fields(conn)
         if sanitized_existing:
@@ -426,10 +559,46 @@ def _run_once(
             cur.execute(
                 """
                 insert into greenlee_pipeline_runs
-                  (run_date, run_finished_at, total_records, inserted_rows, updated_rows, llm_used_rows, status)
-                values (%s, now(), %s, %s, %s, %s, 'success');
+                                    (
+                                        run_date,
+                                        run_finished_at,
+                                        total_records,
+                                        records_missing_document_id,
+                                        records_with_ocr,
+                                        records_used_groq,
+                                        records_with_trustor,
+                                        records_with_address,
+                                        records_with_groq_error,
+                                        inserted_rows,
+                                        updated_rows,
+                                        llm_used_rows,
+                                        lookback_days,
+                                        workers,
+                                        ocr_limit,
+                                        strict_llm,
+                                        llm_regex_fallback_enabled,
+                                        status
+                                    )
+                                values (%s, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success');
                 """,
-                (today, len(records), inserted, updated, llm_used),
+                                (
+                                        today,
+                                        len(records),
+                                        records_missing_document_id,
+                                        records_with_ocr,
+                                        records_with_groq,
+                                        records_with_trustor,
+                                        records_with_addr,
+                                        records_with_groq_error,
+                                        inserted,
+                                        updated,
+                                        llm_used,
+                                        lookback_days,
+                                        max(1, workers),
+                                        int(effective_ocr_limit or 0),
+                                        bool(strict_llm),
+                                        bool(llm_regex_fallback_enabled),
+                                ),
             )
         conn.commit()
         leads_total, _ = _fetch_db_snapshot(conn)
@@ -444,10 +613,11 @@ def main() -> None:
 
     p = argparse.ArgumentParser(description="Run Greenlee pipeline once and upsert into DB")
     p.add_argument("--interval-minutes", type=float, default=0.0, help="Deprecated: ignored (runner always executes once)")
-    p.add_argument("--lookback-days", type=int, default=7)
+    p.add_argument("--lookback-days", type=int, default=20)
     p.add_argument("--workers", type=int, default=3)
     p.add_argument("--ocr-limit", type=int, default=0, help="0 means OCR+LLM for all records, -1 skip OCR")
     p.add_argument("--verbose", action="store_true", help="Print extractor progress while running")
+    p.add_argument("--realtime", action="store_true", help="Print per-record summary before DB upsert")
     mode = p.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="Run one cycle and exit (default)")
     mode.add_argument("--loop", action="store_true", help="Deprecated: ignored (runner always executes once)")
@@ -473,10 +643,23 @@ def main() -> None:
             args.strict_llm,
             args.ocr_limit,
             args.verbose,
+            args.realtime,
         )
         _log(f"run ok total={total} inserted={ins} updated={upd} llm_used={llm_used} db_total={leads_total}")
     except Exception as exc:
         _log(f"run failed: {exc}")
+        db_url = (os.environ.get("DATABASE_URL") or "").strip()
+        llm_regex_fallback_enabled = str(os.environ.get("GREENLEE_LLM_REGEX_FALLBACK", "0")).strip() == "1"
+        _record_failed_run(
+            db_url=db_url,
+            run_date=date.today(),
+            lookback_days=args.lookback_days,
+            workers=args.workers,
+            ocr_limit=args.ocr_limit,
+            strict_llm=args.strict_llm,
+            llm_regex_fallback_enabled=llm_regex_fallback_enabled,
+            error_message=str(exc),
+        )
         raise
 
 
